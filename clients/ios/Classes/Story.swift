@@ -7,29 +7,39 @@
 //
 
 import Foundation
+import SwiftUI
 
-// The Feed, Story, and StoryCache classes could be quite useful going forward; Rather than calling getStory() to get the dictionary, could have a variation that returns a Story instance. Could fetch from the cache if available, or make and cache one from the dictionary. Would need to remove it from the cache when changing anything about a story. Could perhaps make the cache part of StoriesCollection.
+// The Folder, Feed, Story, and StoryCache classes could be quite useful going forward; Rather than calling getStory() to get the dictionary, could have a variation that returns a Story instance. Could fetch from the cache if available, or make and cache one from the dictionary. Would need to remove it from the cache when changing anything about a story. Could perhaps make the cache part of StoriesCollection.
 
 /// A story, wrapping the dictionary representation.
-class Story: Identifiable {
-    let id = UUID()
+///
+/// `isRead`, `isSaved`, and `isShared` are `@Published` so SwiftUI views that
+/// observe a Story via `@ObservedObject` (see `FeedDetailCardView.swift`)
+/// re-render when these flip. Without this, grid-view cards don't re-dim after
+/// the auto-mark-read timer fires.
+@MainActor class Story: Identifiable, ObservableObject {
+    let id: String
     let index: Int
-    
+
     var dictionary = AnyDictionary()
-    
+
     var feed: Feed?
-    
+
     var title = ""
-    var content = ""
+    var shortContent = ""
+    var longContent = ""
     var dateString = ""
     var timestamp = 0
-    var isRead = false
+    @Published var isRead = false
     var isReadAvailable = true
-    var isSaved = false
-    var isShared = false
+    @Published var isSaved = false
+    @Published var isShared = false
     var score = 0
     var hash = ""
     var author = ""
+    var isClusterStory = false
+    var clusterTier = ""
+    var parentStoryIndex: Int?
     
     var dateAndAuthor: String {
         return author.isEmpty ? dateString : "\(dateString) · \(author)"
@@ -45,15 +55,39 @@ class Story: Identifiable {
         let words = keys.filter { lowercasedTitle.contains($0.lowercased()) }
         let sorted = words.sorted()
         
-        return sorted.map { Feed.Training(name: $0, count: 0, score: Feed.Score(rawValue: classifiers[$0] as? Int ?? 0) ?? .none) }
+        return sorted.map { training(name: $0, classifierKey: "titles", score: classifiers[$0] as? Int ?? 0) }
+    }
+
+    var titleRegexes: [Feed.Training] {
+        guard let classifiers = feed?.classifiers(for: "title_regex") else {
+            return []
+        }
+        
+        let keys = classifiers.keys.compactMap { $0 as? String }
+        let matches = keys.filter { regexMatches($0, in: title) }
+        let sorted = matches.sorted()
+        
+        return sorted.map { training(name: $0, classifierKey: "title_regex", score: classifiers[$0] as? Int ?? 0) }
     }
     
     var authors: [Feed.Training] {
         guard let classifiers = feed?.classifiers(for: "authors") else {
             return []
         }
-        
-        return [Feed.Training(name: author, count: 0, score: Feed.Score(rawValue: classifiers[author] as? Int ?? 0) ?? .none)]
+
+        return [training(name: author, classifierKey: "authors", score: classifiers[author] as? Int ?? 0)]
+    }
+
+    var authorRegexes: [Feed.Training] {
+        guard let classifiers = feed?.classifiers(for: "author_regex") else {
+            return []
+        }
+
+        let keys = classifiers.keys.compactMap { $0 as? String }
+        let matches = keys.filter { regexMatches($0, in: author) }
+        let sorted = matches.sorted()
+
+        return sorted.map { training(name: $0, classifierKey: "author_regex", score: classifiers[$0] as? Int ?? 0) }
     }
     
     var tags: [Feed.Training] {
@@ -61,10 +95,83 @@ class Story: Identifiable {
             return []
         }
         
-        return tags.map { Feed.Training(name: $0, count: 0, score: Feed.Score(rawValue: classifiers[$0] as? Int ?? 0) ?? .none) }
+        return tags.map { training(name: $0, classifierKey: "tags", score: classifiers[$0] as? Int ?? 0) }
+    }
+
+    var texts: [Feed.Training] {
+        guard let classifiers = feed?.classifiers(for: "texts") else {
+            return []
+        }
+        
+        let content = contentHTML.lowercased()
+        let keys = classifiers.keys.compactMap { $0 as? String }
+        let matches = keys.filter { content.contains($0.lowercased()) }
+        let sorted = matches.sorted()
+        
+        return sorted.map { training(name: $0, classifierKey: "texts", score: classifiers[$0] as? Int ?? 0) }
+    }
+
+    var textRegexes: [Feed.Training] {
+        guard let classifiers = feed?.classifiers(for: "text_regex") else {
+            return []
+        }
+        
+        let keys = classifiers.keys.compactMap { $0 as? String }
+        let matches = keys.filter { regexMatches($0, in: contentHTML) }
+        let sorted = matches.sorted()
+        
+        return sorted.map { training(name: $0, classifierKey: "text_regex", score: classifiers[$0] as? Int ?? 0) }
+    }
+
+    var urls: [Feed.Training] {
+        let classifiers = feed?.classifiers(for: "urls")
+
+        guard let url = URL(string: permalink), let host = url.host, !host.isEmpty else {
+            // Can't parse URL — fall back to existing classifiers only
+            guard let classifiers else { return [] }
+            let permalinkLower = permalink.lowercased()
+            let keys = classifiers.keys.compactMap { $0 as? String }
+            let matches = keys.filter { permalinkLower.contains($0.lowercased()) }
+            return matches.sorted().map { training(name: $0, classifierKey: "urls", score: classifiers[$0] as? Int ?? 0) }
+        }
+
+        var segments = [String]()
+        segments.append(host)
+        for component in url.pathComponents where component != "/" {
+            segments.append(component)
+        }
+
+        // Include any existing classifiers that match but aren't already segments
+        if let classifiers {
+            for key in classifiers.keys.compactMap({ $0 as? String }) {
+                if !segments.contains(key) && permalink.lowercased().contains(key.lowercased()) {
+                    segments.append(key)
+                }
+            }
+        }
+
+        return segments.map { segment in
+            training(name: segment, classifierKey: "urls", score: classifiers?[segment] as? Int ?? 0)
+        }
+    }
+
+    var urlRegexes: [Feed.Training] {
+        guard let classifiers = feed?.classifiers(for: "url_regex") else {
+            return []
+        }
+        
+        let keys = classifiers.keys.compactMap { $0 as? String }
+        let matches = keys.filter { regexMatches($0, in: permalink) }
+        let sorted = matches.sorted()
+        
+        return sorted.map { training(name: $0, classifierKey: "url_regex", score: classifiers[$0] as? Int ?? 0) }
     }
     
     var isSelected: Bool {
+        guard !isClusterStory else {
+            return false
+        }
+
         return index == NewsBlurAppDelegate.shared!.storiesCollection.locationOfActiveStory()
     }
     
@@ -78,8 +185,69 @@ class Story: Identifiable {
     
     init(index: Int) {
         self.index = index
-        
+
+        // Extract story_hash for stable SwiftUI identity before calling load()
+        if let appDelegate = NewsBlurAppDelegate.shared, let storiesCollection = appDelegate.storiesCollection,
+           index < storiesCollection.activeFeedStoryLocations.count,
+           let row = storiesCollection.activeFeedStoryLocations[index] as? Int,
+           let story = storiesCollection.activeFeedStories[row] as? [String : Any],
+           let storyHash = story["story_hash"] as? String, !storyHash.isEmpty {
+            self.id = storyHash
+        } else {
+            self.id = "story-\(index)"
+        }
+
         load()
+    }
+
+    init(index: Int, dictionary: AnyDictionary) {
+        self.index = index
+        self.dictionary = dictionary
+
+        if let storyHash = dictionary["story_hash"] as? String, !storyHash.isEmpty {
+            self.id = storyHash
+        } else {
+            self.id = "story-\(index)"
+        }
+
+        loadFromDictionary()
+    }
+
+    init(parentIndex: Int, clusterDictionary: AnyDictionary, parentStory: AnyDictionary) {
+        self.index = parentIndex
+        self.dictionary = clusterDictionary
+
+        if let storyHash = clusterDictionary["story_hash"] as? String, !storyHash.isEmpty {
+            self.id = storyHash
+        } else {
+            self.id = "cluster-\(parentIndex)"
+        }
+
+        loadFromDictionary()
+
+        isClusterStory = true
+        parentStoryIndex = parentIndex
+        clusterTier = StoryClusterDisplayDecision.normalizedClusterTierValue(clusterDictionary["cluster_tier"])
+        shortContent = ""
+        longContent = ""
+        author = ""
+        dateString = Utilities.formatClusterDate(fromTimestamp: timestamp) ?? dateString
+        isSaved = false
+        isShared = false
+        isReadAvailable = false
+        score = (clusterDictionary["score"] as? NSNumber)?.intValue ?? score
+
+        let appDelegate = NewsBlurAppDelegate.shared!
+        let parentIsRead = !appDelegate.storiesCollection.isStoryUnread(parentStory)
+        let clusterRead = (clusterDictionary["read_status"] as? NSNumber)?.boolValue ?? false
+        let clusterMarkReadEnabled = appDelegate.isPremiumArchive &&
+            StoryClusterDisplayDecision.isClusterMarkReadEnabled(userProfile: appDelegate.dictUserProfile as NSDictionary?)
+        isRead = StoryClusterDisplayDecision.effectiveClusterReadStatus(
+            isClusterRead: clusterRead,
+            parentRead: parentIsRead,
+            clusterMarkReadEnabled: clusterMarkReadEnabled,
+            isPremiumArchive: appDelegate.isPremiumArchive
+        )
     }
     
     private func string(for key: String) -> String {
@@ -104,6 +272,14 @@ class Story: Identifiable {
         
         dictionary = story
         
+        loadFromDictionary()
+    }
+    
+    private func loadFromDictionary() {
+        guard let appDelegate = NewsBlurAppDelegate.shared, let storiesCollection = appDelegate.storiesCollection else {
+            return
+        }
+        
         if let dictID = dictionary["story_feed_id"], let id = appDelegate.feedIdWithoutSearchQuery("\(dictID)") {
             if let cachedFeed = StoryCache.feeds[id] {
                 feed = cachedFeed
@@ -113,15 +289,30 @@ class Story: Identifiable {
             }
         }
         
+        let tempContent: String = string(for: "story_content")
+        let components = tempContent.components(separatedBy: .newlines)
+        let filteredContent = components.filter { !$0.isEmpty }.joined(separator: "[:*CR*:]")
+        
         title = (string(for: "story_title") as NSString).decodingHTMLEntities()
-        content = String(string(for: "story_content").convertHTML().decodingXMLEntities().decodingHTMLEntities().replacingOccurrences(of: "\n", with: " ").prefix(500))
+        longContent = String(filteredContent
+            .convertHTML()
+            .decodingXMLEntities()
+            .decodingHTMLEntities()
+            .replacingOccurrences(of: "[:*CR*:]", with: "\n")
+            .prefix(1500))
+        shortContent = String(tempContent
+            .convertHTML()
+            .decodingXMLEntities()
+            .decodingHTMLEntities()
+            .replacingOccurrences(of: "\n", with: " ")
+            .prefix(500))
         author = string(for: "story_authors").replacingOccurrences(of: "\"", with: "")
         timestamp = int(for:"story_timestamp")
         dateString = Utilities.formatShortDate(fromTimestamp: timestamp) ?? ""
         isSaved = dictionary["starred"] as? Bool ?? false
         isShared = dictionary["shared"] as? Bool ?? false
         hash = string(for: "story_hash")
-        
+
         if let intelligence = dictionary["intelligence"] as? [String : Any] {
             score = Int(NewsBlurAppDelegate.computeStoryScore(intelligence))
         }
@@ -129,15 +320,48 @@ class Story: Identifiable {
         isRead = !storiesCollection .isStoryUnread(dictionary)
         isReadAvailable = storiesCollection.activeFolder != "saved_stories"
     }
+
+    var contentHTML: String {
+        return string(for: "story_content")
+    }
+
+    var permalink: String {
+        return string(for: "story_permalink")
+    }
+
+    private func regexMatches(_ pattern: String, in text: String) -> Bool {
+        do {
+            let regex = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            return regex.firstMatch(in: text, options: [], range: range) != nil
+        } catch {
+            return false
+        }
+    }
+
+    private func training(name: String, classifierKey: String, score: Int) -> Feed.Training {
+        let scopeInfo = ClassifierScopeResolver.resolveInfo(
+            from: feed?.classifiers,
+            classifierKey: classifierKey,
+            name: name
+        )
+        return Feed.Training(
+            name: name,
+            count: 0,
+            score: Feed.Score(rawValue: score) ?? .none,
+            scope: scopeInfo.scope,
+            folderName: scopeInfo.folderName
+        )
+    }
 }
 
 extension Story: Equatable {
-    static func == (lhs: Story, rhs: Story) -> Bool {
+    nonisolated static func == (lhs: Story, rhs: Story) -> Bool {
         return lhs.id == rhs.id
     }
 }
 
-extension Story: CustomDebugStringConvertible {
+extension Story: @preconcurrency CustomDebugStringConvertible {
     var debugDescription: String {
         return "Story #\(index) \"\(title)\" in \(feed?.name ?? "<none>")"
     }

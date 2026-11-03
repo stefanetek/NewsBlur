@@ -19,14 +19,15 @@
 
 @implementation FeedChooserItem
 
-+ (instancetype)makeFolderWithTitle:(NSString *)title {
-    return [self makeItemWithInfo:@{@"id" : [[NewsBlurAppDelegate sharedAppDelegate] extractFolderName:title], @"feed_title" : title}];
++ (instancetype)makeFolderWithIdentifier:(NSString *)identifier title:(NSString *)title {
+    return [self makeItemWithInfo:@{@"id" : identifier, @"feed_title" : title} search:nil];
 }
 
-+ (instancetype)makeItemWithInfo:(NSDictionary *)info {
++ (instancetype)makeItemWithInfo:(NSDictionary *)info search:(NSString *)search {
     FeedChooserItem *item = [self new];
     
     item.info = info;
+    item.search = search;
     
     return item;
 }
@@ -35,10 +36,18 @@
     id identifier = self.info[@"id"];
     
     if ([identifier isEqual:@" "]) {
-        return @"everything";
-    } else {
-        return identifier;
+        identifier = @"everything";
     }
+    
+    if (self.info[@"tag"] != nil) {
+        identifier = [NSString stringWithFormat:@"saved:%@", identifier];
+    }
+    
+    if (self.search != nil) {
+        identifier = [NSString stringWithFormat:@"%@?%@", identifier, self.search];
+    }
+    
+    return identifier;
 }
 
 - (NSString *)identifierString {
@@ -48,7 +57,11 @@
 - (NSString *)title {
     NSString *title = self.info[@"feed_title"];
     
-    if ([title isEqualToString:@" "] || [title isEqualToString:@"everything"] || [title isEqualToString:@"infrequent"]) {
+    if (self.search != nil) {
+        return [NSString stringWithFormat:[NBLocalization text:@"\"%1$@\" in %2$@"], self.search, title];
+    }
+    
+    if ([title isEqualToString:@" "] || [title isEqualToString:@"dashboard"] || [title isEqualToString:@"everything"] || [title isEqualToString:@"infrequent"]) {
         return @"";
     } else {
         return title;
@@ -58,21 +71,36 @@
 - (UIImage *)icon {
     if (!_icon) {
         if (!self.identifier) {
-            self.icon = [UIImage imageNamed:@"folder-open"];
+            // Check for custom folder icon
+            NSString *folderName = self.info[@"feed_title"];
+            NSDictionary *customIcon = self.appDelegate.dictFolderIcons[folderName];
+            if (customIcon && ![customIcon[@"icon_type"] isEqualToString:@"none"]) {
+                self.icon = [CustomIconRenderer renderIcon:customIcon size:CGSizeMake(20, 20)];
+            }
+            if (!self.icon) {
+                self.icon = [UIImage imageNamed:@"folder-open"];
+            }
         } else {
-            self.icon = [self.appDelegate getFavicon:[self.identifier description] isSocial:NO isSaved:NO];
+            NSString *identifier = self.identifierString;
+            BOOL isSocial = [self.appDelegate isSocialFeed:identifier];
+            BOOL isSaved = [self.appDelegate isSavedFeed:identifier];
+            self.icon = [self.appDelegate getFavicon:identifier isSocial:isSocial isSaved:isSaved];
         }
     }
-    
+
     return _icon;
 }
 
-- (void)addItemWithInfo:(NSDictionary *)info {
+- (void)addItem:(FeedChooserItem *)item {
     if (!self.contents) {
         self.contents = [NSMutableArray array];
     }
     
-    [self.contents addObject:[FeedChooserItem makeItemWithInfo:info]];
+    [self.contents addObject:item];
+}
+
+- (void)addItemWithInfo:(NSDictionary *)info search:(NSString *)search {
+    [self addItem:[FeedChooserItem makeItemWithInfo:info search:search]];
 }
 
 + (NSString *)keyForSort:(FeedChooserSort)sort {
@@ -100,19 +128,23 @@
 }
 
 - (NSString *)detailForSort:(FeedChooserSort)sort {
+    if (self.info[@"active"] == nil) {
+        return @"";
+    }
+    
     switch (sort) {
         case FeedChooserSortSubscribers:
-            return [NSString localizedStringWithFormat:NSLocalizedString(@"%@ subscribers", @"number of subscribers"), self.info[@"num_subscribers"]];
+            return [NBLocalization plural:@"%@ subscribers" count:self.info[@"num_subscribers"]];
             break;
             
         case FeedChooserSortFrequency:
-            return [NSString localizedStringWithFormat:NSLocalizedString(@"%@ stories/month", @"average stories per month"), self.info[@"average_stories_per_month"]];
+            return [NBLocalization plural:@"%@ stories/month" count:self.info[@"average_stories_per_month"]];
             break;
             
         case FeedChooserSortRecency:
         {
             static NSDateFormatter *dateFormatter = nil;
-            static NSDateComponentsFormatter *componentsFormatter = nil;
+            static NSRelativeDateTimeFormatter *relativeFormatter = nil;
             
             if (!dateFormatter) {
                 dateFormatter = [NSDateFormatter new];
@@ -120,23 +152,24 @@
                 dateFormatter.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
             }
             
-            if (!componentsFormatter)
-            {
-                componentsFormatter = [NSDateComponentsFormatter new];
-                
-                componentsFormatter.unitsStyle = NSDateComponentsFormatterUnitsStyleFull;
-                componentsFormatter.maximumUnitCount = 1;
-                componentsFormatter.zeroFormattingBehavior = NSDateComponentsFormatterZeroFormattingBehaviorDropAll;
+            if (!relativeFormatter) {
+                relativeFormatter = [NSRelativeDateTimeFormatter new];
+                relativeFormatter.unitsStyle = NSRelativeDateTimeFormatterUnitsStyleFull;
+                relativeFormatter.dateTimeStyle = NSRelativeDateTimeFormatterStyleNumeric;
             }
+            // FeedChooserItem.m lets the formatter phrase the whole age ("3 days ago", "vor 3 Tagen"),
+            // since wrapping a bare "3 Tage" in a translated "ago" breaks languages with case endings.
+            relativeFormatter.locale = NBLocalization.formattingLocale;
             
             NSDate *date = [dateFormatter dateFromString:self.info[@"last_story_date"]];
+            if (!date) return @"";
             
-            return [NSString stringWithFormat:@"%@ ago",  [componentsFormatter stringFromTimeInterval:-date.timeIntervalSinceNow]];
+            return [relativeFormatter localizedStringForDate:date relativeToDate:[NSDate date]];
             break;
         }
         
         default:
-            return [NSString localizedStringWithFormat:NSLocalizedString(@"%@ opens", @"number of feed opens"), self.info[@"feed_opens"]];
+            return [NBLocalization plural:@"%@ opens" count:self.info[@"feed_opens"]];
             break;
     }
 }

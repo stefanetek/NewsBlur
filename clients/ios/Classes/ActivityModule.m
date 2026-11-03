@@ -33,32 +33,40 @@
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    self.activitiesTable = [[UITableView alloc] init];
-    self.activitiesTable.dataSource = self;
-    self.activitiesTable.delegate = self;
-    self.activitiesTable.frame = CGRectMake(0, 0, self.frame.size.width, self.frame.size.height);;
-    self.activitiesTable.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.activitiesTable.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
-    
-    [self addSubview:self.activitiesTable];   
+    if (!self.activitiesTable) {
+        self.activitiesTable = [[UITableView alloc] init];
+        self.activitiesTable.dataSource = self;
+        self.activitiesTable.delegate = self;
+        self.activitiesTable.rowHeight = UITableViewAutomaticDimension;
+        self.activitiesTable.estimatedRowHeight = MINIMUM_ACTIVITY_HEIGHT_IPAD;
+        self.activitiesTable.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        self.activitiesTable.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
+        [self addSubview:self.activitiesTable];
+    }
+
+    self.activitiesTable.frame = self.bounds;
 }
-    
+
 - (void)refreshWithActivities:(NSArray *)activities {
     appDelegate.userActivitiesArray = activities;
 
     [self.activitiesTable reloadData];
-    
+
     self.pageFetching = NO;
-    
+
     [self performSelector:@selector(checkScroll)
                withObject:nil
                afterDelay:0.1];
 }
 
 - (void)checkScroll {
+    if (self.pageFetching || self.pageFinished || !self.activitiesTable) {
+        return;
+    }
+
     NSInteger currentOffset = self.activitiesTable.contentOffset.y;
     NSInteger maximumOffset = self.activitiesTable.contentSize.height - self.activitiesTable.frame.size.height;
-    
+
     if (maximumOffset - currentOffset <= 60.0) {
         [self fetchActivitiesDetail:self.activitiesPage + 1];
     }
@@ -68,7 +76,7 @@
 #pragma mark Get Interactions
 
 - (void)fetchActivitiesDetail:(int)page {
-    
+
     // if there is no social profile, we are DONE
 //    if ([[appDelegate.dictSocialProfile allKeys] count] == 0) {
 //        self.pageFinished = YES;
@@ -88,17 +96,20 @@
     if (!self.pageFetching && !self.pageFinished) {
         self.activitiesPage = page;
         self.pageFetching = YES;
-        self.appDelegate = (NewsBlurAppDelegate *)[[UIApplication sharedApplication] delegate];  
+        self.appDelegate = (NewsBlurAppDelegate *)[[UIApplication sharedApplication] delegate];
         NSString *urlString = [NSString stringWithFormat:@
                                "%@/social/activities?user_id=%@&page=%i&limit=10"
                                "&category=signup&category=star&category=feedsub&category=follow&category=comment_reply&category=comment_like&category=sharedstory",
                                self.appDelegate.url,
                                [appDelegate.dictSocialProfile objectForKey:@"user_id"],
                                page];
-        
+
         [appDelegate GET:urlString parameters:nil success:^(NSURLSessionDataTask * _Nonnull task, id  _Nullable responseObject) {
             [self finishLoadActivities:responseObject];
         } failure:^(NSURLSessionDataTask * _Nullable task, NSError * _Nonnull error) {
+            self.pageFetching = NO;
+            self.pageFinished = YES;
+            [self.activitiesTable reloadData];
             [self.appDelegate informError:error];
         }];
     }
@@ -111,31 +122,37 @@
     if (![[results objectForKey:@"has_next_page"] intValue]) {
         self.pageFinished = YES;
     }
-    
+
     NSArray *newActivities = [results objectForKey:@"activities"];
-    NSMutableArray *confirmedActivities = [NSMutableArray array];
+    if (![newActivities isKindOfClass:[NSArray class]]) {
+        newActivities = @[];
+    }
+
+    NSArray *confirmedActivities;
     if ([appDelegate.userActivitiesArray count]) {
         NSMutableSet *activitiesDate = [NSMutableSet set];
         for (id activity in appDelegate.userActivitiesArray) {
             [activitiesDate addObject:[activity objectForKey:@"date"]];
         }
+        NSMutableArray *dedupedActivities = [NSMutableArray array];
         for (id activity in newActivities) {
             if (![activitiesDate containsObject:[activity objectForKey:@"date"]]) {
-                [confirmedActivities addObject:activity];
+                [dedupedActivities addObject:activity];
             }
         }
+        confirmedActivities = dedupedActivities;
     } else {
         confirmedActivities = [newActivities copy];
     }
-    
+
     if (self.activitiesPage == 1) {
         appDelegate.userActivitiesArray = confirmedActivities;
     } else {
-        appDelegate.userActivitiesArray = [appDelegate.userActivitiesArray arrayByAddingObjectsFromArray:newActivities];
+        appDelegate.userActivitiesArray = [appDelegate.userActivitiesArray arrayByAddingObjectsFromArray:confirmedActivities];
     }
-    
+
     [self refreshWithActivities:appDelegate.userActivitiesArray];
-} 
+}
 
 #pragma mark -
 #pragma mark Table View - Interactions List
@@ -146,12 +163,12 @@
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
-{    
+{
     NSInteger activitesCount = [appDelegate.userActivitiesArray count];
     return activitesCount + 1;
 }
 
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {    
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger activitiesCount = [appDelegate.userActivitiesArray count];
     int minimumHeight;
     if (!appDelegate.isPhone) {
@@ -159,35 +176,32 @@
     } else {
         minimumHeight = MINIMUM_ACTIVITY_HEIGHT_IPHONE;
     }
-    
+
     if (indexPath.row >= activitiesCount) {
         return minimumHeight;
     }
-    
-    id activityCell;
-    if (!appDelegate.isPhone) {
-        activityCell = [[ActivityCell alloc] init];
-    } else {
-        activityCell = [[SmallActivityCell alloc] init];
+
+    if ([ActivityCell shouldCollapseActivity:appDelegate.userActivitiesArray[indexPath.row]]) {
+        return 1;
     }
-    
-    NSMutableDictionary *userProfile = [appDelegate.dictSocialProfile  mutableCopy];
-    [userProfile setValue:@"You" forKey:@"username"];
-    NSDictionary *activity = [appDelegate.userActivitiesArray
-                              objectAtIndex:(indexPath.row)];
-    int height = [activityCell setActivity:activity
-                           withUserProfile:userProfile
-                                 withWidth:self.frame.size.width - 20];
-    return height;
+    return UITableViewAutomaticDimension;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.row < appDelegate.userActivitiesArray.count &&
+        [ActivityCell shouldCollapseActivity:appDelegate.userActivitiesArray[indexPath.row]]) {
+        // ActivityModule.m keeps missing-author activity collapsed without constraining a normal label into a one-point row.
+        UITableViewCell *collapsedCell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        collapsedCell.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
+        collapsedCell.userInteractionEnabled = NO;
+        return collapsedCell;
+    }
     ActivityCell *cell = [tableView
                           dequeueReusableCellWithIdentifier:@"ActivityCell"];
     if (cell == nil) {
         if (!appDelegate.isPhone) {
             cell = [[ActivityCell alloc]
-                     initWithStyle:UITableViewCellStyleDefault 
+                     initWithStyle:UITableViewCellStyleDefault
                      reuseIdentifier:@"ActivityCell"];
         } else {
             cell = [[SmallActivityCell alloc]
@@ -195,21 +209,20 @@
                     reuseIdentifier:@"ActivityCell"];
         }
     }
-    
+
     if (indexPath.row >= [appDelegate.userActivitiesArray count]) {
         // add in loading cell
         return [self makeLoadingCell];
     } else {
         NSMutableDictionary *userProfile = [appDelegate.dictSocialProfile  mutableCopy];
         [userProfile setValue:@"You" forKey:@"username"];
-        
+
         NSDictionary *activity = [appDelegate.userActivitiesArray
                                    objectAtIndex:(indexPath.row)];
 
         [cell setActivity:activity
-          withUserProfile:userProfile
-                withWidth:self.frame.size.width - 20];
-        
+          withUserProfile:userProfile];
+
         NSString *category = [activity objectForKey:@"category"];
         if ([category isEqualToString:@"follow"]) {
             cell.accessoryType = UITableViewCellAccessoryNone;
@@ -219,13 +232,13 @@
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         }
-    
+
         UIView *myBackView = [[UIView alloc] initWithFrame:self.frame];
         myBackView.backgroundColor = UIColorFromRGB(NEWSBLUR_HIGHLIGHT_COLOR);
         cell.selectedBackgroundView = myBackView;
         cell.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
     }
-    
+
     return cell;
 }
 
@@ -236,13 +249,13 @@
         NSString *category = [activity objectForKey:@"category"];
         if ([category isEqualToString:@"follow"]) {
             [tableView deselectRowAtIndexPath:indexPath animated:YES];
-            
+
             NSString *userId = [NSString stringWithFormat:@"%@", [[activity objectForKey:@"with_user"] objectForKey:@"user_id"]];
             appDelegate.activeUserProfileId = userId;
-            
+
             NSString *username = [NSString stringWithFormat:@"%@", [[activity objectForKey:@"with_user"] objectForKey:@"username"]];
             appDelegate.activeUserProfileName = username;
-            
+
             // pass cell to the show UserProfile
             ActivityCell *cell = (ActivityCell *)[tableView cellForRowAtIndexPath:indexPath];
             [appDelegate showUserProfileModal:cell];
@@ -293,13 +306,13 @@
 }
 
 - (UITableViewCell *)makeLoadingCell {
-    UITableViewCell *cell = [[UITableViewCell alloc] 
-                             initWithStyle:UITableViewCellStyleSubtitle 
+    UITableViewCell *cell = [[UITableViewCell alloc]
+                             initWithStyle:UITableViewCellStyleSubtitle
                              reuseIdentifier:@"NoReuse"];
-    
+
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     cell.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
-    
+
     if (self.pageFinished) {
         UIImage *img = [UIImage imageNamed:@"fleuron.png"];
         UIImageView *fleuron = [[UIImageView alloc] initWithImage:img];
@@ -309,18 +322,18 @@
         } else {
             height = MINIMUM_ACTIVITY_HEIGHT_IPHONE;
         }
-        
+
         fleuron.frame = CGRectMake(0, 0, self.frame.size.width, height);
         fleuron.contentMode = UIViewContentModeCenter;
         [cell.contentView addSubview:fleuron];
         fleuron.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
     } else {
-        cell.textLabel.text = @"Loading...";
-        
-        UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] 
+        cell.textLabel.text = [NBLocalization text:@"Loading..."];
+
+        UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc]
                                             initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
         UIImage *spacer = [UIImage imageNamed:@"spacer"];
-        UIGraphicsBeginImageContext(spinner.frame.size);        
+        UIGraphicsBeginImageContext(spinner.frame.size);
         [spacer drawInRect:CGRectMake(0, 0, spinner.frame.size.width,spinner.frame.size.height)];
         UIImage* resizedSpacer = UIGraphicsGetImageFromCurrentImageContext();
         UIGraphicsEndImageContext();
@@ -328,7 +341,7 @@
         [cell.imageView addSubview:spinner];
         [spinner startAnimating];
     }
-    
+
     return cell;
 }
 

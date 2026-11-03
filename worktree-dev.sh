@@ -38,53 +38,69 @@ else
     HASH=$(echo -n "$WORKSPACE_NAME" | md5 | head -c 4)
     PORT_OFFSET=$((0x$HASH % 900 + 100))
 
-    WEB_PORT=$((8000 + PORT_OFFSET))
-    NODE_PORT=$((8008 + PORT_OFFSET))
-    NGINX_PORT=$((8100 + PORT_OFFSET))
-    HAPROXY_HTTP_PORT=$((8200 + PORT_OFFSET))
-    HAPROXY_HTTPS_PORT=$((8443 + PORT_OFFSET))
-    HAPROXY_STATS_PORT=$((1936 + PORT_OFFSET))
+    # Find a free port, skipping any already in use by other containers
+    find_free_port() {
+        local port=$1
+        while lsof -i :$port -P -n >/dev/null 2>&1; do
+            port=$((port + 1))
+        done
+        echo $port
+    }
+
+    # If docker-compose file already exists, read the actual ports from it
+    # instead of recalculating. find_free_port skips ports that are "in use",
+    # but on re-runs our own containers hold those ports, causing off-by-one.
+    COMPOSE_FILE=".worktree/docker-compose.${WORKSPACE_NAME}.yml"
+    if [ -f "$COMPOSE_FILE" ]; then
+        # Extract host ports from "- HOST:CONTAINER" mappings
+        _read_port() {
+            # Find the line with the container port and extract the host port
+            grep -E "^\s+- [0-9]+:$1\$" "$COMPOSE_FILE" | head -1 | sed 's/.*- \([0-9]*\):.*/\1/'
+        }
+        WEB_PORT=$(_read_port 8000)
+        NODE_PORT=$(_read_port 8008)
+        NGINX_PORT=$(_read_port 81)
+        HAPROXY_HTTP_PORT=$(_read_port 80)
+        HAPROXY_HTTPS_PORT=$(_read_port 443)
+        HAPROXY_STATS_PORT=$(_read_port 1936)
+    else
+        WEB_PORT=$(find_free_port $((8000 + PORT_OFFSET)))
+        NODE_PORT=$(find_free_port $((8008 + PORT_OFFSET)))
+        NGINX_PORT=$(find_free_port $((8100 + PORT_OFFSET)))
+        HAPROXY_HTTP_PORT=$(find_free_port $((8200 + PORT_OFFSET)))
+        HAPROXY_HTTPS_PORT=$(find_free_port $((8443 + PORT_OFFSET)))
+        HAPROXY_STATS_PORT=$(find_free_port $((1936 + PORT_OFFSET)))
+    fi
 fi
 
-# Helper function to render Jinja2 templates
+# Helper function to render templates using sed (no external dependencies)
 render_template() {
     local template_file=$1
     local output_file=$2
 
-    python3 << EOF
-import sys
-from jinja2 import Template
+    sed -e "s/{{ workspace_name }}/${WORKSPACE_NAME}/g" \
+        -e "s/{{ web_port }}/${WEB_PORT}/g" \
+        -e "s/{{ node_port }}/${NODE_PORT}/g" \
+        -e "s/{{ nginx_port }}/${NGINX_PORT}/g" \
+        -e "s/{{ haproxy_http_port }}/${HAPROXY_HTTP_PORT}/g" \
+        -e "s/{{ haproxy_https_port }}/${HAPROXY_HTTPS_PORT}/g" \
+        -e "s/{{ haproxy_stats_port }}/${HAPROXY_STATS_PORT}/g" \
+        "$template_file" > "$output_file"
 
-template_path = "${template_file}"
-output_path = "${output_file}"
-
-with open(template_path, 'r') as f:
-    template = Template(f.read())
-
-rendered = template.render(
-    workspace_name="${WORKSPACE_NAME}",
-    web_port=${WEB_PORT},
-    node_port=${NODE_PORT},
-    nginx_port=${NGINX_PORT},
-    haproxy_http_port=${HAPROXY_HTTP_PORT},
-    haproxy_https_port=${HAPROXY_HTTPS_PORT},
-    haproxy_stats_port=${HAPROXY_STATS_PORT}
-)
-
-# Ensure file ends with newline
-if not rendered.endswith('\n'):
-    rendered += '\n'
-
-with open(output_path, 'w') as f:
-    f.write(rendered)
-
-print(f"✓ Rendered {template_path} -> {output_path}")
-EOF
+    echo "✓ Rendered ${template_file} -> ${output_file}"
 }
 
 # Check if setup has been run
 NEEDS_SETUP=false
 if [ ! -f ".worktree/docker-compose.${WORKSPACE_NAME}.yml" ]; then
+    NEEDS_SETUP=true
+fi
+# Also run setup if SSL certificates are missing
+if [ ! -f "config/certificates/localhost.pem" ]; then
+    NEEDS_SETUP=true
+fi
+# Regenerate if template is newer than the generated compose file
+if [ -f ".worktree/docker-compose.${WORKSPACE_NAME}.yml" ] && [ "docker/compose/worktree.yml.j2" -nt ".worktree/docker-compose.${WORKSPACE_NAME}.yml" ]; then
     NEEDS_SETUP=true
 fi
 
@@ -118,18 +134,6 @@ if [ "$NEEDS_SETUP" = true ]; then
     if ! command -v docker compose &> /dev/null; then
         echo -e "${RED}ERROR: Docker Compose is not available${NC}"
         echo "Please install Docker Compose v2"
-        exit 1
-    fi
-
-    if ! command -v python3 &> /dev/null; then
-        echo -e "${RED}ERROR: Python 3 is not installed${NC}"
-        exit 1
-    fi
-
-    # Check for Jinja2
-    if ! python3 -c "import jinja2" 2>/dev/null; then
-        echo -e "${RED}ERROR: Python Jinja2 module is not installed${NC}"
-        echo "Install with: pip3 install jinja2"
         exit 1
     fi
 
@@ -172,8 +176,9 @@ if [ "$NEEDS_SETUP" = true ]; then
     if [ ! -f "config/certificates/localhost.pem" ]; then
         # Check if we can copy from parent repo (handle both regular repo and worktree)
         PARENT_CERTS=""
-        if [ -d "../../../config/certificates" ] && [ -f "../../../config/certificates/localhost.pem" ]; then
-            PARENT_CERTS="../../../config/certificates"
+        if [ -d "../../config/certificates" ] && [ -f "../../config/certificates/localhost.pem" ]; then
+            # Worktree is at .worktree/<name>, so ../../ gets to main repo
+            PARENT_CERTS="../../config/certificates"
         elif [ -d "/srv/newsblur/config/certificates" ] && [ -f "/srv/newsblur/config/certificates/localhost.pem" ]; then
             PARENT_CERTS="/srv/newsblur/config/certificates"
         fi
@@ -201,30 +206,34 @@ if [ "$NEEDS_SETUP" = true ]; then
     # Check if shared services are already running (using original container names)
     echo -e "${YELLOW}Checking for shared service containers...${NC}"
 
+    SHARED_SERVICES="newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch newsblur_imageproxy newsblur_dejavu"
     SHARED_SERVICES_RUNNING=true
 
-    if ! docker ps --filter "name=newsblur_db_postgres" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_postgres"; then
-        SHARED_SERVICES_RUNNING=false
-    fi
-
-    if ! docker ps --filter "name=newsblur_db_mongo" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_mongo"; then
-        SHARED_SERVICES_RUNNING=false
-    fi
-
-    if ! docker ps --filter "name=newsblur_db_redis" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_redis"; then
-        SHARED_SERVICES_RUNNING=false
-    fi
-
-    if ! docker ps --filter "name=newsblur_db_elasticsearch" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_elasticsearch"; then
-        SHARED_SERVICES_RUNNING=false
-    fi
+    for container in $SHARED_SERVICES; do
+        if ! docker ps --filter "name=^${container}$" --filter "status=running" --format "{{.Names}}" | grep -q "^${container}$"; then
+            SHARED_SERVICES_RUNNING=false
+            break
+        fi
+    done
 
     if [ "$SHARED_SERVICES_RUNNING" = false ]; then
         echo -e "${YELLOW}Shared services not running. Starting them...${NC}"
 
-        # Start only the shared services (databases and imageproxy)
-        # Using the standard docker-compose.yml which already has the correct names and ports
-        docker compose -f docker-compose.yml up -d newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch imageproxy dejavu
+        # First try to start existing containers, then create any missing ones
+        for container in $SHARED_SERVICES; do
+            if docker ps -a --filter "name=^${container}$" --format "{{.Names}}" | grep -q "^${container}$"; then
+                # Container exists, just start it
+                docker start "$container" 2>/dev/null || true
+            fi
+        done
+
+        # Create any missing containers using docker compose from main repo
+        # Use the main repo's docker-compose.yml to avoid namespace conflicts
+        if [ -f "../../docker-compose.yml" ]; then
+            (cd ../../ && docker compose up -d newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch imageproxy dejavu 2>/dev/null) || true
+        else
+            docker compose -f docker-compose.yml up -d newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch imageproxy dejavu 2>/dev/null || true
+        fi
 
         echo -e "${YELLOW}Waiting for shared services to be ready...${NC}"
 
@@ -278,10 +287,7 @@ if [ "$NEEDS_SETUP" = true ]; then
     # Set environment variables for the workspace
     export COMPOSE_PROJECT_NAME="${WORKSPACE_NAME}"
 
-    # Stop any existing containers first to avoid name conflicts
-    docker compose -f ".worktree/docker-compose.${WORKSPACE_NAME}.yml" down 2>/dev/null || true
-
-    # Start workspace containers using the standalone compose file
+    # Start workspace containers (docker compose up -d is idempotent for running containers)
     docker compose -f ".worktree/docker-compose.${WORKSPACE_NAME}.yml" up -d --remove-orphans
 
     # Wait for workspace web container
@@ -332,6 +338,7 @@ if [ "$NEEDS_SETUP" = true ]; then
     echo "  - Django (direct): http://localhost:${WEB_PORT}"
     echo "  - Node (direct):   http://localhost:${NODE_PORT}"
     echo "  - Nginx (direct):  http://localhost:${NGINX_PORT}"
+    echo "  - MCP Server:      http://localhost:${HAPROXY_HTTP_PORT}/mcp"
     echo ""
     echo -e "${GREEN}Shared services (same across all workspaces):${NC}"
     echo "  - PostgreSQL:      localhost:5434"
@@ -379,33 +386,60 @@ if [ -d "../../.claude/skills" ]; then
     fi
 fi
 
+# Configure Chrome DevTools MCP with --isolated flag for worktrees
+# This allows multiple worktrees to run Chrome DevTools MCP simultaneously
+if [ "$IS_MAIN_REPO" = false ] && command -v jq &>/dev/null; then
+    CLAUDE_CONFIG="$HOME/.claude.json"
+    WORKTREE_PATH="$(pwd)"
+
+    if [ -f "$CLAUDE_CONFIG" ]; then
+        # Check if this worktree already has chrome-devtools configured with --isolated
+        CURRENT_ARGS=$(jq -r ".projects[\"$WORKTREE_PATH\"].mcpServers[\"chrome-devtools\"].args // [] | join(\" \")" "$CLAUDE_CONFIG" 2>/dev/null || echo "")
+
+        if ! echo "$CURRENT_ARGS" | grep -q "\-\-isolated"; then
+            # Add or update chrome-devtools MCP with --isolated flag
+            TEMP_CONFIG=$(mktemp)
+            jq ".projects[\"$WORKTREE_PATH\"].mcpServers[\"chrome-devtools\"] = {
+                \"type\": \"stdio\",
+                \"command\": \"npx\",
+                \"args\": [\"-y\", \"chrome-devtools-mcp@latest\", \"--isolated\", \"--accept-insecure-certs\"],
+                \"env\": {}
+            }" "$CLAUDE_CONFIG" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CLAUDE_CONFIG"
+            echo -e "${GREEN}✓ Configured Chrome DevTools MCP with --isolated flag${NC}"
+        fi
+    fi
+fi
+
 # Check if shared services are already running
 echo -e "${YELLOW}Checking for shared service containers...${NC}"
 
+SHARED_SERVICES="newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch newsblur_imageproxy newsblur_dejavu"
 SHARED_SERVICES_RUNNING=true
 
-if ! docker ps --filter "name=newsblur_db_postgres" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_postgres"; then
-    SHARED_SERVICES_RUNNING=false
-fi
-
-if ! docker ps --filter "name=newsblur_db_mongo" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_mongo"; then
-    SHARED_SERVICES_RUNNING=false
-fi
-
-if ! docker ps --filter "name=newsblur_db_redis" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_redis"; then
-    SHARED_SERVICES_RUNNING=false
-fi
-
-if ! docker ps --filter "name=newsblur_db_elasticsearch" --filter "status=running" --format "{{.Names}}" | grep -q "newsblur_db_elasticsearch"; then
-    SHARED_SERVICES_RUNNING=false
-fi
+for container in $SHARED_SERVICES; do
+    if ! docker ps --filter "name=^${container}$" --filter "status=running" --format "{{.Names}}" | grep -q "^${container}$"; then
+        SHARED_SERVICES_RUNNING=false
+        break
+    fi
+done
 
 if [ "$SHARED_SERVICES_RUNNING" = false ]; then
     echo -e "${YELLOW}Shared services not running. Starting them...${NC}"
 
-    # Start only the shared services (databases and imageproxy)
-    # Using the standard docker-compose.yml which already has the correct names and ports
-    docker compose -f docker-compose.yml up -d newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch imageproxy dejavu
+    # First try to start existing containers, then create any missing ones
+    for container in $SHARED_SERVICES; do
+        if docker ps -a --filter "name=^${container}$" --format "{{.Names}}" | grep -q "^${container}$"; then
+            # Container exists, just start it
+            docker start "$container" 2>/dev/null || true
+        fi
+    done
+
+    # Create any missing containers using docker compose from main repo
+    if [ -f "../../docker-compose.yml" ]; then
+        (cd ../../ && docker compose up -d newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch imageproxy dejavu 2>/dev/null) || true
+    else
+        docker compose -f docker-compose.yml up -d newsblur_db_postgres newsblur_db_mongo newsblur_db_redis newsblur_db_elasticsearch imageproxy dejavu 2>/dev/null || true
+    fi
 
     echo -e "${YELLOW}Waiting for shared services to be ready...${NC}"
 
@@ -416,7 +450,7 @@ if [ "$SHARED_SERVICES_RUNNING" = false ]; then
         fi
         if [ $i -eq 30 ]; then
             echo -e "${RED}ERROR: PostgreSQL failed to start${NC}"
-            docker compose -f docker-compose.yml logs newsblur_db_postgres
+            docker logs newsblur_db_postgres 2>&1 | tail -20
             exit 1
         fi
         sleep 2
@@ -429,7 +463,7 @@ if [ "$SHARED_SERVICES_RUNNING" = false ]; then
         fi
         if [ $i -eq 30 ]; then
             echo -e "${RED}ERROR: MongoDB failed to start${NC}"
-            docker compose -f docker-compose.yml logs newsblur_db_mongo
+            docker logs newsblur_db_mongo 2>&1 | tail -20
             exit 1
         fi
         sleep 2
@@ -442,7 +476,7 @@ if [ "$SHARED_SERVICES_RUNNING" = false ]; then
         fi
         if [ $i -eq 30 ]; then
             echo -e "${RED}ERROR: Redis failed to start${NC}"
-            docker compose -f docker-compose.yml logs newsblur_db_redis
+            docker logs newsblur_db_redis 2>&1 | tail -20
             exit 1
         fi
         sleep 2
@@ -469,6 +503,7 @@ echo "   • HAProxy Stats:   https://localhost:${HAPROXY_STATS_PORT}"
 echo "   • Django (direct): http://localhost:${WEB_PORT}"
 echo "   • Node (direct):   http://localhost:${NODE_PORT}"
 echo "   • Nginx (direct):  http://localhost:${NGINX_PORT}"
+echo "   • MCP Server:      http://localhost:${HAPROXY_HTTP_PORT}/mcp"
 echo ""
 echo -e "${YELLOW}💡 Tip: Type 'thisisunsafe' in Chrome to bypass SSL certificate warning${NC}"
 echo ""
@@ -480,10 +515,27 @@ echo ""
 # Set environment for docker compose
 export COMPOSE_PROJECT_NAME="${WORKSPACE_NAME}"
 
-# Stop any existing containers first to avoid name conflicts
-docker compose -f ".worktree/docker-compose.${WORKSPACE_NAME}.yml" down 2>/dev/null || true
+# Check for and remove containers with broken network references
+# This can happen when Docker networks are recreated but old containers still reference the old network ID
+WORKSPACE_CONTAINERS=$(docker ps -a --filter "name=${WORKSPACE_NAME}" --format "{{.Names}}" 2>/dev/null | grep -E "newsblur_(web|node|celery|nginx|haproxy)_${WORKSPACE_NAME}$" || true)
+if [ -n "$WORKSPACE_CONTAINERS" ]; then
+    # Check if any container is in Exited state (potential broken network)
+    EXITED_CONTAINER=$(docker ps -a --filter "name=${WORKSPACE_NAME}" --filter "status=exited" --format "{{.Names}}" 2>/dev/null | grep -E "newsblur_(web|node|celery|nginx|haproxy)_${WORKSPACE_NAME}$" | head -1 || true)
+    if [ -n "$EXITED_CONTAINER" ]; then
+        # Try starting it to check if network is broken
+        START_OUTPUT=$(docker start "$EXITED_CONTAINER" 2>&1 || true)
+        if echo "$START_OUTPUT" | grep -q "network.*not found"; then
+            # Network is broken, remove all workspace containers so they can be recreated
+            echo -e "${YELLOW}Detected broken network reference, removing stale containers...${NC}"
+            for container in $WORKSPACE_CONTAINERS; do
+                docker rm -f "$container" 2>/dev/null || true
+            done
+            echo -e "${GREEN}✓ Stale containers removed${NC}"
+        fi
+    fi
+fi
 
-# Start the containers
+# Start the containers (idempotent - won't restart already running containers)
 docker compose -f ".worktree/docker-compose.${WORKSPACE_NAME}.yml" up -d --remove-orphans
 
 echo ""

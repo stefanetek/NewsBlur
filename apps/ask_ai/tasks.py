@@ -1,3 +1,5 @@
+"""Ask AI tasks: process user questions via LLM providers and stream responses."""
+
 import json
 import time
 import uuid
@@ -9,11 +11,19 @@ from django.contrib.auth.models import User
 from apps.rss_feeds.models import MStory
 from newsblur_web.celeryapp import app
 from utils import log as logging
+from utils.llm_costs import LLMCostTracker
 from utils.story_functions import html_to_text
 
 from .models import MAskAIResponse
 from .prompts import get_full_prompt
-from .providers import DEFAULT_MODEL, LLM_EXCEPTIONS, MODELS, get_provider
+from .providers import (
+    DEFAULT_MODEL,
+    LLM_EXCEPTIONS,
+    MODEL_VENDORS,
+    MODELS,
+    get_provider,
+    is_refused_llm_error,
+)
 from .usage import AskAIUsageTracker
 
 
@@ -26,6 +36,7 @@ def AskAIQuestion(
     conversation_history=None,
     request_id=None,
     model=None,
+    thinking=False,
 ):
     """
     Process an Ask AI question and stream the response via Redis PubSub.
@@ -70,13 +81,16 @@ def AskAIQuestion(
         if model_name not in MODELS:
             model_name = DEFAULT_MODEL
 
+        # Cache key differentiates thinking mode from fast mode
+        cache_model_key = f"{model_name}:thinking" if thinking else model_name
+
         if not conversation_history and not custom_question:
             cached = MAskAIResponse.get_cached_response(
                 user_id=user_id,
                 story_hash=story_hash,
                 question_id=question_id,
                 custom_question=custom_question,
-                model=model_name,
+                model=cache_model_key,
             )
             if cached:
                 response_text = cached.response_text
@@ -148,7 +162,7 @@ def AskAIQuestion(
             ]
 
         # Get provider and model ID
-        provider, model_id = get_provider(model_name)
+        provider, model_id, thinking_config = get_provider(model_name, thinking=thinking)
 
         # Check for required API key
         if not provider.is_configured():
@@ -157,22 +171,61 @@ def AskAIQuestion(
             logging.user(user, f"~BB~FGAsk AI: ~FR~SBError~SN~FG - {error_msg}")
             return {"code": -1, "message": error_msg}
 
+        thinking_label = " (thinking)" if thinking else ""
         logging.user(
             user,
-            f"~BB~FGAsk AI: Starting stream for story ~SB{story_hash}~SN, question ~SB{question_id}~SN, model ~SB{model_name}~SN",
+            f"~BB~FGAsk AI: Starting stream for story ~SB{story_hash}~SN, question ~SB{question_id}~SN, model ~SB{model_name}{thinking_label}~SN",
         )
 
         full_response = []
-        chunk_count = 0
 
-        for text in provider.stream_response(messages, model_id):
-            full_response.append(text)
-            publish_event("chunk", {"chunk": text})
-            chunk_count += 1
-            if chunk_count == 1:
-                logging.user(user, f"~BB~FGAsk AI: First chunk to Redis channel ~SB'{username}'~SN")
+        def stream_answer(provider, model_id, thinking_config):
+            for text in provider.stream_response(messages, model_id, thinking_config=thinking_config):
+                full_response.append(text)
+                publish_event("chunk", {"chunk": text})
+                if len(full_response) == 1:
+                    logging.user(user, f"~BB~FGAsk AI: First chunk to Redis channel ~SB'{username}'~SN")
+
+        try:
+            stream_answer(provider, model_id, thinking_config)
+        except LLM_EXCEPTIONS as e:
+            # tasks.py: SpaceXSI (formerly xAI) refuses outright once its account runs out of
+            # credits or hits its spending limit. Answer Grok users with the default model
+            # instead of an error, as briefings do in apps/briefing/summary.py. Only before any
+            # text has streamed, so an answer never switches models halfway through.
+            if (
+                MODEL_VENDORS.get(model_name) != "xai"
+                or model_name == DEFAULT_MODEL
+                or full_response
+                or not is_refused_llm_error(e)
+            ):
+                raise
+            fallback = get_provider(DEFAULT_MODEL, thinking=thinking)
+            if not fallback[0].is_configured():
+                raise
+            logging.user(
+                user,
+                f"~BB~FGAsk AI: ~FRGrok refused~FG ({e}), answering with ~SB{DEFAULT_MODEL}~SN instead",
+            )
+            model_name = DEFAULT_MODEL
+            cache_model_key = f"{model_name}:thinking" if thinking else model_name
+            provider, model_id, thinking_config = fallback
+            stream_answer(provider, model_id, thinking_config)
 
         full_response_text = "".join(full_response)
+
+        # Record LLM cost
+        input_tokens, output_tokens = provider.get_last_usage()
+        LLMCostTracker.record_usage(
+            provider=MODEL_VENDORS.get(model_name, "unknown"),
+            model=model_id,
+            feature="ask_ai",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            user_id=user_id,
+            request_id=request_token,
+            metadata={"question_id": question_id, "story_hash": story_hash},
+        )
 
         # Record usage for live responses
         tracker = AskAIUsageTracker(user)
@@ -197,6 +250,7 @@ def AskAIQuestion(
         if not conversation_history and not custom_question:
             metadata = {
                 "model": model_name,
+                "thinking": thinking,
                 "question_id": question_id,
                 "duration_seconds": time.time() - start_time,
                 "response_length": len(full_response_text),
@@ -209,7 +263,7 @@ def AskAIQuestion(
                 question_id=question_id,
                 response_text=full_response_text,
                 custom_question=custom_question,
-                model=model_name,
+                model=cache_model_key,
                 metadata=metadata,
             )
 

@@ -2,18 +2,21 @@ package com.newsblur.database;
 
 import static com.newsblur.util.AppConstants.ALL_SHARED_STORIES_GROUP_KEY;
 import static com.newsblur.util.AppConstants.ALL_STORIES_GROUP_KEY;
+import static com.newsblur.util.AppConstants.DAILY_BRIEFING_GROUP_KEY;
 import static com.newsblur.util.AppConstants.GLOBAL_SHARED_STORIES_GROUP_KEY;
+import static com.newsblur.util.AppConstants.GOOD_READS_GROUP_KEY;
 import static com.newsblur.util.AppConstants.INFREQUENT_SITE_STORIES_GROUP_KEY;
+import static com.newsblur.util.AppConstants.LONG_READS_GROUP_KEY;
 import static com.newsblur.util.AppConstants.READ_STORIES_GROUP_KEY;
 import static com.newsblur.util.AppConstants.SAVED_SEARCHES_GROUP_KEY;
 import static com.newsblur.util.AppConstants.SAVED_STORIES_GROUP_KEY;
+import static com.newsblur.util.AppConstants.WIDELY_READ_STORIES_GROUP_KEY;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,7 +24,7 @@ import java.util.Map;
 import java.util.Set;
 
 import android.content.Context;
-import android.database.Cursor;
+import android.graphics.Bitmap;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -38,28 +41,36 @@ import androidx.annotation.Nullable;
 
 import com.google.android.material.progressindicator.CircularProgressIndicator;
 import com.newsblur.R;
+import com.newsblur.domain.CustomIcon;
 import com.newsblur.domain.Feed;
+import com.newsblur.util.CustomIconRenderer;
+import com.newsblur.domain.FeedQueryResult;
 import com.newsblur.domain.Folder;
+import com.newsblur.domain.FolderHierarchy;
+import com.newsblur.domain.FolderQueryResult;
 import com.newsblur.domain.SavedSearch;
+import com.newsblur.domain.SavedStoryCountsQueryResult;
 import com.newsblur.domain.StarredCount;
 import com.newsblur.domain.SocialFeed;
+import com.newsblur.preference.PrefsRepo;
 import com.newsblur.util.Session;
 import com.newsblur.util.AppConstants;
+import com.newsblur.util.DailyBriefingFolderPlacementDecision;
 import com.newsblur.util.FeedListOrder;
 import com.newsblur.util.SessionDataSource;
 import com.newsblur.util.SpacingStyle;
 import com.newsblur.util.FeedSet;
 import com.newsblur.util.ImageLoader;
-import com.newsblur.util.PrefsUtils;
 import com.newsblur.util.StateFilter;
 import com.newsblur.util.UIUtils;
+import com.newsblur.view.AnimatedFolderListView;
 
 /**
  * Custom adapter to display a nested folder/feed list in an ExpandableListView.
  */
 public class FolderListAdapter extends BaseExpandableListAdapter {
 
-    private enum GroupType { GLOBAL_SHARED_STORIES, ALL_SHARED_STORIES, INFREQUENT_STORIES, ALL_STORIES, FOLDER, READ_STORIES, SAVED_SEARCHES, SAVED_STORIES }
+    private enum GroupType { GLOBAL_SHARED_STORIES, ALL_SHARED_STORIES, DAILY_BRIEFING, INFREQUENT_STORIES, WIDELY_READ_STORIES, LONG_READS, GOOD_READS, ALL_STORIES, FOLDER, READ_STORIES, SAVED_SEARCHES, SAVED_STORIES }
     private enum ChildType { SOCIAL_FEED, FEED, SAVED_BY_TAG, SAVED_SEARCH }
 
     private final static float defaultTextSize_childName = 14;
@@ -68,11 +79,13 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
 
     private final static float NONZERO_UNREADS_ALPHA = 0.87f;
     private final static float ZERO_UNREADS_ALPHA = 0.70f;
+    private final static float INDICATOR_COLLAPSED_ROTATION = 0f;
+    private final static float INDICATOR_EXPANDED_ROTATION = 180f;
 
     /** Social feed in display order. */
-    private List<SocialFeed> socialFeedsOrdered = Collections.emptyList();
+    private final List<SocialFeed> socialFeedsOrdered = new ArrayList<>();
     /** Active social feed in display order. */
-    private List<SocialFeed> socialFeedsActive = Collections.emptyList();
+    private final List<SocialFeed> socialFeedsActive = new ArrayList<>();
     /** Total neutral unreads for all social feeds. */
     public int totalSocialNeutCount = 0;
     /** Total positive unreads for all social feeds. */
@@ -81,22 +94,22 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
     public int totalActiveFeedCount = 0;
 
     /** Feeds, indexed by feed ID. */
-    private Map<String,Feed> feeds = Collections.emptyMap();
+    private final Map<String,Feed> feeds = new LinkedHashMap<>();
     /** Neutral counts for active feeds, indexed by feed ID. */
-    private Map<String,Integer> feedNeutCounts = Collections.emptyMap();
+    private final Map<String,Integer> feedNeutCounts = new LinkedHashMap<>();
     /** Positive counts for active feeds, indexed by feed ID. */
-    private Map<String,Integer> feedPosCounts = Collections.emptyMap();
+    private final Map<String,Integer> feedPosCounts = new LinkedHashMap<>();
     /** Total neutral unreads for all feeds. */
     public int totalNeutCount = 0;
     /** Total positive unreads for all feeds. */
     public int totalPosCount = 0;
     /** Saved counts for active feeds, indexed by feed ID. */
-    private Map<String,Integer> feedSavedCounts = Collections.emptyMap();
+    private final Map<String,Integer> feedSavedCounts = new LinkedHashMap<>();
 
     /** Folders, indexed by canonical name. */
-    private Map<String,Folder> folders = Collections.emptyMap();
+    private final Map<String,Folder> folders = new LinkedHashMap<>();
     /** Folders, indexed by flat name. */
-    private Map<String,Folder> flatFolders = Collections.emptyMap();
+    private final Map<String,Folder> flatFolders = new LinkedHashMap<>();
     /** Flat names of currently displayed folders in display order. */
     private List<String> activeFolderNames;
     /** List of currently displayed feeds for a folder, ordered the same as activeFolderNames. */
@@ -107,9 +120,9 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
     private List<Integer> folderPosCounts;
 
     /** Starred story sets in display order. */
-    private List<StarredCount> starredCountsByTag = Collections.emptyList();
+    private final List<StarredCount> starredCountsByTag = new ArrayList<>();
     /** Saved Searches */
-    private List<SavedSearch> savedSearches = Collections.emptyList();
+    private final List<SavedSearch> savedSearches = new ArrayList<>();
 
     private int savedStoriesTotalCount;
 
@@ -124,6 +137,7 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
 	private StateFilter currentState;
 	private final ImageLoader iconLoader;
 	private final BlurDatabaseHelper dbHelper;
+    private final PrefsRepo prefsRepo;
 
     // since we want to implement a custom expando that does group collapse/expand, we need
     // a way to call back to those functions on the listview from the onclick listener of
@@ -137,18 +151,24 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
     // the last feed or folder viewed and force the DB to include it in the selection
     public String lastFeedViewedId;
     public String lastFolderViewed;
+    @Nullable
+    private Feed tryFeed;
 
     public String activeSearchQuery;
 
-	public FolderListAdapter(Context context, StateFilter currentState, ImageLoader iconLoader, BlurDatabaseHelper dbHelper) {
+    @Nullable
+    private Runnable toggleAllFoldersClickListener;
+
+	public FolderListAdapter(Context context, StateFilter currentState, ImageLoader iconLoader, BlurDatabaseHelper dbHelper, PrefsRepo prefsRepo) {
         this.currentState = currentState;
         this.context = context;
 		this.inflater = (LayoutInflater) context.getSystemService(Context.LAYOUT_INFLATER_SERVICE);
 		this.iconLoader = iconLoader;
 		this.dbHelper = dbHelper;
+        this.prefsRepo = prefsRepo;
 
-        textSize = PrefsUtils.getListTextSize(context);
-        spacingStyle = PrefsUtils.getSpacingStyle(context);
+        textSize = prefsRepo.getListTextSize();
+        spacingStyle = prefsRepo.getSpacingStyle();
 	}
 
 	@Override
@@ -174,10 +194,18 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
                 ((TextView) v.findViewById(R.id.row_foldersumpos)).setText(Integer.toString(totalSocialPosiCount));
             }
             v.findViewById(R.id.row_foldersums).setVisibility(isExpanded ? View.INVISIBLE : View.VISIBLE);
+		} else if (isRowDailyBriefing(groupPosition)) {
+			if (v == null) v =  inflater.inflate(R.layout.row_daily_briefing, null, false);
 		} else if (isRowAllStories(groupPosition)) {
 			if (v == null) v =  inflater.inflate(R.layout.row_all_stories, null, false);
 		} else if (isRowInfrequentStories(groupPosition)) {
 			if (v == null) v =  inflater.inflate(R.layout.row_infrequent_stories, null, false);
+        } else if (isRowWidelyReadStories(groupPosition)) {
+            if (v == null) v = inflater.inflate(R.layout.row_widely_read_stories, null, false);
+        } else if (isRowLongReads(groupPosition)) {
+            if (v == null) v = inflater.inflate(R.layout.row_long_reads, null, false);
+        } else if (isRowGoodReads(groupPosition)) {
+            if (v == null) v = inflater.inflate(R.layout.row_good_reads, null, false);
         } else if (isRowReadStories(groupPosition)) {
             if (v == null) v = inflater.inflate(R.layout.row_read_stories, null, false);
         } else if (isRowSavedSearches(groupPosition)) {
@@ -198,13 +226,27 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
 			if (v == null) v = inflater.inflate(R.layout.row_folder, parent, false);
             String folderName = activeFolderNames.get(groupPosition);
 			TextView folderTitle = v.findViewById(R.id.row_foldername);
-		    folderTitle.setText(folderName);
+		    Folder folder = flatFolders.get(folderName);
+            folderTitle.setText(folder.name);
+            v.setPaddingRelative(UIUtils.dp2px(context, 28 * folder.depth()), 0, 0, 0);
+            folderTitle.setContentDescription(folderName);
 		    folderTitle.setTextSize(textSize * defaultTextSize_childName);
             bindCountViews(v, folderNeutCounts.get(groupPosition), folderPosCounts.get(groupPosition), false);
             v.findViewById(R.id.row_foldersums).setVisibility(isExpanded ? View.INVISIBLE : View.VISIBLE);
             ImageView folderIconView = v.findViewById(R.id.row_folder_icon);
             if ( folderIconView != null ) {
-                folderIconView.setImageResource(isExpanded ? R.drawable.ic_folder : R.drawable.ic_folder_closed);
+                CustomIcon customIcon = BlurDatabaseHelper.getFolderIcon(folderName);
+                if (customIcon != null) {
+                    int iconSize = UIUtils.dp2px(context, 19);
+                    Bitmap iconBitmap = CustomIconRenderer.renderIcon(context, customIcon, iconSize);
+                    if (iconBitmap != null) {
+                        folderIconView.setImageBitmap(iconBitmap);
+                    } else {
+                        folderIconView.setImageResource(isExpanded ? R.drawable.ic_folder : R.drawable.ic_folder_closed);
+                    }
+                } else {
+                    folderIconView.setImageResource(isExpanded ? R.drawable.ic_folder : R.drawable.ic_folder_closed);
+                }
             }
 		}
 
@@ -222,8 +264,14 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         // if a group has a sub-view called row_folder_indicator, it will act as an expando
         @Nullable ImageView folderIndicatorView = v.findViewById(R.id.row_folder_indicator);
         if ( folderIndicatorView != null ) {
-            folderIndicatorView.setImageResource(isExpanded ? R.drawable.ic_arrow_down : R.drawable.ic_arrow_up);
-			folderIndicatorView.setOnClickListener(v1 -> toggleGroup(v1, groupPosition, isExpanded));
+            folderIndicatorView.setImageResource(R.drawable.ic_arrow_up);
+            if (isRowAllStories(groupPosition)) {
+                bindIndicatorRotation(folderIndicatorView, !areAllVisibleFoldersCollapsed());
+                folderIndicatorView.setOnClickListener(v1 -> toggleAllFolders(folderIndicatorView));
+            } else {
+                bindIndicatorRotation(folderIndicatorView, isExpanded);
+			    folderIndicatorView.setOnClickListener(v1 -> toggleGroup(folderIndicatorView, groupPosition));
+            }
         }
 
 		return v;
@@ -234,15 +282,41 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
      * on groups anywhere other than an expando, so the default onGroupClick action in the Listview
      * is overridden in the fragment that uses this adapter.
      */
-    private void toggleGroup(View v, int groupPosition, boolean isExpanded) {
+    private void toggleGroup(@NonNull ImageView indicatorView, int groupPosition) {
         ExpandableListView list = listBackref.get();
         if (list == null) return;
 
-        if (isExpanded) {
-            list.collapseGroup(groupPosition);
+        boolean isExpanded = list.isGroupExpanded(groupPosition);
+        Runnable change = () -> {
+            if (isExpanded) {
+                list.collapseGroup(groupPosition);
+            } else {
+                // AnimatedFolderListView.kt owns movement; ExpandableListView's optional animation is a separate scroll.
+                list.expandGroup(groupPosition, false);
+            }
+        };
+        if (list instanceof AnimatedFolderListView) {
+            ((AnimatedFolderListView) list).animateGroupChange(groupPosition, !isExpanded, change);
         } else {
-            list.expandGroup(groupPosition, true);
+            change.run();
         }
+    }
+
+    private void toggleAllFolders(@NonNull ImageView indicatorView) {
+        if (toggleAllFoldersClickListener != null) {
+            ExpandableListView list = listBackref.get();
+            if (list instanceof AnimatedFolderListView) {
+                ((AnimatedFolderListView) list).animateGroupChange(getRootFolderIndex(),
+                        areAllVisibleFoldersCollapsed(), toggleAllFoldersClickListener);
+            } else {
+                toggleAllFoldersClickListener.run();
+            }
+        }
+    }
+
+    private void bindIndicatorRotation(@NonNull ImageView indicatorView, boolean expanded) {
+        indicatorView.animate().cancel();
+        indicatorView.setRotation(expanded ? INDICATOR_EXPANDED_ROTATION : INDICATOR_COLLAPSED_ROTATION);
     }
 
 	@Override
@@ -255,7 +329,7 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
             TextView nameView = v.findViewById(R.id.row_socialfeed_name);
             nameView.setText(f.feedTitle);
             nameView.setTextSize(textSize * defaultTextSize_childName);
-            nameView.setPadding(nameView.getPaddingLeft(), titleVerticalPadding, nameView.getPaddingRight(), titleVerticalPadding);
+            nameView.setPaddingRelative(nameView.getPaddingStart(), titleVerticalPadding, nameView.getPaddingEnd(), titleVerticalPadding);
             ImageView iconView = v.findViewById(R.id.row_socialfeed_icon);
             iconLoader.displayImage(f.photoUrl, iconView);
             TextView neutCounter = v.findViewById(R.id.row_socialsumneu);
@@ -288,7 +362,7 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
             nameView.setText(sc.tag);
             nameView.setTextSize(textSize * defaultTextSize_childName);
             nameView.setAlpha(NONZERO_UNREADS_ALPHA);
-            nameView.setPadding(nameView.getPaddingLeft(), titleVerticalPadding, nameView.getPaddingRight(), titleVerticalPadding);
+            nameView.setPaddingRelative(nameView.getPaddingStart(), titleVerticalPadding, nameView.getPaddingEnd(), titleVerticalPadding);
             TextView savedCounter = v.findViewById(R.id.row_saved_tag_sum);
             savedCounter.setText(Integer.toString(checkNegativeUnreads(sc.count)));
             savedCounter.setTextSize(textSize * defaultTextSize_count);
@@ -297,7 +371,7 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
             SavedSearch ss = savedSearches.get(childPosition);
             TextView nameView = v.findViewById(R.id.row_saved_search_title);
             nameView.setText(UIUtils.fromHtml(ss.feedTitle));
-            nameView.setPadding(nameView.getPaddingLeft(), titleVerticalPadding, nameView.getPaddingRight(), titleVerticalPadding);
+            nameView.setPaddingRelative(nameView.getPaddingStart(), titleVerticalPadding, nameView.getPaddingEnd(), titleVerticalPadding);
             ImageView iconView = v.findViewById(R.id.row_saved_search_icon);
             iconLoader.preCheck(ss.faviconUrl, iconView);
             iconLoader.displayImage(ss.faviconUrl, iconView);
@@ -305,17 +379,29 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
             if (v == null) v = inflater.inflate(R.layout.row_feed, parent, false);
             Feed f = activeFolderChildren.get(groupPosition).get(childPosition);
             FrameLayout containerTitle = v.findViewById(R.id.row_title);
-            int rowMarginStart = isRowAllStories(groupPosition) ? 0 : UIUtils.dp2px(context, 32);
+            int rowMarginStart = isRowAllStories(groupPosition) ? 0 : UIUtils.dp2px(context, 28 * (getGroupFolder(groupPosition).depth() + 1));
             RelativeLayout.LayoutParams lp = (RelativeLayout.LayoutParams) containerTitle.getLayoutParams();
             lp.setMarginStart(rowMarginStart);
             containerTitle.setLayoutParams(lp);
             TextView nameView = v.findViewById(R.id.row_feedname);
             nameView.setText(f.title);
             nameView.setTextSize(textSize * defaultTextSize_childName);
-            nameView.setPadding(nameView.getPaddingLeft(), titleVerticalPadding, nameView.getPaddingRight(), titleVerticalPadding);
+            nameView.setPaddingRelative(nameView.getPaddingStart(), titleVerticalPadding, nameView.getPaddingEnd(), titleVerticalPadding);
             ImageView iconView = v.findViewById(R.id.row_feedfavicon);
-            iconLoader.preCheck(f.faviconUrl, iconView);
-            iconLoader.displayImage(f.faviconUrl, iconView);
+            CustomIcon customFeedIcon = BlurDatabaseHelper.getFeedIcon(f.feedId);
+            if (customFeedIcon != null) {
+                int iconSize = UIUtils.dp2px(context, 19);
+                Bitmap iconBitmap = CustomIconRenderer.renderIcon(context, customFeedIcon, iconSize);
+                if (iconBitmap != null) {
+                    iconView.setImageBitmap(iconBitmap);
+                } else {
+                    iconLoader.preCheck(f.faviconUrl, iconView);
+                    iconLoader.displayImage(f.faviconUrl, iconView);
+                }
+            } else {
+                iconLoader.preCheck(f.faviconUrl, iconView);
+                iconLoader.displayImage(f.faviconUrl, iconView);
+            }
             TextView neutCounter = v.findViewById(R.id.row_feedneutral);
             TextView posCounter = v.findViewById(R.id.row_feedpositive);
             TextView savedCounter = v.findViewById(R.id.row_feedsaved);
@@ -403,11 +489,19 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
             return FeedSet.globalShared();
         } else if (isRowAllSharedStories(groupPosition)) {
             return FeedSet.allSocialFeeds();
+        } else if (isRowDailyBriefing(groupPosition)) {
+            return FeedSet.dailyBriefing();
         } else if (isRowAllStories(groupPosition)) {
             if (currentState == StateFilter.SAVED) return FeedSet.allSaved();
             return FeedSet.allFeeds();
         } else if (isRowInfrequentStories(groupPosition)) {
             return FeedSet.infrequentFeeds();
+        } else if (isRowWidelyReadStories(groupPosition)) {
+            return FeedSet.widelyReadStories();
+        } else if (isRowLongReads(groupPosition)) {
+            return FeedSet.longReads();
+        } else if (isRowGoodReads(groupPosition)) {
+            return FeedSet.goodReads();
         } else if (isRowReadStories(groupPosition)) {
             return FeedSet.allRead();
         } else if (isRowSavedStories(groupPosition)) {
@@ -428,10 +522,11 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         if (isRowRootFolder(groupPosition)) return AppConstants.ROOT_FOLDER;
         String flatFolderName = activeFolderNames.get(groupPosition);
         Folder folder = flatFolders.get(flatFolderName);
-        return folder.name;
+        return folder.flatName();
     }
 
     public Folder getGroupFolder(int groupPosition) {
+        if (!isValidGroupPosition(groupPosition)) return null;
         String flatFolderName = activeFolderNames.get(groupPosition);
         return flatFolders.get(flatFolderName);
     }
@@ -484,11 +579,15 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
 		return getChild(groupPosition, childPosition).hashCode();
 	}
 
-	public synchronized String getGroupUniqueName(int groupPosition) {
+    public synchronized String getGroupUniqueName(int groupPosition) {
         // these "names" aren't actually what is used to render the row, but are used
         // by the fragment for tracking row identity to save open/close preferences
         return activeFolderNames.get(groupPosition);
 	}
+
+    public void setToggleAllFoldersClickListener(@Nullable Runnable toggleAllFoldersClickListener) {
+        this.toggleAllFoldersClickListener = toggleAllFoldersClickListener;
+    }
 
     public boolean isRowGlobalSharedStories(int groupPosition) {
         return GLOBAL_SHARED_STORIES_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
@@ -502,8 +601,24 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         return ALL_STORIES_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
     }
 
+    public boolean isRowDailyBriefing(int groupPosition) {
+        return DAILY_BRIEFING_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
+    }
+
     public boolean isRowInfrequentStories(int groupPosition) {
         return INFREQUENT_SITE_STORIES_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
+    }
+
+    public boolean isRowWidelyReadStories(int groupPosition) {
+        return WIDELY_READ_STORIES_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
+    }
+
+    public boolean isRowLongReads(int groupPosition) {
+        return LONG_READS_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
+    }
+
+    public boolean isRowGoodReads(int groupPosition) {
+        return GOOD_READS_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
     }
 
     public boolean isRowReadStories(int groupPosition) {
@@ -516,6 +631,20 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
 
     public boolean isRowSavedSearches(int groupPosition) {
         return SAVED_SEARCHES_GROUP_KEY.equals(activeFolderNames.get(groupPosition));
+    }
+
+    public boolean isNormalFolder(int groupPosition) {
+        return !isRowGlobalSharedStories(groupPosition) &&
+               !isRowAllSharedStories(groupPosition) &&
+               !isRowDailyBriefing(groupPosition) &&
+               !isRowAllStories(groupPosition) &&
+               !isRowInfrequentStories(groupPosition) &&
+               !isRowWidelyReadStories(groupPosition) &&
+               !isRowLongReads(groupPosition) &&
+               !isRowGoodReads(groupPosition) &&
+               !isRowReadStories(groupPosition) &&
+               !isRowSavedStories(groupPosition) &&
+               !isRowSavedSearches(groupPosition);
     }
 
     /**
@@ -531,18 +660,14 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         return activeFolderNames.indexOf(ALL_STORIES_GROUP_KEY);
     }
 
-	public synchronized void setSocialFeedCursor(Cursor cursor) {
-        if (!cursor.isBeforeFirst()) return;
-        socialFeedsOrdered = new ArrayList<SocialFeed>(cursor.getCount());
-        while (cursor.moveToNext()) {
-            SocialFeed f = SocialFeed.fromCursor(cursor);
-            socialFeedsOrdered.add(f);
-        }
+	public synchronized void setSocialFeeds(@NonNull List<SocialFeed> socialFeeds) {
+        socialFeedsOrdered.clear();
+        socialFeedsOrdered.addAll(socialFeeds);
         recountSocialFeeds();
     }
 
     private void recountSocialFeeds() {
-        socialFeedsActive = new ArrayList<SocialFeed>();
+        socialFeedsActive.clear();
         totalSocialNeutCount = 0;
         totalSocialPosiCount = 0;
         for (SocialFeed f : socialFeedsOrdered) {
@@ -561,76 +686,88 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         notifyDataSetChanged();
 	}
 
-    public synchronized void setFoldersCursor(Cursor cursor) {
-        if ((cursor.getCount() < 1) || (!cursor.isBeforeFirst())) return;
-        folders = new LinkedHashMap<String,Folder>(cursor.getCount());
-        flatFolders = new LinkedHashMap<String,Folder>(cursor.getCount());
-        while (cursor.moveToNext()) {
-            Folder folder = Folder.fromCursor(cursor);
-            folders.put(folder.name, folder);
-            flatFolders.put(folder.flatName(), folder);
+    public synchronized void setFolders(FolderQueryResult foldersResult) {
+        folders.clear();
+        flatFolders.clear();
+        folders.putAll(foldersResult.getFolders());
+        flatFolders.putAll(foldersResult.getFlatFolders());
+        com.newsblur.network.FolderPath.setFolders(flatFolders.values());
+        closedFolders.clear();
+        for (String path : flatFolders.keySet()) {
+            if (!prefsRepo.getBoolean(AppConstants.FOLDER_PRE + "_" + path, true)) closedFolders.add(path);
         }
+
         recountFeeds();
         notifyDataSetChanged();
     }
 
-	public synchronized void setFeedCursor(Cursor cursor) {
-        if (!cursor.isBeforeFirst()) return;
-        feeds = new LinkedHashMap<String,Feed>(cursor.getCount());
-        feedNeutCounts = new HashMap<String,Integer>();
-        feedPosCounts = new HashMap<String,Integer>();
-        totalNeutCount = 0;
-        totalPosCount = 0;
-        totalActiveFeedCount = 0;
-        while (cursor.moveToNext()) {
-            Feed f = Feed.fromCursor(cursor);
-            feeds.put(f.feedId, f);
-            if (f.active && f.positiveCount > 0) {
-                int pos = checkNegativeUnreads(f.positiveCount);
-                feedPosCounts.put(f.feedId, pos);
-                totalPosCount += pos;
-            }
-            if (f.active && f.neutralCount > 0) {
-                int neut = checkNegativeUnreads(f.neutralCount);
-                feedNeutCounts.put(f.feedId, neut);
-                totalNeutCount += neut;
-            }
-            if (f.active) {
-                totalActiveFeedCount++;
-            }
-        }
+	public synchronized void setFeeds(FeedQueryResult feedQueryResult) {
+        feeds.clear();
+        feeds.putAll(feedQueryResult.getFeeds());
+        feedNeutCounts.clear();
+        feedNeutCounts.putAll(feedQueryResult.getFeedNeutCounts());
+        feedPosCounts.clear();
+        feedPosCounts.putAll(feedQueryResult.getFeedPosCounts());
+        totalNeutCount = feedQueryResult.getTotalNeutCount();
+        totalPosCount = feedQueryResult.getTotalPosCount();
+        totalActiveFeedCount = feedQueryResult.getTotalActiveFeedCount();
+
         recountFeeds();
         notifyDataSetChanged();
 	}
 
-	public synchronized void setStarredCountCursor(Cursor cursor) {
-        if (!cursor.isBeforeFirst()) return;
-        starredCountsByTag = new ArrayList<StarredCount>();
-        feedSavedCounts = new HashMap<String,Integer>();
-        while (cursor.moveToNext()) {
-            StarredCount sc = StarredCount.fromCursor(cursor);
-            if (sc.isTotalCount()) {
-                savedStoriesTotalCount = sc.count;
-            } else if (sc.tag != null) {
-                starredCountsByTag.add(sc);
-            } else if (sc.feedId != null) {
-                feedSavedCounts.put(sc.feedId, sc.count);
-            }
+	public synchronized void setStarredCount(SavedStoryCountsQueryResult result) {
+        starredCountsByTag.clear();
+        feedSavedCounts.clear();
+        starredCountsByTag.addAll(result.getStarredCountsByTag());
+        feedSavedCounts.putAll(result.getFeedSavedCounts());
+        if (result.getSavedStoriesTotalCount() != null) {
+            savedStoriesTotalCount = result.getSavedStoriesTotalCount();
         }
-        Collections.sort(starredCountsByTag, StarredCount.StarredCountComparatorByTag);
+
         recountFeeds();
         notifyDataSetChanged();
 	}
 
-	public synchronized void setSavedSearchesCursor(Cursor cursor) {
-        if (!cursor.isBeforeFirst()) return;
-        savedSearches = new ArrayList<>();
-        while (cursor.moveToNext()) {
-            SavedSearch savedSearch = SavedSearch.fromCursor(cursor);
-            savedSearches.add(savedSearch);
-        }
-        Collections.sort(savedSearches, SavedSearch.SavedSearchComparatorByTitle);
+    public synchronized void setSavedSearches(List<SavedSearch> savedSearches) {
+        this.savedSearches.clear();
+        this.savedSearches.addAll(savedSearches);
         notifyDataSetChanged();
+    }
+
+    public synchronized List<String> getAllFolderFlatNames() {
+        List<String> folderFlatNames = new ArrayList<>(flatFolders.keySet());
+        folderFlatNames.remove(AppConstants.ROOT_FOLDER);
+        return folderFlatNames;
+    }
+
+    public synchronized void setAllFoldersClosed(boolean closed) {
+        closedFolders.clear();
+        if (closed) {
+            for (String folderName : folders.keySet()) {
+                if (!AppConstants.ROOT_FOLDER.equals(folderName)) {
+                    closedFolders.add(folderName);
+                }
+            }
+        }
+        forceRecount();
+    }
+
+    public synchronized boolean areAllVisibleFoldersCollapsed() {
+        if (activeFolderNames == null) return false;
+
+        boolean hasVisibleFolders = false;
+        for (int groupPosition = 0; groupPosition < activeFolderNames.size(); groupPosition++) {
+            if (!isNormalFolder(groupPosition)) continue;
+
+            hasVisibleFolders = true;
+            Folder folder = flatFolders.get(activeFolderNames.get(groupPosition));
+            if ((folder != null) && !closedFolders.contains(folder.flatName())) {
+                return false;
+            }
+        }
+
+        return hasVisibleFolders;
     }
 
     private void recountFeeds() {
@@ -641,59 +778,80 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         folderNeutCounts = new ArrayList<Integer>();
         folderPosCounts = new ArrayList<Integer>();
 
-        if (PrefsUtils.isEnableRowInfrequent(context) && (currentState != StateFilter.SAVED)) addSpecialRow(INFREQUENT_SITE_STORIES_GROUP_KEY);
-        addSpecialRow(ALL_STORIES_GROUP_KEY);
+        List<String> topLevelRows = new ArrayList<String>();
+        if (prefsRepo.isEnableRowInfrequent() && (currentState != StateFilter.SAVED)) topLevelRows.add(INFREQUENT_SITE_STORIES_GROUP_KEY);
+        topLevelRows.add(ALL_STORIES_GROUP_KEY);
+        if (currentState != StateFilter.SAVED) {
+            topLevelRows = new ArrayList<String>(DailyBriefingFolderPlacementDecision.orderedFolderNames(topLevelRows, prefsRepo.isEnableRowDailyBriefing()));
+        }
+        for (String topLevelRow : topLevelRows) {
+            addSpecialRow(topLevelRow);
+        }
 
-        // create a sorted list of folder display names
-        List<String> sortedFolderNames = new ArrayList<String>(flatFolders.keySet());
-        Collections.sort(sortedFolderNames, Folder.FolderNameComparator);
-        // figure out which sub-folders are hidden because their parents are closed (flat names)
-        Set<String> hiddenSubFolders = getSubFoldersRecursive(closedFolders);
-        Set<String> hiddenSubFoldersFlat = new HashSet<String>(hiddenSubFolders.size());
-        for (String hiddenSub : hiddenSubFolders) hiddenSubFoldersFlat.add(folders.get(hiddenSub).flatName());
-        // inspect folders to see if the are active for display
-        for (String folderName : sortedFolderNames) {
-            if (hiddenSubFoldersFlat.contains(folderName)) continue;
-            Folder folder = flatFolders.get(folderName);
-            List<Feed> activeFeeds = new ArrayList<Feed>();
-            feedinfolderloop: for (String feedId : folder.feedIds) {
+        // FolderHierarchy.kt retains ancestors with matching descendants and keeps sibling subtrees together.
+        FolderHierarchy hierarchy = new FolderHierarchy(flatFolders.values());
+        Map<String, List<Feed>> matchingFeeds = new LinkedHashMap<>();
+        Set<String> matchingFolders = new HashSet<>();
+        for (Folder folder : hierarchy.getOrdered()) {
+            List<Feed> activeFeeds = new ArrayList<>();
+            Set<String> seenFeeds = new HashSet<>();
+            for (String feedId : folder.feedIds) {
                 Feed f = feeds.get(feedId);
-                // activeFeeds is a list, so it doesn't handle duplication (which the API allows) gracefully
-                if (f == null) continue feedinfolderloop;
-                if (activeFeeds.contains(f)) break feedinfolderloop;
-
-                if ( (currentState == StateFilter.ALL) ||
-                     ((currentState == StateFilter.SOME) && (feedNeutCounts.containsKey(feedId) || feedPosCounts.containsKey(feedId))) ||
-                     ((currentState == StateFilter.BEST) && feedPosCounts.containsKey(feedId)) ||
-                     ((currentState == StateFilter.SAVED) && feedSavedCounts.containsKey(feedId)) ||
-                     f.feedId.equals(lastFeedViewedId) ) {
-                    if ((activeSearchQuery == null) || (f.title.toLowerCase().indexOf(activeSearchQuery.toLowerCase()) >= 0)) {
+                if (f == null || !seenFeeds.add(feedId)) continue;
+                if (currentState == StateFilter.ALL ||
+                        (currentState == StateFilter.SOME && (feedNeutCounts.containsKey(feedId) || feedPosCounts.containsKey(feedId))) ||
+                        (currentState == StateFilter.BEST && feedPosCounts.containsKey(feedId)) ||
+                        (currentState == StateFilter.SAVED && feedSavedCounts.containsKey(feedId)) ||
+                        f.feedId.equals(lastFeedViewedId)) {
+                    if (activeSearchQuery == null || f.title.toLowerCase().contains(activeSearchQuery.toLowerCase())) {
                         activeFeeds.add(f);
                     }
                 }
             }
-            if ((activeFeeds.size() > 0) || (folderName.equals(AppConstants.ROOT_FOLDER)) || folder.name.equals(lastFolderViewed)) {
-                Collections.sort(activeFeeds);
-                if (folderName.equals(AppConstants.ROOT_FOLDER)) {
-                    activeFolderChildren.set(getRootFolderIndex(), activeFeeds);
-                } else {
-                    activeFolderNames.add(folderName);
-                    activeFolderChildren.add(activeFeeds);
-                    folderNeutCounts.add(getFolderNeutralCountRecursive(folder, null));
-                    folderPosCounts.add(getFolderPositiveCountRecursive(folder, null));
+            String path = folder.flatName();
+            matchingFeeds.put(path, activeFeeds);
+            if (!activeFeeds.isEmpty() || path.equals(lastFolderViewed) ||
+                    (currentState == StateFilter.ALL && activeSearchQuery == null)) matchingFolders.add(path);
+        }
+        for (Folder folder : hierarchy.visibleFolders(matchingFolders, closedFolders)) {
+            String path = folder.flatName();
+            List<Feed> activeFeeds = matchingFeeds.get(path);
+            if (AppConstants.ROOT_FOLDER.equals(path)) {
+                activeFolderChildren.set(getRootFolderIndex(), activeFeeds);
+            } else {
+                activeFolderNames.add(path);
+                activeFolderChildren.add(activeFeeds);
+                int neutral = 0;
+                int positive = 0;
+                for (String feedId : hierarchy.feedIds(path)) {
+                    neutral += feedNeutCounts.getOrDefault(feedId, 0);
+                    positive += feedPosCounts.getOrDefault(feedId, 0);
                 }
+                folderNeutCounts.add(neutral);
+                folderPosCounts.add(positive);
             }
         }
 
         // sort feeds within each folder
-        FeedListOrder feedListOrder = PrefsUtils.getFeedListOrder(context);
+        FeedListOrder feedListOrder = prefsRepo.getFeedListOrder();
         Comparator<Feed> feedComparator = Feed.getFeedListOrderComparator(feedListOrder);
         for (List<Feed> folderChildren : activeFolderChildren) {
             Collections.sort(folderChildren, feedComparator);
         }
 
+        if ((tryFeed != null) && (getRootFolderIndex() >= 0)) {
+            List<Feed> rootFolderChildren = activeFolderChildren.get(getRootFolderIndex());
+            rootFolderChildren.remove(tryFeed);
+            if ((activeSearchQuery == null) || (tryFeed.title.toLowerCase().contains(activeSearchQuery.toLowerCase()))) {
+                rootFolderChildren.add(0, tryFeed);
+            }
+        }
+
         addSpecialRow(READ_STORIES_GROUP_KEY);
-        if (PrefsUtils.isEnableRowGlobalShared(context) && (currentState != StateFilter.SAVED)) addSpecialRow(GLOBAL_SHARED_STORIES_GROUP_KEY);
+        if (prefsRepo.isEnableRowGlobalShared() && (currentState != StateFilter.SAVED)) addSpecialRow(GLOBAL_SHARED_STORIES_GROUP_KEY);
+        if (prefsRepo.isEnableRowWidelyReadStories() && (currentState != StateFilter.SAVED)) addSpecialRow(WIDELY_READ_STORIES_GROUP_KEY);
+        if (prefsRepo.isEnableRowLongReads() && (currentState != StateFilter.SAVED)) addSpecialRow(LONG_READS_GROUP_KEY);
+        if (prefsRepo.isEnableRowGoodReads() && (currentState != StateFilter.SAVED)) addSpecialRow(GOOD_READS_GROUP_KEY);
         if ((currentState != StateFilter.SAVED)) addSpecialRow(ALL_SHARED_STORIES_GROUP_KEY);
         addSpecialRow(SAVED_SEARCHES_GROUP_KEY);
         addSpecialRow(SAVED_STORIES_GROUP_KEY);
@@ -706,8 +864,8 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
      */
     private void addSpecialRow(String specialRowName) {
         activeFolderNames.add(specialRowName);
-        List<Feed> emptyList = Collections.emptyList();
-        activeFolderChildren.add(emptyList);
+        // FolderListAdapter.java can insert a preview before the root folder has loaded.
+        activeFolderChildren.add(new ArrayList<Feed>());
         folderNeutCounts.add(0);
         folderPosCounts.add(0);
     }
@@ -727,77 +885,34 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         lastFeedCount = newFeedCount;
     }
 
-    /**
-     * Given a set of (not-flat) folder names, figure out child folder names (also not flat). Does
-     * not include the initially passed folder names, unless they occur as children of one of the
-     * other parents passed.
-     */
-    private Set<String> getSubFoldersRecursive(Set<String> parentFolders) {
-        HashSet<String> subFolders = new HashSet<String>();
-        for (String folder : parentFolders) {
-            Folder f = folders.get(folder);
-            if (f == null) continue;
-            subFolders.addAll(f.children);
-            subFolders.addAll(getSubFoldersRecursive(subFolders));
-        }
-        return subFolders;
-    }
-
-    private int getFolderNeutralCountRecursive(Folder folder, Set<String> visitedParents) {
-        int count = 0;
-        if (visitedParents == null) visitedParents = new HashSet<String>();
-        visitedParents.add(folder.name);
-        for (String feedId : folder.feedIds) {
-            Integer feedCount = feedNeutCounts.get(feedId);
-            if (feedCount != null) count += feedCount;
-        }
-        for (String childName : folder.children) {
-            if (!visitedParents.contains(childName)) {
-                count += getFolderNeutralCountRecursive(folders.get(childName), visitedParents);
-            }
-        }
-        return count;
-    }
-
-    private int getFolderPositiveCountRecursive(Folder folder, Set<String> visitedParents) {
-        int count = 0;
-        if (visitedParents == null) visitedParents = new HashSet<String>();
-        visitedParents.add(folder.name);
-        for (String feedId : folder.feedIds) {
-            Integer feedCount = feedPosCounts.get(feedId);
-            if (feedCount != null) count += feedCount;
-        }
-        for (String childName : folder.children) {
-            if (!visitedParents.contains(childName)) {
-                count += getFolderPositiveCountRecursive(folders.get(childName), visitedParents);
-            }
-        }
-        return count;
-    }
-
     public synchronized void forceRecount() {
         recountFeeds();
         recountSocialFeeds();
         notifyDataSetChanged();
     }
 
+    public synchronized void setTryFeed(@Nullable Feed tryFeed) {
+        this.tryFeed = tryFeed;
+        forceRecount();
+    }
+
     public void reset() {
         notifyDataSetInvalidated();
 
         synchronized (this) {
-            socialFeedsOrdered = Collections.emptyList();
-            socialFeedsActive = Collections.emptyList();
+            socialFeedsOrdered .clear();
+            socialFeedsActive.clear();
             totalSocialNeutCount = 0;
             totalSocialPosiCount = 0;
 
-            folders = Collections.emptyMap();
-            flatFolders = Collections.emptyMap();
+            folders.clear();
+            flatFolders.clear();
             safeClear(activeFolderNames);
             safeClear(activeFolderChildren);
             safeClear(folderNeutCounts);
             safeClear(folderPosCounts);
 
-            feeds = Collections.emptyMap();
+            feeds.clear();
             safeClear(feedNeutCounts);
             safeClear(feedPosCounts);
             totalNeutCount = 0;
@@ -811,6 +926,14 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         }
     }
 
+// FolderListAdapter.java only exposes normal feed rows to feed-specific gesture actions.
+public synchronized Feed getGestureFeed(int group, int child) {
+    if (group < 0 || group >= activeFolderChildren.size() || child < 0 ||
+            child >= activeFolderChildren.get(group).size() ||
+            getChildType(group, child) != ChildType.FEED.ordinal()) return null;
+    return activeFolderChildren.get(group).get(child);
+}
+
     /** Get the cached Feed object for the feed at the given list location. */
     public synchronized Feed getFeed(int groupPosition, int childPosition) {
         if (groupPosition > activeFolderChildren.size()) return null;
@@ -818,10 +941,23 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         return activeFolderChildren.get(groupPosition).get(childPosition);
     }
 
+    public synchronized boolean isTryFeed(int groupPosition, int childPosition) {
+        Feed feed = getFeed(groupPosition, childPosition);
+        return (tryFeed != null) && (feed != null) && feed.equals(tryFeed);
+    }
+
     public Set<String> getAllFeedsForFolder(int groupPosition) {
-        String flatFolderName = activeFolderNames.get(groupPosition);
-        Folder folder = flatFolders.get(flatFolderName);
+        Folder folder = getGroupFolder(groupPosition);
+        return folder == null ? Collections.emptySet() : new FolderHierarchy(flatFolders.values()).feedIds(folder.flatName());
+    }
+
+    public static Set<String> safeFolderFeedIds(@Nullable Folder folder) {
+        if (folder == null || folder.feedIds == null) return Collections.emptySet();
         return new HashSet<>(folder.feedIds);
+    }
+
+    public synchronized boolean isValidGroupPosition(int groupPosition) {
+        return activeFolderNames != null && groupPosition >= 0 && groupPosition < activeFolderNames.size();
     }
 
     /** Get the cached SocialFeed object for the feed at the given list location. */
@@ -848,9 +984,9 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
         Folder folder = flatFolders.get(folderName);
         if (folder == null) return; // beat the cursors
         if (closed) {
-            closedFolders.add(folder.name);
+            closedFolders.add(folder.flatName());
         } else {
-            closedFolders.remove(folder.name);
+            closedFolders.remove(folder.flatName());
         }
         // the logic to open/close sub-folders happens during recounts
         forceRecount();
@@ -873,14 +1009,22 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
 
 	@Override
 	public int getGroupType(int groupPosition) {
-		if (isRowGlobalSharedStories(groupPosition)) {
+        if (isRowGlobalSharedStories(groupPosition)) {
 			return GroupType.GLOBAL_SHARED_STORIES.ordinal();
 		} else if (isRowAllSharedStories(groupPosition)) {
             return GroupType.ALL_SHARED_STORIES.ordinal();
+        } else if (isRowDailyBriefing(groupPosition)) {
+            return GroupType.DAILY_BRIEFING.ordinal();
         } else if (isRowAllStories(groupPosition)) {
             return GroupType.ALL_STORIES.ordinal();
         } else if (isRowInfrequentStories(groupPosition)) {
             return GroupType.INFREQUENT_STORIES.ordinal();
+        } else if (isRowWidelyReadStories(groupPosition)) {
+            return GroupType.WIDELY_READ_STORIES.ordinal();
+        } else if (isRowLongReads(groupPosition)) {
+            return GroupType.LONG_READS.ordinal();
+        } else if (isRowGoodReads(groupPosition)) {
+            return GroupType.GOOD_READS.ordinal();
         } else if (isRowReadStories(groupPosition)) {
             return GroupType.READ_STORIES.ordinal();
         } else if (isRowSavedSearches(groupPosition)) {
@@ -979,5 +1123,9 @@ public class FolderListAdapter extends BaseExpandableListAdapter {
 
     public SessionDataSource buildSessionDataSource(Session activeSession) {
         return new SessionDataSource(activeSession, activeFolderNames, activeFolderChildren);
+    }
+
+    public SessionDataSource buildNextUnreadSessionDataSource(Session activeSession) {
+        return new SessionDataSource(activeSession, activeFolderNames, activeFolderChildren, currentState, feedSavedCounts.keySet());
     }
 }

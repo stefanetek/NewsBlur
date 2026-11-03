@@ -16,7 +16,7 @@ body {
 
 .NB-header {
     color: black;
-    background-image: -webkit-gradient(linear, left top, left bottom, from(#FCF6ED), to(#FAF3E8));
+    background-image: -webkit-gradient(linear, left top, left bottom, from(#F3E8D8), to(#F6EDE0));
     text-shadow: 0 1px 0 rgba(194, 180, 165, .25);
 
     -webkit-tap-highlight-color: rgba(0, 0, 0, 0);
@@ -112,6 +112,10 @@ a:active {
     border-left-color: #D4C8B8;
     background-color: #EDE0D0;
 }
+/* storyDetailViewSepia.css colors the right-hand quote border of right-to-left story text (storyDetailView.css). */
+html[dir="rtl"] .NB-story blockquote:dir(rtl) {
+    border-right-color: #D4C8B8;
+}
 
 .NB-story blockquote p {
     background-color: #EDE0D0;
@@ -164,9 +168,10 @@ a:active {
     border-color: rgba(255, 255, 255, .3) rgba(0, 0, 0, .2) rgba(0, 0, 0, .3) rgba(255, 255, 255, .2);
 }
 .NB-button.NB-share-button div {
-    color: rgba(0, 0, 0, 0.25);
-    text-shadow: 0 1px 0 rgba(255, 255, 255, .5);
-    border: 1px solid rgb(0, 0, 0, 0.25);
+    color: rgba(80, 60, 30, 0.4);
+    text-shadow: none;
+    border: 0.5px solid rgba(80, 60, 30, 0.15);
+    background: rgba(80, 60, 30, 0.05);
 }
 .NB-button:active div,
 .NB-button.NB-button-active div {
@@ -184,8 +189,13 @@ a:active {
 
 .NB-button.NB-share-button:active div,
 .NB-button.NB-share-button.NB-button-active div {
-    color: darkgrey;
-    text-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+    color: rgba(80, 60, 30, 0.6);
+    background: rgba(80, 60, 30, 0.1);
+    text-shadow: none;
+}
+/* storyDetailViewSepia.css: a story queued in Listen's Up Next shades its + like an active button. */
+.NB-button.NB-share-button a.NB-listen-queue.NB-listen-queued div {
+    background: rgba(80, 60, 30, 0.1);
 }
 
 .NB-newsletter p,
@@ -255,4 +265,68 @@ a:active {
 
 .NB-text-view-premium-only {
     background-color: #FAF3E8;
+}
+
+.NB-story-cluster-detail {
+    border-top-color: rgba(180, 165, 150, .55);
+    border-bottom-color: rgba(180, 165, 150, .55);
+    background-color: #F5EADB;
+}
+
+.NB-story-cluster-detail-header {
+    border-bottom-color: rgba(180, 165, 150, .4);
+}
+
+.NB-story-cluster-detail-title {
+    color: #8B7B6B;
+}
+
+.NB-story-cluster-detail-item,
+.NB-cluster-locked-upsell {
+    color: #3C3226;
+    border-top-color: rgba(180, 165, 150, .25);
+}
+
+.NB-story-cluster-detail-item.read {
+    color: #8B7B6B;
+}
+
+.NB-clustering-detail-upgrade-pill {
+    background-color: rgba(27, 36, 140, .12);
+    color: #1B248C;
+}
+
+.NB-cluster-detail-date,
+.NB-cluster-locked-text {
+    color: #8B7B6B;
+}
+
+.NB-cluster-tier-badge {
+    color: #8B7B6B;
+}
+
+.NB-cluster-tier-title .NB-cluster-tier-badge {
+    color: #6E865F;
+}
+
+.NB-cluster-tier-related .NB-cluster-tier-badge {
+    color: #9B7540;
+}
+
+.NB-cluster-detail-favicon,
+.NB-cluster-detail-image {
+    background-color: rgba(60, 50, 38, .10);
+}
+
+.NB-cluster-locked-upsell {
+    background-color: rgba(212, 200, 184, .35);
+}
+
+/* Listen (Classes/Listen/ListenStoryBridge.swift) */
+.NB-listen-highlight {
+    background-color: rgba(214, 150, 40, 0.15);
+    box-shadow: 0 0 0 5px rgba(214, 150, 40, 0.15);
+}
+span.NB-listen-run.NB-listen-highlight {
+    box-shadow: none;
 }

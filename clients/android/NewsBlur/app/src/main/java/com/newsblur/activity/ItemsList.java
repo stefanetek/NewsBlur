@@ -1,55 +1,105 @@
 package com.newsblur.activity;
 
+import static com.newsblur.service.NbSyncManager.UPDATE_METADATA;
 import static com.newsblur.service.NbSyncManager.UPDATE_REBUILD;
 import static com.newsblur.service.NbSyncManager.UPDATE_STATUS;
 import static com.newsblur.service.NbSyncManager.UPDATE_STORY;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.ValueAnimator;
+import android.content.Context;
 import android.content.Intent;
+import android.content.res.ColorStateList;
+import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
-
-import androidx.activity.result.ActivityResult;
-import androidx.activity.result.ActivityResultLauncher;
-import androidx.activity.result.contract.ActivityResultContracts;
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-import androidx.fragment.app.FragmentManager;
-import androidx.fragment.app.FragmentTransaction;
-import androidx.lifecycle.ViewModelProvider;
-
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Trace;
+import android.text.Editable;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.View.OnKeyListener;
+import android.view.ViewGroup;
+import android.view.animation.AccelerateInterpolator;
+import android.view.animation.DecelerateInterpolator;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.PopupMenu;
+import android.widget.PopupWindow;
 
+import androidx.activity.BackEventCompat;
+import androidx.activity.OnBackPressedCallback;
+import androidx.activity.result.ActivityResult;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.core.content.ContextCompat;
+import androidx.fragment.app.FragmentManager;
+import androidx.fragment.app.FragmentTransaction;
+import androidx.lifecycle.ViewModelProvider;
+
+import com.google.android.material.button.MaterialButton;
+import com.google.android.material.color.MaterialColors;
 import com.newsblur.R;
 import com.newsblur.database.BlurDatabaseHelper;
 import com.newsblur.databinding.ActivityItemslistBinding;
 import com.newsblur.delegate.ItemListContextMenuDelegate;
 import com.newsblur.delegate.ItemListContextMenuDelegateImpl;
+import com.newsblur.delegate.ItemListMenuPopup;
 import com.newsblur.fragment.ItemSetFragment;
-import com.newsblur.service.NBSyncService;
+import com.newsblur.service.SyncServiceState;
 import com.newsblur.util.AppConstants;
+import com.newsblur.util.EdgeToEdgeUtil;
 import com.newsblur.util.FeedSet;
 import com.newsblur.util.FeedUtils;
+import com.newsblur.util.LastStoryList;
 import com.newsblur.util.Log;
+import com.newsblur.util.NetworkUtils;
 import com.newsblur.util.PendingTransitionUtils;
+import com.newsblur.util.PrefConstants;
+import com.newsblur.util.ReadFilter;
 import com.newsblur.util.ReadingActionListener;
-import com.newsblur.util.PrefsUtils;
 import com.newsblur.util.Session;
 import com.newsblur.util.SessionDataSource;
+import com.newsblur.util.SessionDataSourceRegistry;
 import com.newsblur.util.StateFilter;
+import com.newsblur.util.StoryHeaderPillAppearanceResolver;
+import com.newsblur.util.StoryHeaderOptionsTitleFormatter;
+import com.newsblur.util.StoryHeaderPillLayoutDecider;
+import com.newsblur.util.StoryOrder;
+import com.newsblur.util.StorySplitView;
+import com.newsblur.util.TryFeedSessionResetter;
 import com.newsblur.util.UIUtils;
 import com.newsblur.viewModel.ItemListViewModel;
+
+import org.jetbrains.annotations.NotNull;
 
 import javax.inject.Inject;
 
 import dagger.hilt.android.AndroidEntryPoint;
 
+import java.lang.ref.WeakReference;
+import java.util.HashMap;
+import java.util.Map;
+
 @AndroidEntryPoint
-public abstract class ItemsList extends NbActivity implements ReadingActionListener {
+public abstract class ItemsList extends NbActivity implements ReadingActionListener,
+        com.newsblur.fragment.InfrequentCutoffDialogFragment.InfrequentCutoffChangedListener {
+
+    // The story list each task's reader belongs to, keyed by task so two NewsBlur windows (desktop
+    // mode, system split screen) each keep their own.
+    private static final Map<Integer, WeakReference<ItemsList>> readingLaunchParents = new HashMap<>();
 
     @Inject
     BlurDatabaseHelper dbHelper;
@@ -57,21 +107,115 @@ public abstract class ItemsList extends NbActivity implements ReadingActionListe
     @Inject
     FeedUtils feedUtils;
 
+    @Inject
+    SyncServiceState syncServiceState;
+
+    @Inject @com.newsblur.di.IconLoader
+    com.newsblur.util.ImageLoader relatedIconLoader;
+
+    @Inject @com.newsblur.di.ThumbnailLoader
+    com.newsblur.util.ImageLoader relatedThumbnailLoader;
+
+    @Inject
+    com.newsblur.util.TryFeedStore relatedTryFeedStore;
+
     public static final String EXTRA_FEED_SET = "feed_set";
     public static final String EXTRA_STORY_HASH = "story_hash";
     public static final String EXTRA_WIDGET_STORY = "widget_story";
+    public static final String EXTRA_AUTO_OPEN_STORY = "auto_open_story";
     public static final String EXTRA_VISIBLE_SEARCH = "visibleSearch";
-    public static final String EXTRA_SESSION_DATA = "session_data";
+    public static final String EXTRA_SESSION_DATA_KEY = "session_data_key";
+    // Slide the feed list over this story list as soon as it opens (tablet launch, FeedListDrawer.kt).
+    public static final String EXTRA_OPEN_FEED_DRAWER = "open_feed_drawer";
+    // The tablet's launch story list waits under the feed list slide-over without loading
+    // anything (FeedListDrawer.kt) until a feed is picked or the slide-over closes.
+    public static final String EXTRA_DEFER_STORIES = "defer_stories";
+    private static final String BUNDLE_STORIES_DEFERRED = "storiesDeferred";
+    private static final String BUNDLE_STORY_LIST_INTENT = "storyListIntent";
     private static final String BUNDLE_ACTIVE_SEARCH_QUERY = "activeSearchQuery";
+    private static final String BUNDLE_SPLIT_READING_STORY_HASH = "splitReadingStoryHash";
+    private static final String BUNDLE_FEED_DRAWER_PENDING = "feedDrawerPending";
+    private static final long STORY_STATUS_FETCH_DELAY_MS = 1000L;
+    private static final long STORY_STATUS_SHOW_DURATION_MS = 300L;
+    private static final long STORY_STATUS_HIDE_DURATION_MS = 250L;
+    private static final long STORY_SEARCH_DEBOUNCE_MS = 350L;
+    private static final long MILLIS_PER_DAY = 24L * 60L * 60L * 1000L;
+    private static final int STORY_HEADER_COMPACT_PILL_HORIZONTAL_PADDING_DP = 8;
+    private static final int[] MARK_READ_CUTOFF_DAYS = new int[]{1, 3, 7, 14};
+    private static final DecelerateInterpolator STORY_STATUS_SHOW_INTERPOLATOR = new DecelerateInterpolator();
+    private static final AccelerateInterpolator STORY_STATUS_HIDE_INTERPOLATOR = new AccelerateInterpolator();
+    private static final DecelerateInterpolator STORY_LIST_SWIPE_INTERPOLATOR = new DecelerateInterpolator();
+    private static final long STORY_LIST_SWIPE_SETTLE_DURATION_MS = 180L;
+    private static final float STORY_LIST_SWIPE_ELEVATION_DP = 12f;
 
     protected ItemListViewModel viewModel;
     protected FeedSet fs;
+    // What this list shows: its toolbar, its own menu items, its saved search id (StoryListKind.kt).
+    protected StoryListKind kind;
+    private boolean storiesDeferred = false;
+    // Set once switchStoryList shows another feed here, so a rotation reopens that one.
+    private boolean switchedStoryList = false;
+    // The load held back until the feed list has slid away (loadAfterFeedListSlide).
+    @Nullable
+    private Runnable pendingSwitchLoad;
 
     private ItemSetFragment itemSetFragment;
-    private ActivityItemslistBinding binding;
+    protected ActivityItemslistBinding binding;
     private ItemListContextMenuDelegate contextMenuDelegate;
     @Nullable
     private SessionDataSource sessionDataSource;
+    @Nullable
+    private SessionDataSource storyListSessionDataSource;
+    @Nullable
+    private String sessionDataKey;
+    @Nullable
+    private ValueAnimator storyStatusBannerAnimator;
+    @Nullable
+    private PopupWindow itemListMenuPopup;
+    @Nullable
+    private ItemListMenuPopup.Content itemListPopupContent;
+    @Nullable
+    private View interactiveSwipeSurface;
+    @Nullable
+    private Runnable storySearchRunnable;
+    @Nullable
+    private StoryHeaderPillAppearanceResolver.Appearance discoverPillExpandedAppearance;
+    @Nullable
+    private StoryHeaderPillAppearanceResolver.Appearance searchPillExpandedAppearance;
+    private boolean updatingStoryHeaderPillLabels = false;
+    private String expandedOptionsPillTitle = "";
+    private String compactOptionsPillTitle = "";
+    private boolean storySearchRefreshInFlight = false;
+    private boolean predictiveBackInProgress = false;
+    private boolean suppressNextExitTransition = false;
+    private boolean awaitingInitialFetchingBanner = false;
+    private boolean readerToolbarHidden = false;
+    private boolean opaqueTabletWindow = false;
+    private boolean storyListWindowBackgroundSet = false;
+    private com.newsblur.view.FloatingStoryToolbar floatingStoryToolbar;
+    private boolean storyToolbarAtBottom;
+    @Nullable
+    private String preparedReturnStoryHash;
+    // Whether FeedListDrawer.kt still has to slide over this story list after launch.
+    private boolean feedDrawerPending = false;
+    // Whether this tablet story list already reloaded for the sync housekeeping now running.
+    private boolean rebuildHandled = false;
+    // The story the reader beside this list was showing before a rotation recreated the list.
+    @Nullable
+    private String restoredSplitReadingStoryHash;
+    private boolean fetchingBannerDelayElapsed = false;
+    @Nullable
+    private ImageView interactiveSwipeUnderlay;
+    private final Handler storySearchHandler = new Handler(Looper.getMainLooper());
+    private final Runnable showFetchingBannerRunnable = () -> {
+        fetchingBannerDelayElapsed = true;
+        updateStatusIndicators();
+    };
+
+    private enum StoryStatusBannerStyle {
+        FETCHING,
+        OFFLINE,
+    }
 
     @NonNull
     protected ActivityResultLauncher<Intent> readingActivityLaunch = registerForActivityResult(
@@ -81,81 +225,148 @@ public abstract class ItemsList extends NbActivity implements ReadingActionListe
     @Override
     protected void onCreate(Bundle bundle) {
         Trace.beginSection("ItemsListOnCreate");
-		super.onCreate(bundle);
+        super.onCreate(bundle);
+        Intent switchedIntent = bundle != null ? androidx.core.os.BundleCompat.getParcelable(bundle, BUNDLE_STORY_LIST_INTENT, Intent.class) : null;
+        if (switchedIntent != null) {
+            setIntent(switchedIntent);
+            switchedStoryList = true;
+        }
+        storiesDeferred = bundle != null
+                ? bundle.getBoolean(BUNDLE_STORIES_DEFERRED, false)
+                : getIntent().getBooleanExtra(EXTRA_DEFER_STORIES, false);
+        readerToolbarHidden = bundle != null
+                ? bundle.getBoolean(Reading.EXTRA_TOOLBAR_HIDDEN, false)
+                : getIntent().getBooleanExtra(Reading.EXTRA_TOOLBAR_HIDDEN, false);
 
         PendingTransitionUtils.overrideEnterTransition(this);
 
-        contextMenuDelegate = new ItemListContextMenuDelegateImpl(this, feedUtils);
+        contextMenuDelegate = new ItemListContextMenuDelegateImpl(this, feedUtils, prefsRepo, syncServiceState);
         viewModel = new ViewModelProvider(this).get(ItemListViewModel.class);
-		fs = (FeedSet) getIntent().getSerializableExtra(EXTRA_FEED_SET);
-        sessionDataSource = (SessionDataSource) getIntent().getSerializableExtra(EXTRA_SESSION_DATA);
-
-        // this is not strictly necessary, since our first refresh with the fs will swap in
-        // the correct session, but that can be delayed by sync backup, so we try here to
-        // reduce UI lag, or in case somehow we got redisplayed in a zero-story state
-        feedUtils.prepareReadingSession(this, fs, false);
-        if (getIntent().getBooleanExtra(EXTRA_WIDGET_STORY, false)) {
-            String hash = (String) getIntent().getSerializableExtra(EXTRA_STORY_HASH);
-            UIUtils.startReadingActivity(this, fs, hash, readingActivityLaunch);
-        } else if (PrefsUtils.isAutoOpenFirstUnread(this)) {
-            StateFilter intelState = PrefsUtils.getStateFilter(this);
-            if (dbHelper.getUnreadCount(fs, intelState) > 0) {
-                UIUtils.startReadingActivity(this, fs, Reading.FIND_FIRST_UNREAD, readingActivityLaunch);
-            }
+        fs = (FeedSet) getIntent().getSerializableExtra(EXTRA_FEED_SET);
+        kind = StoryListKind.fromIntent(getIntent(), fs);
+        sessionDataKey = getIntent().getStringExtra(EXTRA_SESSION_DATA_KEY);
+        SessionDataSourceRegistry.Entry sessionDataEntry = SessionDataSourceRegistry.get(sessionDataKey);
+        if (sessionDataEntry != null) {
+            sessionDataSource = sessionDataEntry.getSessionDataSource();
+            storyListSessionDataSource = sessionDataEntry.getStoryListSessionDataSource();
         }
 
-        getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+        if (shouldResetReadingSessionOnCreate()) {
+            TryFeedSessionResetter.INSTANCE.reset(syncServiceState, dbHelper, fs);
+        }
+
+        if (!storiesDeferred) {
+            // this is not strictly necessary, since our first refresh with the fs will swap in
+            // the correct session, but that can be delayed by sync backup, so we try here to
+            // reduce UI lag, or in case somehow we got redisplayed in a zero-story state
+            feedUtils.prepareReadingSession(fs, false);
+            // FolderItemsList.java and FeedItemsList.kt share the "folderName" extra.
+            LastStoryList.remember(this, this, fs, getIntent().getStringExtra(FolderItemsList.EXTRA_FOLDER_NAME));
+            openLaunchStory();
+        }
 
         binding = ActivityItemslistBinding.inflate(getLayoutInflater());
-		setContentView(binding.getRoot());
+        installStoryListLayout();
+        findViewById(R.id.toolbar_fullscreen_button).setOnClickListener(v -> {
+            StorySplitView.setStoryListFullscreen(this, !StorySplitView.isStoryListFullscreen(this));
+            updateStoryListFullscreenButton();
+        });
+        View toolbarSettingsButton = findViewById(R.id.toolbar_settings_button);
+        if (toolbarSettingsButton != null) {
+            toolbarSettingsButton.setOnClickListener(this::showItemListSettingsPopup);
+        }
 
-		FragmentManager fragmentManager = getSupportFragmentManager();
-		itemSetFragment = (ItemSetFragment) fragmentManager.findFragmentByTag(ItemSetFragment.class.getName());
-		if (itemSetFragment == null) {
+        FragmentManager fragmentManager = getSupportFragmentManager();
+        itemSetFragment = (ItemSetFragment) fragmentManager.findFragmentByTag(ItemSetFragment.class.getName());
+        if (itemSetFragment == null) {
             itemSetFragment = ItemSetFragment.newInstance();
 			FragmentTransaction transaction = fragmentManager.beginTransaction();
 			transaction.add(R.id.activity_itemlist_container, itemSetFragment, ItemSetFragment.class.getName());
-			transaction.commit();
+			transaction.commitNow();
 		}
 
         String activeSearchQuery;
         if (bundle != null) {
             activeSearchQuery = bundle.getString(BUNDLE_ACTIVE_SEARCH_QUERY);
+            restoredSplitReadingStoryHash = bundle.getString(BUNDLE_SPLIT_READING_STORY_HASH);
         } else {
             activeSearchQuery = fs.getSearchQuery();
         }
         if (activeSearchQuery != null) {
             binding.itemlistSearchQuery.setText(activeSearchQuery);
-            binding.itemlistSearchQuery.setVisibility(View.VISIBLE);
-        } else if (getIntent().getBooleanExtra(EXTRA_VISIBLE_SEARCH, false)){
-            binding.itemlistSearchQuery.setVisibility(View.VISIBLE);
+            binding.itemlistSearchContainer.setVisibility(View.VISIBLE);
+        } else if (getIntent().getBooleanExtra(EXTRA_VISIBLE_SEARCH, false)) {
+            binding.itemlistSearchContainer.setVisibility(View.VISIBLE);
             binding.itemlistSearchQuery.requestFocus();
         }
 
         binding.itemlistSearchQuery.setOnKeyListener(new OnKeyListener() {
             public boolean onKey(View v, int keyCode, KeyEvent event) {
                 if ((keyCode == KeyEvent.KEYCODE_BACK) && (event.getAction() == KeyEvent.ACTION_DOWN)) {
-                    binding.itemlistSearchQuery.setVisibility(View.GONE);
-                    binding.itemlistSearchQuery.setText("");
-                    checkSearchQuery();
+                    hideStorySearch(true);
                     return true;
                 }
-                if ((keyCode == KeyEvent.KEYCODE_ENTER) && (event.getAction() == KeyEvent.ACTION_DOWN)) {
-                    checkSearchQuery();
-                    return true;
-                }   
                 return false;
             }
         });
+        setupStoryHeader();
+        refreshStoryHeaderControls();
+        scheduleInitialFetchingBanner();
+        setupOnBackPressed();
+        // Joining the split recreates this story list moments after launch, so the pending feed
+        // list slide-over rides along in the saved state until onResume opens it.
+        feedDrawerPending = bundle != null
+                ? bundle.getBoolean(BUNDLE_FEED_DRAWER_PENDING, false)
+                : getIntent().getBooleanExtra(EXTRA_OPEN_FEED_DRAWER, false);
+        kind.setupToolbar(this);
+        viewModel.getNextSession().observe(this, session -> kind.onNextSession(this, session));
+        if (storiesDeferred) showDeferredContent(false);
         Trace.endSection();
-	}
+    }
+
+    private void installStoryListLayout() {
+        // EdgeToEdgeUtil.kt replaces the content view; attach the split divider only afterward.
+        EdgeToEdgeUtil.applyView(this, binding);
+        updateStoryListWindowBackground();
+        // ItemsList.java refreshes after ComponentActivity updates resources for the new pane bounds.
+        addOnConfigurationChangedListener(configuration -> {
+            updateStoryListWindowBackground();
+            updateStoryListFullscreenButton();
+            updateStoryHeaderPillLabels();
+        });
+        StorySplitView.trackSplit(this, () -> {
+            updateStoryListWindowBackground();
+            updateStoryListFullscreenButton();
+            return kotlin.Unit.INSTANCE;
+        });
+    }
+
+    private void updateStoryListWindowBackground() {
+        // StorySplitView.kt keeps embedded windows opaque even when a narrow window hides the split.
+        boolean shouldBeOpaque = opaqueTabletWindow || StorySplitView.isInSplit(this) || StorySplitView.slidesOverFeedDrawer(this);
+        if (storyListWindowBackgroundSet && shouldBeOpaque == opaqueTabletWindow) return;
+        opaqueTabletWindow = shouldBeOpaque;
+        getWindow().setBackgroundDrawableResource(opaqueTabletWindow
+                ? UIUtils.getThemedResource(this, R.attr.layoutBackground, android.R.attr.background)
+                : android.R.color.transparent);
+        storyListWindowBackgroundSet = true;
+    }
 
     @Override
-    protected void onSaveInstanceState(Bundle outState) {
-        super.onSaveInstanceState(outState);
+    protected void onSaveInstanceState(@NotNull Bundle savedInstanceState) {
+        super.onSaveInstanceState(savedInstanceState);
+        savedInstanceState.putBoolean(Reading.EXTRA_TOOLBAR_HIDDEN, readerToolbarHidden);
         String q = binding.itemlistSearchQuery.getText().toString().trim();
-        if (q.length() > 0) {
-            outState.putString(BUNDLE_ACTIVE_SEARCH_QUERY, q);
+        if (!q.isEmpty()) {
+            savedInstanceState.putString(BUNDLE_ACTIVE_SEARCH_QUERY, q);
+        }
+        savedInstanceState.putBoolean(BUNDLE_FEED_DRAWER_PENDING, feedDrawerPending);
+        savedInstanceState.putBoolean(BUNDLE_STORIES_DEFERRED, storiesDeferred);
+        if (switchedStoryList) {
+            savedInstanceState.putParcelable(BUNDLE_STORY_LIST_INTENT, getIntent());
+        }
+        if (preparedReturnStoryHash != null && Reading.peekSplitReader(getTaskId()) != null && StorySplitView.isInSplit(this)) {
+            savedInstanceState.putString(BUNDLE_SPLIT_READING_STORY_HASH, preparedReturnStoryHash);
         }
     }
 
@@ -163,51 +374,165 @@ public abstract class ItemsList extends NbActivity implements ReadingActionListe
         return this.fs;
     }
 
+    public static void putSessionDataKeyExtra(@NonNull Intent intent,
+                                              @Nullable SessionDataSource sessionDataSource,
+                                              @Nullable SessionDataSource storyListSessionDataSource) {
+        String sessionDataKey = SessionDataSourceRegistry.register(sessionDataSource, storyListSessionDataSource);
+        if (sessionDataKey != null) {
+            intent.putExtra(EXTRA_SESSION_DATA_KEY, sessionDataKey);
+        }
+    }
+
+    @Override
+    protected boolean shouldUseTranslucentTheme() {
+        return true;
+    }
+
+    protected boolean shouldResetReadingSessionOnCreate() {
+        return false;
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
-        if (NBSyncService.isHousekeepingRunning()) finish();
+        if (binding != null && storyToolbarAtBottom != prefsRepo.isStoryToolbarAtBottom()) {
+            recreate();
+            return;
+        }
+        if (!syncServiceState.isHousekeepingRunning()) {
+            rebuildHandled = false;
+        } else if (!rebuildHandled) {
+            // The UPDATE_REBUILD broadcast only reaches a resumed list, so one paused under the
+            // reader or feed list catches up here, once per housekeeping run.
+            leaveForRebuild();
+        }
+        applyStoryHeaderTheme();
+        refreshStoryHeaderControls();
         updateStatusIndicators();
+        if (itemSetFragment != null) {
+            itemSetFragment.refreshLoadingIndicators();
+        }
+        // The first story tapped beside this list shouldn't wait for WebView to start up.
+        if (slidesOverFeedDrawer() || StorySplitView.isInSplit(this)) {
+            com.newsblur.util.WebViewPrewarm.startWhenIdle(this);
+        }
+        if (feedDrawerPending) {
+            feedDrawerPending = false;
+            // At launch the feed list is the first screen, already open over the waiting list.
+            FeedListDrawer.open(this, getIntent().getStringExtra(Main.EXTRA_FORCE_SHOW_FEED_ID));
+        }
+        if (slidesOverFeedDrawer() || StorySplitView.isInSplit(this)) {
+            // A rotation recreates this list but not the reader beside it, which still reports
+            // back through peekReadingLaunchParent, so claim that role and restore its highlight.
+            // ReadingPlaceholder.kt also finds this list there to hand it Back. The first resume can
+            // come before the split is reported, so a root list claims it without waiting for that.
+            claimReadingLaunchParent();
+            if (restoredSplitReadingStoryHash != null) {
+                prepareReturnToStory(restoredSplitReadingStoryHash);
+                restoredSplitReadingStoryHash = null;
+            }
+        }
         // Reading activities almost certainly changed the read/unread state of some stories. Ensure
         // we reflect those changes promptly.
         itemSetFragment.hasUpdated();
     }
 
+    public void refreshStoryHeaderControls() {
+        if (binding == null) return;
+        updateStoryListFullscreenButton();
+
+        Menu menu = buildItemListMenuModel();
+        boolean showDiscover = shouldShowDiscoverAction();
+        MenuItem searchItem = menu.findItem(R.id.menu_search_stories);
+        MenuItem markReadItem = menu.findItem(R.id.menu_mark_all_as_read);
+
+        updateOptionsPillTitle(menu);
+        binding.itemlistDiscoverPill.setVisibility(showDiscover ? View.VISIBLE : View.GONE);
+        binding.itemlistSearchPill.setVisibility(searchItem != null && searchItem.isVisible() ? View.VISIBLE : View.GONE);
+        binding.itemlistMarkReadContainer.setVisibility(markReadItem != null && markReadItem.isVisible() ? View.VISIBLE : View.GONE);
+        updateStoryHeaderPillLabels();
+        invalidateOptionsMenu();
+
+        if (searchItem != null && !searchItem.isVisible() && isStorySearchVisible()) {
+            hideStorySearch(true);
+        } else {
+            updateStorySearchLoadingIndicator();
+            updateStorySearchPillState();
+        }
+    }
+
     @Override
     protected void onPause() {
+        predictiveBackInProgress = false;
+        setStorySearchRefreshInFlight(false);
+        cancelPendingStorySearch();
+        cancelPendingFetchingBanner();
+        cancelStoryStatusBannerAnimation();
+        dismissItemListMenuPopup();
+        // ItemsList.java keeps the completed swipe offscreen until Android removes its window.
+        if (!isFinishing()) {
+            resetInteractiveStoryListSwipe(true);
+        }
         super.onPause();
-        NBSyncService.addRecountCandidates(fs);
+        syncServiceState.addRecountCandidate(fs);
     }
 
-	@Override
-	public boolean onCreateOptionsMenu(Menu menu) {
-		return contextMenuDelegate.onCreateMenuOptions(menu, getMenuInflater(), fs);
-	}
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        return true;
+    }
 
-	@Override
-	public boolean onPrepareOptionsMenu(Menu menu) {
+    @Override
+    public boolean onPrepareOptionsMenu(Menu menu) {
         super.onPrepareOptionsMenu(menu);
-        boolean showSavedSearch = !TextUtils.isEmpty(binding.itemlistSearchQuery.getText());
-        return contextMenuDelegate.onPrepareMenuOptions(menu, fs, showSavedSearch);
+        updateToolbarSettingsButtonVisibility();
+        return true;
     }
 
     @Override
-	public boolean onOptionsItemSelected(MenuItem item) {
-        return contextMenuDelegate.onOptionsItemSelected(item, itemSetFragment, fs, binding.itemlistSearchQuery, getSaveSearchFeedId());
-	}
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == R.id.menu_story_settings) {
+            showItemListSettingsPopup(findViewById(R.id.toolbar));
+            return true;
+        }
+        if (contextMenuDelegate.onOptionsItemSelected(item, itemSetFragment, fs, binding.itemlistSearchQuery, getSaveSearchFeedId())) {
+            return true;
+        }
+        return kind.onOptionsItemSelected(this, item);
+    }
+
+    protected boolean prepareItemListMenuModel(Menu menu) {
+        boolean showSavedSearch = !TextUtils.isEmpty(binding.itemlistSearchQuery.getText());
+        boolean prepared = contextMenuDelegate.onPrepareMenuOptions(menu, fs, showSavedSearch);
+        return kind.prepareMenu(this, menu) || prepared;
+    }
 
     @Override
-	public void handleUpdate(int updateType) {
+    public void infrequentCutoffChanged(int newValue) {
+        prefsRepo.setInfrequentCutoff(newValue);
+        dbHelper.clearInfrequentSession();
+        restartReadingSession();
+    }
+
+    // infix fun Int.has(flag: Int) = (this and flag) != 0
+    @Override
+    public void handleUpdate(int updateType) {
         if ((updateType & UPDATE_REBUILD) != 0) {
-            finish();
+            leaveForRebuild();
         }
         if ((updateType & UPDATE_STATUS) != 0) {
             updateStatusIndicators();
-        }
-		if ((updateType & UPDATE_STORY) != 0) {
             if (itemSetFragment != null) {
-			    itemSetFragment.hasUpdated();
+                itemSetFragment.refreshLoadingIndicators();
             }
+        }
+        if ((updateType & UPDATE_STORY) != 0) {
+            if (itemSetFragment != null) {
+                itemSetFragment.hasUpdated();
+            }
+        }
+        if ((updateType & UPDATE_METADATA) != 0) {
+            kind.onMetadataUpdated(this);
         }
     }
 
@@ -216,107 +541,1421 @@ public abstract class ItemsList extends NbActivity implements ReadingActionListe
         if (sessionDataSource != null) {
             Session session = sessionDataSource.getNextSession();
             if (session != null) {
-                // set the next session on the parent activity
-                fs = session.getFeedSet();
-                feedUtils.prepareReadingSession(this, fs, false);
-                triggerSync();
+                applyNextSession(session);
+                return;
+            }
+        }
+        // ItemsList.java action completion returns to feeds without treating an already open
+        // FeedListDrawer.kt as a request to leave the app, as explicit Back navigation does.
+        if (slidesOverFeedDrawer()) FeedListDrawer.open(this);
+        else finish();
+    }
 
-                // set the next session on the child activity
-                viewModel.updateSession(session);
+    @Nullable
+    public Session peekNextStoryListSession() {
+        if (storyListSessionDataSource == null) return null;
+        return storyListSessionDataSource.peekNextSession();
+    }
 
-                // update item set fragment
-                itemSetFragment.resetEmptyState();
-                itemSetFragment.hasUpdated();
-                itemSetFragment.scrollToTop();
-            } else finish();
-        } else finish();
+    public boolean openNextStoryListSession() {
+        if (storyListSessionDataSource == null) return false;
+        Session session = storyListSessionDataSource.getNextSession();
+        if (session == null) return false;
+        if (openDifferentStoryListActivity(session)) return true;
+        applyNextSession(session);
+        return true;
+    }
+
+    private boolean openDifferentStoryListActivity(@NonNull Session session) {
+        if (session.getFeedSet().isFolder() && !(kind instanceof StoryListKind.Folder)) {
+            if (sessionDataSource != null) {
+                sessionDataSource.setSession(session);
+            }
+            Intent intent = new Intent(this, FolderItemsList.class);
+            intent.putExtra(EXTRA_FEED_SET, session.getFeedSet());
+            intent.putExtra(FolderItemsList.EXTRA_FOLDER_NAME, session.getFolderName());
+            putSessionDataKeyExtra(intent, sessionDataSource, storyListSessionDataSource);
+            StorySplitView.startStoryList(this, intent);
+            finish();
+            return true;
+        }
+        return false;
+    }
+
+    private void applyNextSession(@NonNull Session session) {
+        closeSplitReader();
+        // set the next session on the parent activity
+        fs = session.getFeedSet();
+        feedUtils.prepareReadingSession(fs, false);
+        LastStoryList.remember(this, this, fs, session.getFolderName() != null ? session.getFolderName() : fs.getFolderName());
+        triggerSync();
+        scheduleInitialFetchingBanner();
+
+        if (sessionDataSource != null) {
+            sessionDataSource.setSession(session);
+        }
+        if (storyListSessionDataSource != null) {
+            storyListSessionDataSource.setSession(session);
+        }
+
+        // set the next session on the child activity
+        viewModel.updateSession(session);
+
+        // update item set fragment
+        itemSetFragment.resetEmptyState();
+        itemSetFragment.hasUpdated();
+        itemSetFragment.scrollToTop();
+        refreshStoryHeaderControls();
     }
 
     private void updateStatusIndicators() {
-        if (binding.itemlistSyncStatus != null) {
-            String syncStatus = NBSyncService.getSyncStatusMessage(this, true);
-            if (syncStatus != null)  {
-                if (AppConstants.VERBOSE_LOG) {
-                    syncStatus = syncStatus + UIUtils.getMemoryUsageDebug(this);
+        if (!NetworkUtils.isOnline(this)) {
+            setStorySearchRefreshInFlight(false);
+            cancelPendingFetchingBanner();
+            showStoryStatusBanner(getString(R.string.sync_status_offline), StoryStatusBannerStyle.OFFLINE);
+            return;
+        }
+
+        if (syncServiceState.getTryFeedRefreshStatus(fs) == com.newsblur.service.TryFeedRefreshStatus.FETCHING) {
+            showStoryStatusBanner(getString(R.string.try_feed_instafetching), StoryStatusBannerStyle.FETCHING);
+            return;
+        }
+
+        boolean isInitialFetchPending = awaitingInitialFetchingBanner && syncServiceState.isFeedSetSyncing(fs);
+        if (isInitialFetchPending && fetchingBannerDelayElapsed && itemSetFragment != null && itemSetFragment.hasStories()) {
+            showStoryStatusBanner("Fetching recent stories...", StoryStatusBannerStyle.FETCHING);
+            return;
+        }
+
+        if (!syncServiceState.isFeedSetSyncing(fs)) {
+            setStorySearchRefreshInFlight(false);
+            awaitingInitialFetchingBanner = false;
+            fetchingBannerDelayElapsed = false;
+            cancelPendingFetchingBanner();
+        }
+
+        updateStorySearchLoadingIndicator();
+        hideStoryStatusBanner(true);
+    }
+
+    public void refreshStoryStatusIndicators() {
+        updateStatusIndicators();
+    }
+
+    public void toggleStorySearch() {
+        if (isStorySearchVisible()) {
+            hideStorySearch(true);
+        } else {
+            showStorySearch(true);
+        }
+    }
+
+    private void setupStoryHeader() {
+        storyToolbarAtBottom = prefsRepo.isStoryToolbarAtBottom();
+        if (storyToolbarAtBottom) floatingStoryToolbar = new com.newsblur.view.FloatingStoryToolbar(binding, prefsRepo.getResolvedTheme(this));
+        discoverPillExpandedAppearance = captureStoryHeaderPillAppearance(binding.itemlistDiscoverPill);
+        searchPillExpandedAppearance = captureStoryHeaderPillAppearance(binding.itemlistSearchPill);
+        binding.itemlistDiscoverPill.setOnClickListener(view -> openDiscoverFeeds());
+        binding.itemlistOptionsPill.setOnClickListener(this::showItemListMenuPopup);
+        binding.itemlistSearchPill.setOnClickListener(view -> toggleStorySearch());
+        binding.itemlistMarkReadButton.setOnClickListener(view ->
+                feedUtils.markRead(this, fs, null, null, R.array.mark_all_read_options, this)
+        );
+        binding.itemlistMarkReadMoreButton.setOnClickListener(this::showMarkReadCutoffMenu);
+        binding.itemlistClearSearchQuery.setOnClickListener(view -> {
+            binding.itemlistSearchQuery.setText("");
+            binding.itemlistSearchQuery.requestFocus();
+        });
+        binding.itemlistStoryHeaderBar.addOnLayoutChangeListener((view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) ->
+                updateStoryHeaderPillLabels()
+        );
+        binding.itemlistSearchQuery.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                setStorySearchRefreshInFlight(!TextUtils.equals(normalizeStorySearchQuery(s), fs.getSearchQuery()));
+                updateStorySearchClearButton(s);
+                refreshStoryHeaderControls();
+                if (TextUtils.isEmpty(s)) {
+                    runStorySearchNow();
+                } else {
+                    scheduleStorySearch();
                 }
-                binding.itemlistSyncStatus.setText(syncStatus);
-                binding.itemlistSyncStatus.setVisibility(View.VISIBLE);
+            }
+        });
+        binding.itemlistSearchQuery.setOnEditorActionListener((textView, actionId, event) -> {
+            boolean isSearchAction =
+                    actionId == EditorInfo.IME_ACTION_SEARCH ||
+                    actionId == EditorInfo.IME_ACTION_DONE ||
+                    ((event != null) &&
+                     (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) &&
+                     (event.getAction() == KeyEvent.ACTION_DOWN));
+            if (!isSearchAction) {
+                return false;
+            }
+            runStorySearchNow();
+            return true;
+        });
+        applyStoryHeaderTheme();
+        updateStorySearchClearButton(binding.itemlistSearchQuery.getText());
+        updateStorySearchLoadingIndicator();
+        updateStoryHeaderPillLabels();
+        updateStorySearchPillState();
+    }
+
+    private void showStorySearch(boolean requestFocus) {
+        binding.itemlistSearchContainer.setVisibility(View.VISIBLE);
+        updateStorySearchLoadingIndicator();
+        updateStorySearchPillState();
+        if (requestFocus) {
+            binding.itemlistSearchQuery.requestFocus();
+            if (storyToolbarAtBottom) binding.itemlistSearchQuery.post(() -> {
+                InputMethodManager keyboard = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                keyboard.showSoftInput(binding.itemlistSearchQuery, InputMethodManager.SHOW_IMPLICIT);
+            });
+        }
+    }
+
+    private void hideStorySearch(boolean clearText) {
+        if (clearText) {
+            binding.itemlistSearchQuery.setText("");
+        }
+        binding.itemlistSearchContainer.setVisibility(View.GONE);
+        binding.itemlistSearchQuery.clearFocus();
+        if (storyToolbarAtBottom) {
+            InputMethodManager keyboard = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            keyboard.hideSoftInputFromWindow(binding.itemlistSearchQuery.getWindowToken(), 0);
+        }
+        updateStorySearchLoadingIndicator();
+        updateStorySearchPillState();
+        runStorySearchNow();
+    }
+
+    private boolean isStorySearchVisible() {
+        return binding.itemlistSearchContainer.getVisibility() == View.VISIBLE;
+    }
+
+    private void updateStorySearchPillState() {
+        StoryHeaderPalette palette = storyHeaderPalette();
+        boolean isActive = isStorySearchVisible();
+        applyPillStyle(
+                binding.itemlistSearchPill,
+                isActive ? palette.selectedBackgroundColor : palette.pillBackgroundColor,
+                isActive ? palette.selectedBorderColor : palette.pillBorderColor,
+                isActive ? palette.selectedTextColor : palette.pillTextColor
+        );
+        if (floatingStoryToolbar != null) floatingStoryToolbar.applyTheme(isActive);
+    }
+
+    private void updateStoryHeaderPillLabels() {
+        if (floatingStoryToolbar != null) {
+            floatingStoryToolbar.update(expandedOptionsPillTitle, compactOptionsPillTitle, binding.itemlistSearchContainer.getVisibility() == View.VISIBLE);
+            return;
+        }
+        if (updatingStoryHeaderPillLabels) return;
+        if (binding.itemlistStoryHeaderBar.getWidth() <= 0) return;
+        updatingStoryHeaderPillLabels = true;
+
+        int availableWidth = binding.itemlistStoryHeaderBar.getWidth()
+                - binding.itemlistStoryHeaderBar.getPaddingLeft()
+                - binding.itemlistStoryHeaderBar.getPaddingRight();
+        if (availableWidth <= 0) {
+            updatingStoryHeaderPillLabels = false;
+            return;
+        }
+
+        int optionsWidth = binding.itemlistOptionsPill.getVisibility() == View.VISIBLE
+                ? measureOptionsPillWidth(expandedOptionsPillTitle)
+                : 0;
+        int compactOptionsWidth = binding.itemlistOptionsPill.getVisibility() == View.VISIBLE
+                ? measureOptionsPillWidth(compactOptionsPillTitle)
+                : 0;
+        StoryHeaderPillAppearanceResolver.Appearance discoverExpandedAppearance = getDiscoverPillExpandedAppearance();
+        StoryHeaderPillAppearanceResolver.Appearance searchExpandedAppearance = getSearchPillExpandedAppearance();
+        int markReadWidth = binding.itemlistMarkReadContainer.getVisibility() == View.VISIBLE
+                ? measureDesiredWidth(binding.itemlistMarkReadContainer)
+                : 0;
+        int discoverFullWidth = binding.itemlistDiscoverPill.getVisibility() == View.VISIBLE
+                ? measureDiscoverPillWidth(getString(R.string.story_header_related_sites), true, discoverExpandedAppearance)
+                : 0;
+        int discoverCompactWidth = binding.itemlistDiscoverPill.getVisibility() == View.VISIBLE
+                ? measureDiscoverPillWidth("", false, discoverExpandedAppearance)
+                : 0;
+        int searchFullWidth = binding.itemlistSearchPill.getVisibility() == View.VISIBLE
+                ? measureSearchPillWidth(getString(R.string.story_header_search), true, searchExpandedAppearance)
+                : 0;
+        int searchCompactWidth = binding.itemlistSearchPill.getVisibility() == View.VISIBLE
+                ? measureSearchPillWidth("", false, searchExpandedAppearance)
+                : 0;
+
+        int discoverMargin = binding.itemlistDiscoverPill.getVisibility() == View.VISIBLE
+                ? ((ViewGroup.MarginLayoutParams) binding.itemlistDiscoverPill.getLayoutParams()).getMarginEnd()
+                : 0;
+        int searchMargin = binding.itemlistSearchPill.getVisibility() == View.VISIBLE
+                ? ((ViewGroup.MarginLayoutParams) binding.itemlistSearchPill.getLayoutParams()).getMarginStart()
+                : 0;
+        int markReadMargin = binding.itemlistMarkReadContainer.getVisibility() == View.VISIBLE
+                ? ((ViewGroup.MarginLayoutParams) binding.itemlistMarkReadContainer.getLayoutParams()).getMarginStart()
+                : 0;
+
+        StoryHeaderPillLayoutDecider.Decision decision = StoryHeaderPillLayoutDecider.decide(
+                availableWidth,
+                optionsWidth,
+                compactOptionsWidth,
+                markReadWidth,
+                discoverFullWidth,
+                discoverCompactWidth,
+                searchFullWidth,
+                searchCompactWidth,
+                discoverMargin,
+                searchMargin,
+                markReadMargin,
+                binding.itemlistDiscoverPill.getVisibility() == View.VISIBLE,
+                binding.itemlistSearchPill.getVisibility() == View.VISIBLE
+        );
+
+        binding.itemlistOptionsPill.setText(decision.showFullOptionsTitle() ? expandedOptionsPillTitle : compactOptionsPillTitle);
+        binding.itemlistOptionsPill.setMaxWidth(decision.optionsWidth());
+        if (binding.itemlistDiscoverPill.getVisibility() == View.VISIBLE) {
+            applyStoryHeaderPillLabel(
+                    binding.itemlistDiscoverPill,
+                    getString(R.string.story_header_related_sites),
+                    decision.showDiscoverText(),
+                    discoverExpandedAppearance
+            );
+        }
+        if (binding.itemlistSearchPill.getVisibility() == View.VISIBLE) {
+            applyStoryHeaderPillLabel(
+                    binding.itemlistSearchPill,
+                    getString(R.string.story_header_search),
+                    decision.showSearchText(),
+                    searchExpandedAppearance
+            );
+        }
+        // Reset the guard after the next layout pass to prevent the layout change
+        // listener from re-entering this method and undoing the text we just set.
+        binding.itemlistStoryHeaderBar.post(() -> updatingStoryHeaderPillLabels = false);
+    }
+
+    private int measureSearchPillWidth(
+            CharSequence title,
+            boolean showText,
+            StoryHeaderPillAppearanceResolver.Appearance expandedAppearance
+    ) {
+        return measureStoryHeaderPillWidth(binding.itemlistSearchPill, title, showText, expandedAppearance);
+    }
+
+    private int measureOptionsPillWidth(CharSequence title) {
+        CharSequence previousTitle = binding.itemlistOptionsPill.getText();
+        int previousMaxWidth = binding.itemlistOptionsPill.getMaxWidth();
+        binding.itemlistOptionsPill.setMaxWidth(Integer.MAX_VALUE);
+        binding.itemlistOptionsPill.setText(title);
+        int width = measureDesiredWidth(binding.itemlistOptionsPill);
+        binding.itemlistOptionsPill.setText(previousTitle);
+        binding.itemlistOptionsPill.setMaxWidth(previousMaxWidth);
+        return width;
+    }
+
+    private int measureDiscoverPillWidth(
+            CharSequence title,
+            boolean showText,
+            StoryHeaderPillAppearanceResolver.Appearance expandedAppearance
+    ) {
+        return measureStoryHeaderPillWidth(binding.itemlistDiscoverPill, title, showText, expandedAppearance);
+    }
+
+    private int measureStoryHeaderPillWidth(
+            MaterialButton button,
+            CharSequence title,
+            boolean showText,
+            StoryHeaderPillAppearanceResolver.Appearance expandedAppearance
+    ) {
+        CharSequence previousTitle = button.getText();
+        StoryHeaderPillAppearanceResolver.Appearance previousAppearance = captureStoryHeaderPillAppearance(button);
+        applyStoryHeaderPillLabel(button, title, showText, expandedAppearance);
+        int width = measureDesiredWidth(button);
+        button.setText(previousTitle);
+        applyStoryHeaderPillAppearance(button, previousAppearance);
+        return width;
+    }
+
+    private void applyStoryHeaderPillLabel(
+            MaterialButton button,
+            CharSequence title,
+            boolean showText,
+            StoryHeaderPillAppearanceResolver.Appearance expandedAppearance
+    ) {
+        button.setText(showText ? title : "");
+        applyStoryHeaderPillAppearance(button, StoryHeaderPillAppearanceResolver.resolve(
+                showText, expandedAppearance.paddingStart(), expandedAppearance.paddingTop(),
+                expandedAppearance.paddingEnd(), expandedAppearance.paddingBottom(), expandedAppearance.iconPadding(),
+                UIUtils.dp2px(this, STORY_HEADER_COMPACT_PILL_HORIZONTAL_PADDING_DP)));
+    }
+
+    private void applyStoryHeaderPillAppearance(
+            MaterialButton button,
+            StoryHeaderPillAppearanceResolver.Appearance appearance
+    ) {
+        button.setIconPadding(appearance.iconPadding());
+        button.setPaddingRelative(appearance.paddingStart(), appearance.paddingTop(), appearance.paddingEnd(), appearance.paddingBottom());
+    }
+
+    private StoryHeaderPillAppearanceResolver.Appearance captureStoryHeaderPillAppearance(MaterialButton button) {
+        return new StoryHeaderPillAppearanceResolver.Appearance(
+                button.getPaddingStart(),
+                button.getPaddingTop(),
+                button.getPaddingEnd(),
+                button.getPaddingBottom(),
+                button.getIconPadding()
+        );
+    }
+
+    private StoryHeaderPillAppearanceResolver.Appearance getDiscoverPillExpandedAppearance() {
+        if (discoverPillExpandedAppearance == null) {
+            discoverPillExpandedAppearance = captureStoryHeaderPillAppearance(binding.itemlistDiscoverPill);
+        }
+        return discoverPillExpandedAppearance;
+    }
+
+    private StoryHeaderPillAppearanceResolver.Appearance getSearchPillExpandedAppearance() {
+        if (searchPillExpandedAppearance == null) {
+            searchPillExpandedAppearance = captureStoryHeaderPillAppearance(binding.itemlistSearchPill);
+        }
+        return searchPillExpandedAppearance;
+    }
+
+    private int measureDesiredWidth(View view) {
+        int widthSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+        int heightSpec;
+        ViewGroup.LayoutParams layoutParams = view.getLayoutParams();
+        if (layoutParams != null && layoutParams.height > 0) {
+            heightSpec = View.MeasureSpec.makeMeasureSpec(layoutParams.height, View.MeasureSpec.EXACTLY);
+        } else {
+            heightSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+        }
+        view.measure(widthSpec, heightSpec);
+        return view.getMeasuredWidth();
+    }
+
+    private void updateOptionsPillTitle(Menu menu) {
+        StoryOrder storyOrder = prefsRepo.getStoryOrder(fs);
+        ReadFilter readFilter = prefsRepo.getReadFilter(fs);
+        boolean showOrder = menu.findItem(R.id.menu_story_order) != null && menu.findItem(R.id.menu_story_order).isVisible();
+        boolean showReadFilter = menu.findItem(R.id.menu_read_filter) != null && menu.findItem(R.id.menu_read_filter).isVisible();
+
+        String orderText = storyOrder == StoryOrder.OLDEST ? getString(R.string.oldest) : getString(R.string.newest);
+        String filterText = readFilter == ReadFilter.UNREAD ? getString(R.string.state_unread) : getString(R.string.state_all);
+        expandedOptionsPillTitle = StoryHeaderOptionsTitleFormatter.INSTANCE.format(filterText, orderText, getString(R.string.story_header_options), showReadFilter, showOrder);
+        compactOptionsPillTitle = StoryHeaderOptionsTitleFormatter.INSTANCE.format(filterText, orderText, getString(R.string.story_header_options), showReadFilter, showOrder && !showReadFilter);
+        binding.itemlistOptionsPill.setText(expandedOptionsPillTitle);
+        binding.itemlistOptionsPill.setContentDescription(expandedOptionsPillTitle);
+        applyPillStyle(binding.itemlistOptionsPill, storyHeaderPalette().pillBackgroundColor, storyHeaderPalette().pillBorderColor, storyHeaderPalette().pillTextColor);
+    }
+
+    private void showMarkReadCutoffMenu(View anchor) {
+        if (storyToolbarAtBottom) {
+            dismissItemListMenuPopup();
+            itemListMenuPopup = com.newsblur.delegate.MarkReadCutoffPopover.show(this, anchor, MARK_READ_CUTOFF_DAYS, days -> {
+                long olderThan = System.currentTimeMillis() - (days * MILLIS_PER_DAY);
+                feedUtils.markRead(this, fs, olderThan, null, R.array.mark_older_read_options, this);
+            });
+            return;
+        }
+        PopupMenu popupMenu = new PopupMenu(this, anchor);
+        for (int i = 0; i < MARK_READ_CUTOFF_DAYS.length; i++) {
+            int days = MARK_READ_CUTOFF_DAYS[i];
+            popupMenu.getMenu().add(Menu.NONE, days, i, getResources().getQuantityString(R.plurals.story_header_mark_read_older_than_days, days, days));
+        }
+        popupMenu.setOnMenuItemClickListener(item -> {
+            int days = item.getItemId();
+            long olderThan = System.currentTimeMillis() - (days * MILLIS_PER_DAY);
+            feedUtils.markRead(this, fs, olderThan, null, R.array.mark_older_read_options, this);
+            return true;
+        });
+        popupMenu.show();
+    }
+
+    private void showItemListMenuPopup(View anchor) {
+        showItemListPopup(anchor, ItemListMenuPopup.Content.VISUAL);
+    }
+
+    private void showItemListSettingsPopup(View anchor) {
+        showItemListPopup(anchor, ItemListMenuPopup.Content.ACTIONS);
+    }
+
+    private void updateStoryListFullscreenButton() {
+        if (binding == null) return;
+        android.widget.ImageButton button = findViewById(R.id.toolbar_fullscreen_button);
+        boolean fullscreen = StorySplitView.isStoryListFullscreen(this);
+        button.setVisibility(StorySplitView.canToggleStoryListFullscreen(this) ? View.VISIBLE : View.GONE);
+        button.setImageResource(fullscreen ? R.drawable.ic_reader_fullscreen_exit : R.drawable.ic_reader_fullscreen);
+        button.setContentDescription(getString(fullscreen ? R.string.story_list_exit_fullscreen : R.string.story_list_enter_fullscreen));
+        androidx.appcompat.widget.TooltipCompat.setTooltipText(button, button.getContentDescription());
+    }
+
+    private void updateToolbarSettingsButtonVisibility() {
+        View settingsButton = findViewById(R.id.toolbar_settings_button);
+        if (settingsButton == null) {
+            return;
+        }
+        boolean hasVisibleActions = ItemListMenuPopup.hasVisibleActions(buildItemListMenuModel());
+        settingsButton.setVisibility(hasVisibleActions ? View.VISIBLE : View.INVISIBLE);
+    }
+
+    private void showItemListPopup(View anchor, ItemListMenuPopup.Content content) {
+        Menu menuModel = buildItemListMenuModel();
+        if ((content == ItemListMenuPopup.Content.ACTIONS) && !ItemListMenuPopup.hasVisibleActions(menuModel)) {
+            dismissItemListMenuPopup();
+            return;
+        }
+
+        if (itemListMenuPopup != null && itemListMenuPopup.isShowing()) {
+            if (content == itemListPopupContent) {
+                dismissItemListMenuPopup();
+                return;
+            }
+            dismissItemListMenuPopup();
+        }
+
+        PopupWindow popup =
+                new ItemListMenuPopup(this, new ItemListMenuPopup.Controller() {
+                    @Override
+                    public Menu buildMenuModel() {
+                        return buildItemListMenuModel();
+                    }
+
+                    @Override
+                    public boolean onMenuItemSelected(int itemId) {
+                        MenuItem menuItem = buildItemListMenuModel().findItem(itemId);
+                        return menuItem != null && ItemsList.this.onOptionsItemSelected(menuItem);
+                    }
+                }, content).show(anchor);
+        popup.setOnDismissListener(() -> {
+            if (itemListMenuPopup == popup) {
+                itemListMenuPopup = null;
+                itemListPopupContent = null;
+            }
+        });
+        itemListMenuPopup = popup;
+        itemListPopupContent = content;
+    }
+
+    private void dismissItemListMenuPopup() {
+        if (itemListMenuPopup != null) {
+            itemListMenuPopup.dismiss();
+            itemListMenuPopup = null;
+        }
+        itemListPopupContent = null;
+    }
+
+    private Menu buildItemListMenuModel() {
+        PopupMenu popupMenu = new PopupMenu(this, findViewById(R.id.toolbar));
+        contextMenuDelegate.onCreateMenuOptions(popupMenu.getMenu(), popupMenu.getMenuInflater(), fs);
+        prepareItemListMenuModel(popupMenu.getMenu());
+        return popupMenu.getMenu();
+    }
+
+    private void applyStoryHeaderTheme() {
+        StoryHeaderPalette palette = storyHeaderPalette();
+        binding.itemlistStoryHeader.setBackgroundColor(palette.headerBackgroundColor);
+        binding.itemlistSearchContainer.setBackgroundColor(palette.headerBackgroundColor);
+        binding.itemlistMarkReadDivider.setBackgroundColor(palette.markReadDividerColor);
+
+        applyPillStyle(binding.itemlistDiscoverPill, palette.pillBackgroundColor, palette.pillBorderColor, palette.pillTextColor);
+        applyPillStyle(binding.itemlistOptionsPill, palette.pillBackgroundColor, palette.pillBorderColor, palette.pillTextColor);
+        updateStorySearchPillState();
+
+        GradientDrawable markReadBackground = new GradientDrawable();
+        markReadBackground.setShape(GradientDrawable.RECTANGLE);
+        markReadBackground.setCornerRadius(UIUtils.dp2px(this, 14));
+        markReadBackground.setColor(palette.markReadBackgroundColor);
+        markReadBackground.setStroke(UIUtils.dp2px(this, 1), palette.markReadDividerColor);
+        binding.itemlistMarkReadContainer.setBackground(markReadBackground);
+        binding.itemlistMarkReadMoreButton.setColorFilter(palette.pillTextColor);
+        binding.itemlistMarkReadButton.setColorFilter(palette.pillTextColor);
+        if (floatingStoryToolbar != null) floatingStoryToolbar.applyTheme(binding.itemlistSearchContainer.getVisibility() == View.VISIBLE);
+    }
+
+    public boolean shouldShowDiscoverAction() {
+        if (fs == null) return false;
+        if (fs.getSearchQuery() != null) return false;
+        if (fs.isFilterSaved()) return false;
+        if (fs.isSingleNormal()) return true;
+        return fs.isFolder() && !AppConstants.ROOT_FOLDER.equals(fs.getFolderName());
+    }
+
+    public void openDiscoverFeeds() {
+        if (!shouldShowDiscoverAction()) return;
+        if (storyToolbarAtBottom) {
+            dismissItemListMenuPopup();
+            itemListMenuPopup = RelatedSitesPopover.show(this, binding.itemlistDiscoverPill, fs, relatedIconLoader, relatedThumbnailLoader, relatedTryFeedStore);
+            return;
+        }
+
+        if (fs.isFolder()) {
+            DiscoverFeedsActivity.startForFeeds(this, fs.getAllFeeds());
+        } else if (fs.isSingleNormal()) {
+            String feedId = fs.getSingleFeed();
+            com.newsblur.domain.Feed sourceFeed = dbHelper.getFeed(feedId);
+            if (sourceFeed != null) {
+                DiscoverFeedsActivity.startForFeed(this, sourceFeed);
             } else {
-                binding.itemlistSyncStatus.setVisibility(View.GONE);
+                DiscoverFeedsActivity.startForFeed(this, feedId);
             }
         }
     }
 
+    private void applyPillStyle(MaterialButton button, int backgroundColor, int borderColor, int textColor) {
+        button.setBackgroundTintList(ColorStateList.valueOf(backgroundColor));
+        button.setStrokeColor(ColorStateList.valueOf(borderColor));
+        button.setStrokeWidth(UIUtils.dp2px(this, 1));
+        button.setCornerRadius(UIUtils.dp2px(this, 14));
+        button.setTextColor(textColor);
+        button.setIconTint(ColorStateList.valueOf(textColor));
+        button.setInsetTop(0);
+        button.setInsetBottom(0);
+    }
+
+    private StoryHeaderPalette storyHeaderPalette() {
+        PrefConstants.ThemeValue theme = prefsRepo.getResolvedTheme(this);
+
+        if (theme == PrefConstants.ThemeValue.SEPIA) {
+            return new StoryHeaderPalette(
+                    ContextCompat.getColor(this, R.color.bar_background_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_background_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_text_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_selected_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_selected_text_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_background_sepia),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_sepia)
+            );
+        } else if (theme == PrefConstants.ThemeValue.DARK) {
+            return new StoryHeaderPalette(
+                    ContextCompat.getColor(this, R.color.dark_bar_background),
+                    ContextCompat.getColor(this, R.color.segmented_control_background_dark),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_dark),
+                    ContextCompat.getColor(this, R.color.segmented_control_text_dark),
+                    ContextCompat.getColor(this, R.color.segmented_control_selected_dark),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_dark),
+                    ContextCompat.getColor(this, R.color.segmented_control_selected_text_dark),
+                    ContextCompat.getColor(this, R.color.segmented_control_background_dark),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_dark)
+            );
+        } else if (theme == PrefConstants.ThemeValue.BLACK) {
+            return new StoryHeaderPalette(
+                    ContextCompat.getColor(this, R.color.black),
+                    ContextCompat.getColor(this, R.color.segmented_control_background_black),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_black),
+                    ContextCompat.getColor(this, R.color.segmented_control_text_black),
+                    ContextCompat.getColor(this, R.color.segmented_control_selected_black),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_black),
+                    ContextCompat.getColor(this, R.color.segmented_control_selected_text_black),
+                    ContextCompat.getColor(this, R.color.segmented_control_background_black),
+                    ContextCompat.getColor(this, R.color.segmented_control_border_black)
+            );
+        }
+
+        return new StoryHeaderPalette(
+                ContextCompat.getColor(this, R.color.bar_background),
+                ContextCompat.getColor(this, R.color.segmented_control_background_light),
+                ContextCompat.getColor(this, R.color.segmented_control_border_light),
+                ContextCompat.getColor(this, R.color.segmented_control_text_light),
+                ContextCompat.getColor(this, R.color.segmented_control_selected_light),
+                ContextCompat.getColor(this, R.color.segmented_control_border_light),
+                ContextCompat.getColor(this, R.color.segmented_control_selected_text_light),
+                ContextCompat.getColor(this, R.color.segmented_control_background_light),
+                ContextCompat.getColor(this, R.color.segmented_control_border_light)
+        );
+    }
+
+    private void scheduleStorySearch() {
+        cancelPendingStorySearch();
+        storySearchRunnable = this::checkSearchQuery;
+        storySearchHandler.postDelayed(storySearchRunnable, STORY_SEARCH_DEBOUNCE_MS);
+    }
+
+    private void cancelPendingStorySearch() {
+        if (storySearchRunnable != null) {
+            storySearchHandler.removeCallbacks(storySearchRunnable);
+            storySearchRunnable = null;
+        }
+    }
+
+    private void runStorySearchNow() {
+        cancelPendingStorySearch();
+        checkSearchQuery();
+    }
+
+    @Nullable
+    private String normalizeStorySearchQuery(@Nullable CharSequence query) {
+        if (query == null) {
+            return null;
+        }
+        String normalizedQuery = query.toString().trim();
+        return normalizedQuery.isEmpty() ? null : normalizedQuery;
+    }
+
+    private void updateStorySearchClearButton(@Nullable CharSequence query) {
+        binding.itemlistClearSearchQuery.setVisibility(TextUtils.isEmpty(query) ? View.GONE : View.VISIBLE);
+    }
+
+    private void setStorySearchRefreshInFlight(boolean isInFlight) {
+        storySearchRefreshInFlight = isInFlight;
+        updateStorySearchLoadingIndicator();
+    }
+
+    private void updateStorySearchLoadingIndicator() {
+        binding.itemlistSearchProgress.setVisibility(
+                storySearchRefreshInFlight && isStorySearchVisible() ? View.VISIBLE : View.GONE
+        );
+    }
+
+    private void restoreStorySearchFieldFocus(int selectionEnd) {
+        binding.itemlistSearchQuery.post(() -> {
+            if (!isStorySearchVisible()) {
+                return;
+            }
+            binding.itemlistSearchQuery.requestFocus();
+            Editable query = binding.itemlistSearchQuery.getText();
+            int safeSelectionEnd = Math.max(0, Math.min(selectionEnd, query.length()));
+            binding.itemlistSearchQuery.setSelection(safeSelectionEnd);
+            InputMethodManager inputMethodManager = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.showSoftInput(binding.itemlistSearchQuery, InputMethodManager.SHOW_IMPLICIT);
+            }
+        });
+    }
+
     private void checkSearchQuery() {
-        String q = binding.itemlistSearchQuery.getText().toString().trim();
-        if (q.length() < 1) {
+        storySearchRunnable = null;
+        boolean shouldRestoreFocus = isStorySearchVisible() && binding.itemlistSearchQuery.hasFocus();
+        int selectionEnd = shouldRestoreFocus ? binding.itemlistSearchQuery.getSelectionEnd() : -1;
+        String q = normalizeStorySearchQuery(binding.itemlistSearchQuery.getText());
+        if (q == null) {
             updateFleuron(false);
-            q = null;
-        } else if (!PrefsUtils.hasSubscription(this)) {
+        } else if (!prefsRepo.hasSubscription()) {
+            setStorySearchRefreshInFlight(false);
             updateFleuron(true);
             return;
         }
 
         String oldQuery = fs.getSearchQuery();
         fs.setSearchQuery(q);
-        if (!TextUtils.equals(q, oldQuery)) {
-            feedUtils.prepareReadingSession(this, fs, true);
+        boolean queryChanged = !TextUtils.equals(q, oldQuery);
+        if (queryChanged) {
+            closeSplitReader();
+            feedUtils.prepareReadingSession(fs, true);
             triggerSync();
+            scheduleInitialFetchingBanner();
             itemSetFragment.resetEmptyState();
             itemSetFragment.hasUpdated();
             itemSetFragment.scrollToTop();
+        } else {
+            setStorySearchRefreshInFlight(false);
+        }
+        refreshStoryHeaderControls();
+        if (shouldRestoreFocus) {
+            restoreStorySearchFieldFocus(selectionEnd);
         }
     }
 
     private void updateFleuron(boolean requiresPremium) {
-	    FragmentTransaction transaction = getSupportFragmentManager()
+        FragmentTransaction transaction = getSupportFragmentManager()
                 .beginTransaction()
                 .setCustomAnimations(android.R.animator.fade_in, android.R.animator.fade_out);
 
-	    if (requiresPremium) {
-	        transaction.hide(itemSetFragment);
+        if (requiresPremium) {
+            transaction.hide(itemSetFragment);
             binding.footerFleuron.textSubscription.setText(R.string.premium_subscribers_search);
             binding.footerFleuron.containerSubscribe.setVisibility(View.VISIBLE);
             binding.footerFleuron.getRoot().setVisibility(View.VISIBLE);
             binding.footerFleuron.containerSubscribe.setOnClickListener(view -> UIUtils.startSubscriptionActivity(this));
         } else {
-	        transaction.show(itemSetFragment);
+            transaction.show(itemSetFragment);
             binding.footerFleuron.containerSubscribe.setVisibility(View.GONE);
             binding.footerFleuron.getRoot().setVisibility(View.GONE);
             binding.footerFleuron.containerSubscribe.setOnClickListener(null);
         }
-	    transaction.commit();
+	    transaction.commitNow();
     }
 
-    protected void restartReadingSession() {
-        NBSyncService.resetFetchState(fs);
-        feedUtils.prepareReadingSession(this, fs, true);
+    public void restartReadingSession() {
+        closeSplitReader();
+        syncServiceState.resetFetchState(fs);
+        feedUtils.prepareReadingSession(fs, true);
         triggerSync();
+        scheduleInitialFetchingBanner();
         itemSetFragment.resetEmptyState();
         itemSetFragment.hasUpdated();
         itemSetFragment.scrollToTop();
+        refreshStoryHeaderControls();
+    }
+
+    // A list waiting under the feed list slide-over shows only its background, so no toolbar or
+    // empty list flashes in the pane before the slide-over covers it (ItemsList.java).
+    private void showDeferredContent(boolean show) {
+        ViewGroup root = (ViewGroup) binding.getRoot();
+        for (int i = 0; i < root.getChildCount(); i++) {
+            root.getChildAt(i).setAlpha(show ? 1f : 0f);
+        }
+    }
+
+    // A story the launch intent asks for (a widget tap, a notification), or the first unread one.
+    private void openLaunchStory() {
+        if (getIntent().getBooleanExtra(EXTRA_WIDGET_STORY, false) ||
+            getIntent().getBooleanExtra(EXTRA_AUTO_OPEN_STORY, false)) {
+            String hash = (String) getIntent().getSerializableExtra(EXTRA_STORY_HASH);
+            launchReadingActivity(fs, hash);
+        } else if (prefsRepo.isAutoOpenFirstUnread()) {
+            StateFilter intelState = prefsRepo.getStateFilter();
+            if (dbHelper.getUnreadCount(fs, intelState) > 0) {
+                launchReadingActivity(fs, Reading.FIND_FIRST_UNREAD);
+            }
+        }
+    }
+
+    /** True while this list waits under the feed list slide-over without loading (EXTRA_DEFER_STORIES). */
+    public boolean areStoriesDeferred() {
+        // Also while a switch to a picked feed waits for the feed list to slide away.
+        return storiesDeferred || pendingSwitchLoad != null;
+    }
+
+    /** The feed list slide-over closed without a pick, so load the stories this list waited on. */
+    public void startDeferredStories() {
+        if (!storiesDeferred) return;
+        storiesDeferred = false;
+        showDeferredContent(true);
+        // As after a pick (switchStoryList), the stories load once the feed list has slid away.
+        loadAfterFeedListSlide(() -> {
+            feedUtils.prepareReadingSession(fs, false);
+            LastStoryList.remember(this, this, fs, getIntent().getStringExtra(FolderItemsList.EXTRA_FOLDER_NAME));
+            triggerSync();
+            scheduleInitialFetchingBanner();
+            // While it waited, the empty list laid out just its footer, which the stories would then
+            // load in above, leaving the list scrolled to the end. Start it empty at the top instead.
+            itemSetFragment.resetEmptyState();
+            itemSetFragment.scrollToTop();
+            itemSetFragment.hasUpdated();
+            refreshStoryHeaderControls();
+            openLaunchStory();
+        });
+    }
+
+    // The feed list slides away over this list on the same main thread, so work that would stall
+    // its slide (switching the reading session, loading and laying out stories) waits until it is
+    // gone. Until then areStoriesDeferred() keeps the story list from loading on its own.
+    private void loadAfterFeedListSlide(Runnable load) {
+        View root = binding.getRoot();
+        if (pendingSwitchLoad != null) root.removeCallbacks(pendingSwitchLoad);
+        pendingSwitchLoad = () -> {
+            pendingSwitchLoad = null;
+            if (isFinishing() || isDestroyed()) return;
+            load.run();
+        };
+        root.postDelayed(pendingSwitchLoad, FeedListDrawer.SLIDE_DURATION_MS);
+    }
+
+    /**
+     * Shows another feed, folder or river in this story list instead of opening a new one. The
+     * tablet's feed list slide-over (FeedListDrawer.kt) hands its picks here, so the story list
+     * pane stays in place as the feed list slides away and only its stories change, the way the
+     * iPad reloads its story titles. [next] is the intent that would have opened the pick.
+     */
+    public void switchStoryList(Intent next) {
+        FeedSet nextFs = (FeedSet) next.getSerializableExtra(EXTRA_FEED_SET);
+        if (nextFs == null) return;
+        // The reader beside this list fades to the empty pane's look alongside the slide and parks,
+        // leaving the reading session, which switches to the pick, alone (Reading.park).
+        Reading splitReader = Reading.peekSplitReader(getTaskId());
+        if (splitReader != null && StorySplitView.isInSplit(this)) {
+            if (prefsRepo.isStoryListFullscreenEnabled()) {
+                splitReader.finish();
+            } else {
+                splitReader.fadeToPlaceholder(FeedListDrawer.SLIDE_DURATION_MS);
+                splitReader.park();
+            }
+        }
+        setIntent(next);
+        switchedStoryList = true;
+        if (storiesDeferred) showDeferredContent(true);
+        storiesDeferred = false;
+        fs = nextFs;
+        kind = StoryListKind.fromIntent(next, fs);
+        sessionDataKey = next.getStringExtra(EXTRA_SESSION_DATA_KEY);
+        SessionDataSourceRegistry.Entry sessionDataEntry = SessionDataSourceRegistry.get(sessionDataKey);
+        sessionDataSource = sessionDataEntry != null ? sessionDataEntry.getSessionDataSource() : null;
+        storyListSessionDataSource = sessionDataEntry != null ? sessionDataEntry.getStoryListSessionDataSource() : null;
+        if (isStorySearchVisible() || !TextUtils.isEmpty(binding.itemlistSearchQuery.getText())) {
+            hideStorySearch(true);
+        }
+        String folderName = next.getStringExtra(FolderItemsList.EXTRA_FOLDER_NAME);
+        LastStoryList.remember(this, this, fs, folderName);
+        kind.setupToolbar(this);
+        // A rotation replays the view model's last session into the kind, so keep it on this pick.
+        viewModel.updateSession(new Session(fs, folderName, (com.newsblur.domain.Feed) next.getSerializableExtra(FeedItemsList.EXTRA_FEED)));
+        itemSetFragment.resetEmptyState();
+        // Each feed set keeps its own list, grid or magazine style.
+        itemSetFragment.updateListStyle();
+        itemSetFragment.scrollToTop();
+        refreshStoryHeaderControls();
+        loadAfterFeedListSlide(() -> {
+            feedUtils.prepareReadingSession(fs, false);
+            triggerSync();
+            scheduleInitialFetchingBanner();
+            itemSetFragment.hasUpdated();
+            openLaunchStory();
+        });
     }
 
     public void startReadingActivity(FeedSet feedSet, String storyHash) {
-        UIUtils.startReadingActivity(this, feedSet, storyHash, readingActivityLaunch);
+        launchReadingActivity(feedSet, storyHash);
+    }
+
+    public void animateBackToFeedListFromReading() {
+        // On a tablet the feed list slides over instead of this story list sliding away
+        // (FeedListDrawer.kt). In any other split this story list is one pane, so just close it
+        // and its reader.
+        if (slidesOverFeedDrawer()) {
+            FeedListDrawer.open(this);
+            return;
+        }
+        if (StorySplitView.isInSplit(this)) {
+            finish();
+            return;
+        }
+        beginInteractiveStoryListSwipe();
+        completeInteractiveStoryListSwipe();
+    }
+
+    @Nullable
+    public static ItemsList peekReadingLaunchParent(int taskId) {
+        WeakReference<ItemsList> parent = readingLaunchParents.get(taskId);
+        return parent != null ? parent.get() : null;
+    }
+
+    private void claimReadingLaunchParent() {
+        readingLaunchParents.put(getTaskId(), new WeakReference<>(this));
+    }
+
+    private void launchReadingActivity(FeedSet feedSet, String storyHash) {
+        preparedReturnStoryHash = null;
+        claimReadingLaunchParent();
+        // In a tablet split the reader already beside this list pages over to the tapped story,
+        // as the iPad does, instead of a new reader replacing it (Reading.kt).
+        Reading splitReader = Reading.peekSplitReader(getTaskId());
+        if (splitReader != null && StorySplitView.isInSplit(this) && splitReader.showStoryFromStoryList(feedSet, storyHash)) {
+            return;
+        }
+        UIUtils.startReadingActivity(this, feedSet, storyHash, readingActivityLaunch, readerToolbarHidden);
+    }
+
+    // On a tablet this story list is the task's root and the feed list slides over it
+    // (FeedListDrawer.kt), so going back to feeds opens that panel instead of finishing.
+    public boolean slidesOverFeedDrawer() {
+        return StorySplitView.slidesOverFeedDrawer(this);
+    }
+
+    /** Back, and the toolbar's back arrow, icon, and title (UIUtils.java), all leave through here. */
+    public void backToFeedList() {
+        if (slidesOverFeedDrawer()) {
+            if (FeedListDrawer.peek(getTaskId()) != null) moveTaskToBack(true);
+            else FeedListDrawer.open(this);
+        } else {
+            finish();
+        }
+    }
+
+    /**
+     * A deleted or missing feed leaves this story list with nothing to show. A phone finishes back
+     * to Main.java. A tablet's root story list has no feed list underneath, so All Site Stories
+     * takes its place with the feed list slid over it (FeedListDrawer.kt).
+     */
+    public void replaceWithFeedList() {
+        if (!slidesOverFeedDrawer()) {
+            finish();
+            return;
+        }
+        Intent allStories = new Intent(this, AllStoriesItemsList.class);
+        allStories.putExtra(EXTRA_FEED_SET, FeedSet.allFeeds());
+        allStories.putExtra(EXTRA_OPEN_FEED_DRAWER, true);
+        allStories.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        startActivity(allStories);
+    }
+
+    /**
+     * Sync housekeeping cleans up the stories under this list (UPDATE_REBUILD). A phone finishes back
+     * to Main.java. A tablet's root story list reloads in place instead, because a replacement would
+     * close again while housekeeping runs, and slides the feed list over it as Main.java would show.
+     */
+    private void leaveForRebuild() {
+        if (!slidesOverFeedDrawer()) {
+            finish();
+            return;
+        }
+        feedDrawerPending = false;
+        rebuildHandled = true;
+        restartReadingSession();
+        FeedListDrawer.open(this);
+    }
+
+    public void beginInteractiveStoryListSwipe() {
+        // The swipe back to feeds pulls the feed list over instead of sliding this list away.
+        if (slidesOverFeedDrawer()) {
+            return;
+        }
+        prepareInteractiveSwipeUnderlay();
+        View surface = getInteractiveSwipeSurface();
+        surface.animate().cancel();
+        itemSetFragment.setInteractiveStoryListSwipeRendering(true);
+        surface.setTranslationZ(UIUtils.dp2px(this, STORY_LIST_SWIPE_ELEVATION_DP));
+    }
+
+    public void updateInteractiveStoryListSwipe(float offsetPx) {
+        if (slidesOverFeedDrawer()) {
+            return;
+        }
+        View surface = getInteractiveSwipeSurface();
+        float clampedOffset = Math.max(0f, offsetPx);
+        int width = surface.getWidth();
+        if (width > 0) {
+            clampedOffset = Math.min(clampedOffset, width);
+        }
+        // The offset counts toward the end edge, so the list slides left in right-to-left layouts.
+        surface.setTranslationX(clampedOffset * UIUtils.towardEndSign(this));
+        surface.setTranslationZ(clampedOffset > 0f ? UIUtils.dp2px(this, STORY_LIST_SWIPE_ELEVATION_DP) : 0f);
+    }
+
+    public void cancelInteractiveStoryListSwipe() {
+        if (slidesOverFeedDrawer()) {
+            return;
+        }
+        animateInteractiveStoryListSwipe(0f, false);
+    }
+
+    public void completeInteractiveStoryListSwipe() {
+        if (slidesOverFeedDrawer()) {
+            backToFeedList();
+            return;
+        }
+        View surface = getInteractiveSwipeSurface();
+        float slideDistance = surface.getWidth() > 0 ? surface.getWidth() : getResources().getDisplayMetrics().widthPixels;
+        animateInteractiveStoryListSwipe(slideDistance * UIUtils.towardEndSign(this), true);
+    }
+
+    protected boolean interceptBackPress(boolean isGestureNavigation) {
+        return false;
+    }
+
+    protected boolean shouldHandlePredictiveBack() {
+        return true;
+    }
+
+    // A reader beside this list in a tablet split shows a story from the list's current reading
+    // session. Close it before the list switches or resets sessions (search, next feed, story
+    // order and read filter changes, retry), so the list and the reader never fight over the one
+    // shared session. StorySplitView.kt brings back the placeholder pane.
+    private void closeSplitReader() {
+        Reading reader = Reading.peekSplitReader(getTaskId());
+        if (reader != null && StorySplitView.isInSplit(this)) {
+            reader.finish();
+        }
+    }
+
+    public void prepareReturnToStory(@Nullable String storyHash) {
+        if (storyHash == null || storyHash.equals(preparedReturnStoryHash) || itemSetFragment == null) return;
+        preparedReturnStoryHash = storyHash;
+        itemSetFragment.prepareReturnToStory(storyHash);
+    }
+
+    public void followReadingStory(@Nullable String storyHash) {
+        if (storyHash == null || storyHash.equals(preparedReturnStoryHash) || itemSetFragment == null) return;
+        preparedReturnStoryHash = storyHash;
+        itemSetFragment.followReadingStory(storyHash);
     }
 
     private void handleReadingActivityResult(ActivityResult result) {
+
         if (result.getData() != null) {
-            int lastReadingPosition = result.getData().getIntExtra(Reading.LAST_READING_POS, -1);
-            if (lastReadingPosition > 1) {
-                Log.d(this.getClass().getName(), "Scrolling to last reading position " + lastReadingPosition);
-                itemSetFragment.scrollToPosition(lastReadingPosition);
+            readerToolbarHidden = result.getData().getBooleanExtra(Reading.EXTRA_TOOLBAR_HIDDEN, readerToolbarHidden);
+            String lastReadingStoryHash = result.getData().getStringExtra(Reading.LAST_READING_STORY_HASH);
+            if (lastReadingStoryHash != null) {
+                Log.d(this.getClass().getName(), "Checking returned story position for " + lastReadingStoryHash);
+                itemSetFragment.scrollToStoryHashIfOffScreen(lastReadingStoryHash);
             }
+        }
+        if (slidesOverFeedDrawer()) {
+            // ItemsList.java returns to browsing after an article closes. A replacement reader
+            // or a feed already opening must not be displaced by this result callback.
+            binding.getRoot().postDelayed(() -> {
+                if (!isFinishing() && !isDestroyed() && !prefsRepo.isStoryListFullscreenEnabled()
+                        && Reading.peekReader(getTaskId()) == null && FeedListDrawer.peek(getTaskId()) == null) {
+                    FeedListDrawer.open(this, null, false);
+                }
+            }, FeedListDrawer.SLIDE_DURATION_MS);
         }
     }
 
     @Override
     public void finish() {
+        predictiveBackInProgress = false;
+        cancelPendingFetchingBanner();
+        cancelStoryStatusBannerAnimation();
         super.finish();
-        PendingTransitionUtils.overrideExitTransition(this);
+        if (suppressNextExitTransition) {
+            PendingTransitionUtils.overrideNoExitTransition(this);
+        } else {
+            PendingTransitionUtils.overrideExitTransition(this);
+        }
+        suppressNextExitTransition = false;
     }
 
-    abstract String getSaveSearchFeedId();
+    private void scheduleInitialFetchingBanner() {
+        awaitingInitialFetchingBanner = true;
+        fetchingBannerDelayElapsed = false;
+        cancelPendingFetchingBanner();
+        hideStoryStatusBanner(false);
+        binding.itemlistStoryStatusBanner.postDelayed(showFetchingBannerRunnable, STORY_STATUS_FETCH_DELAY_MS);
+    }
+
+    private void cancelPendingFetchingBanner() {
+        if (binding != null) {
+            binding.itemlistStoryStatusBanner.removeCallbacks(showFetchingBannerRunnable);
+        }
+    }
+
+    private void showStoryStatusBanner(String title, StoryStatusBannerStyle style) {
+        applyStoryStatusBannerStyle(title, style);
+
+        if (binding.itemlistStoryStatusBanner.getVisibility() == View.VISIBLE) {
+            return;
+        }
+
+        cancelStoryStatusBannerAnimation();
+
+        View banner = binding.itemlistStoryStatusBanner;
+        ViewGroup.LayoutParams layoutParams = banner.getLayoutParams();
+        layoutParams.height = 0;
+        banner.setLayoutParams(layoutParams);
+        banner.setVisibility(View.VISIBLE);
+
+        int expandedHeight = measureStoryStatusBannerHeight();
+        animateStoryStatusBannerHeight(0, expandedHeight, true);
+    }
+
+    private void hideStoryStatusBanner(boolean animated) {
+        View banner = binding.itemlistStoryStatusBanner;
+        if (banner.getVisibility() != View.VISIBLE) {
+            return;
+        }
+
+        cancelStoryStatusBannerAnimation();
+
+        if (!animated) {
+            banner.setVisibility(View.GONE);
+            ViewGroup.LayoutParams layoutParams = banner.getLayoutParams();
+            layoutParams.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+            banner.setLayoutParams(layoutParams);
+            return;
+        }
+
+        int currentHeight = banner.getHeight();
+        if (currentHeight == 0) {
+            currentHeight = measureStoryStatusBannerHeight();
+        }
+        animateStoryStatusBannerHeight(currentHeight, 0, false);
+    }
+
+    private void animateStoryStatusBannerHeight(int startHeight, int endHeight, boolean showing) {
+        ValueAnimator animator = ValueAnimator.ofInt(startHeight, endHeight);
+        animator.setDuration(showing ? STORY_STATUS_SHOW_DURATION_MS : STORY_STATUS_HIDE_DURATION_MS);
+        animator.setInterpolator(showing ? STORY_STATUS_SHOW_INTERPOLATOR : STORY_STATUS_HIDE_INTERPOLATOR);
+        animator.addUpdateListener(valueAnimator -> {
+            ViewGroup.LayoutParams layoutParams = binding.itemlistStoryStatusBanner.getLayoutParams();
+            layoutParams.height = (int) valueAnimator.getAnimatedValue();
+            binding.itemlistStoryStatusBanner.setLayoutParams(layoutParams);
+        });
+        animator.addListener(new AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(Animator animation) {
+                if (storyStatusBannerAnimator != animation) {
+                    return;
+                }
+                ViewGroup.LayoutParams layoutParams = binding.itemlistStoryStatusBanner.getLayoutParams();
+                if (showing) {
+                    layoutParams.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+                    binding.itemlistStoryStatusBanner.setLayoutParams(layoutParams);
+                } else {
+                    binding.itemlistStoryStatusBanner.setVisibility(View.GONE);
+                    layoutParams.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+                    binding.itemlistStoryStatusBanner.setLayoutParams(layoutParams);
+                }
+                storyStatusBannerAnimator = null;
+            }
+
+            @Override
+            public void onAnimationCancel(Animator animation) {
+                if (storyStatusBannerAnimator == animation) {
+                    storyStatusBannerAnimator = null;
+                }
+            }
+        });
+        storyStatusBannerAnimator = animator;
+        animator.start();
+    }
+
+    private void cancelStoryStatusBannerAnimation() {
+        if (storyStatusBannerAnimator != null) {
+            storyStatusBannerAnimator.cancel();
+            storyStatusBannerAnimator = null;
+        }
+        // NbActivity.kt can finish for missing login credentials before ItemsList.java inflates its layout.
+        if (binding != null) {
+            binding.itemlistStoryStatusBanner.animate().cancel();
+        }
+    }
+
+    private void setupOnBackPressed() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackStarted(@NonNull BackEventCompat backEvent) {
+                predictiveBackInProgress = supportsPredictiveStoryListBack()
+                        && isInteractiveStoryListBackEnabled()
+                        && shouldHandlePredictiveBack()
+                        && backEvent.getSwipeEdge() == storyListBackSwipeEdge();
+                if (predictiveBackInProgress) {
+                    beginInteractiveStoryListSwipe();
+                }
+            }
+
+            @Override
+            public void handleOnBackProgressed(@NonNull BackEventCompat backEvent) {
+                if (!predictiveBackInProgress) return;
+                updateInteractiveStoryListSwipe(backEvent.getProgress() * getInteractiveSwipeSurface().getWidth());
+            }
+
+            @Override
+            public void handleOnBackCancelled() {
+                if (!predictiveBackInProgress) return;
+                predictiveBackInProgress = false;
+                cancelInteractiveStoryListSwipe();
+            }
+
+            @Override
+            public void handleOnBackPressed() {
+                predictiveBackInProgress = false;
+                View surface = getInteractiveSwipeSurface();
+                boolean isGestureNavigation = surface.getTranslationX() != 0f;
+                if (interceptBackPress(isGestureNavigation)) {
+                    if (isGestureNavigation) {
+                        cancelInteractiveStoryListSwipe();
+                    }
+                    return;
+                }
+                if (isGestureNavigation) {
+                    completeInteractiveStoryListSwipe();
+                } else {
+                    backToFeedList();
+                }
+            }
+        });
+    }
+
+    // ItemsList.java follows the system back swipe from the start edge, the right edge in Arabic and Hebrew.
+    private int storyListBackSwipeEdge() {
+        return UIUtils.towardEndSign(this) < 0f ? BackEventCompat.EDGE_RIGHT : BackEventCompat.EDGE_LEFT;
+    }
+
+    private void animateInteractiveStoryListSwipe(float targetTranslationX, boolean finishWhenComplete) {
+        View surface = getInteractiveSwipeSurface();
+        surface.animate()
+                .translationX(targetTranslationX)
+                .setDuration(STORY_LIST_SWIPE_SETTLE_DURATION_MS)
+                .setInterpolator(STORY_LIST_SWIPE_INTERPOLATOR)
+                .withEndAction(() -> {
+                    if (finishWhenComplete) {
+                        suppressNextExitTransition = true;
+                        finish();
+                    } else {
+                        resetInteractiveStoryListSwipe(false);
+                    }
+                })
+                .start();
+    }
+
+    private View getInteractiveSwipeSurface() {
+        if (interactiveSwipeSurface == null) {
+            interactiveSwipeSurface = binding.getRoot();
+        }
+        return interactiveSwipeSurface;
+    }
+
+    private boolean isInteractiveStoryListBackEnabled() {
+        // The swipe back draws a full screen feed list snapshot, which doesn't fit a split pane.
+        return binding != null && !isTaskRoot() && !isFinishing() && !StorySplitView.isInSplit(this);
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (interactiveSwipeSurface != null) {
+            interactiveSwipeSurface.animate().cancel();
+        }
+        hideInteractiveSwipeUnderlay();
+        // A finishing activity can already be out of its task, so match by list rather than task id.
+        readingLaunchParents.values().removeIf(parent -> parent.get() == null || parent.get() == this);
+        if (!isChangingConfigurations()) {
+            SessionDataSourceRegistry.remove(sessionDataKey);
+        }
+        super.onDestroy();
+    }
+
+    private boolean supportsPredictiveStoryListBack() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+    }
+
+    private void resetInteractiveStoryListSwipe(boolean cancelAnimation) {
+        View surface = getInteractiveSwipeSurface();
+        if (cancelAnimation) {
+            surface.animate().cancel();
+        }
+        surface.setTranslationX(0f);
+        surface.setTranslationZ(0f);
+        itemSetFragment.setInteractiveStoryListSwipeRendering(false);
+        hideInteractiveSwipeUnderlay();
+    }
+
+    private void prepareInteractiveSwipeUnderlay() {
+        FrameLayout contentFrame = findViewById(android.R.id.content);
+        if (interactiveSwipeUnderlay == null) {
+            interactiveSwipeUnderlay = new ImageView(this);
+            interactiveSwipeUnderlay.setScaleType(ImageView.ScaleType.FIT_XY);
+            interactiveSwipeUnderlay.setVisibility(View.GONE);
+            contentFrame.addView(interactiveSwipeUnderlay, 0, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+            ));
+        }
+
+        // The translucent activity surface can retain stale story-row pixels while translated.
+        // Use a fixed feed-list snapshot as the visual underlay for the interactive back drag.
+        Bitmap snapshot = Main.createVisibleFeedListSnapshot();
+        interactiveSwipeUnderlay.setImageBitmap(snapshot);
+        interactiveSwipeUnderlay.setVisibility(snapshot != null ? View.VISIBLE : View.GONE);
+    }
+
+    private void hideInteractiveSwipeUnderlay() {
+        if (interactiveSwipeUnderlay == null) {
+            return;
+        }
+        interactiveSwipeUnderlay.setVisibility(View.GONE);
+        interactiveSwipeUnderlay.setImageDrawable(null);
+    }
+
+    private int measureStoryStatusBannerHeight() {
+        View banner = binding.itemlistStoryStatusBanner;
+        int width = binding.content.getWidth();
+        if (width <= 0) {
+            width = getResources().getDisplayMetrics().widthPixels;
+        }
+        int widthSpec = View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY);
+        int heightSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+        banner.measure(widthSpec, heightSpec);
+        return banner.getMeasuredHeight();
+    }
+
+    private void applyStoryStatusBannerStyle(String title, StoryStatusBannerStyle style) {
+        binding.itemlistStoryStatusText.setText(title);
+        binding.itemlistStoryStatusSpinner.setVisibility(style == StoryStatusBannerStyle.FETCHING ? View.VISIBLE : View.GONE);
+        binding.itemlistStoryStatusOfflineIcon.setVisibility(style == StoryStatusBannerStyle.OFFLINE ? View.VISIBLE : View.GONE);
+
+        int backgroundAttr = style == StoryStatusBannerStyle.OFFLINE
+                ? R.attr.storyStatusOfflineBackgroundColor
+                : R.attr.storyStatusFetchingBackgroundColor;
+        int textAttr = style == StoryStatusBannerStyle.OFFLINE
+                ? R.attr.storyStatusOfflineTextColor
+                : R.attr.storyStatusFetchingTextColor;
+        int borderAttr = style == StoryStatusBannerStyle.OFFLINE
+                ? R.attr.storyStatusOfflineBorderColor
+                : R.attr.storyStatusFetchingBorderColor;
+
+        int backgroundColor = MaterialColors.getColor(binding.itemlistStoryStatusBanner, backgroundAttr);
+        int textColor = MaterialColors.getColor(binding.itemlistStoryStatusBanner, textAttr);
+        int borderColor = MaterialColors.getColor(binding.itemlistStoryStatusBanner, borderAttr);
+
+        binding.itemlistStoryStatusBanner.setBackgroundColor(backgroundColor);
+        binding.itemlistStoryStatusBannerContent.setBackgroundColor(backgroundColor);
+        binding.itemlistStoryStatusText.setTextColor(textColor);
+        binding.itemlistStoryStatusBorder.setBackgroundColor(borderColor);
+        binding.itemlistStoryStatusOfflineIcon.setImageTintList(ColorStateList.valueOf(textColor));
+        binding.itemlistStoryStatusSpinner.setIndicatorColor(textColor);
+    }
+
+    @Override
+    protected boolean showsListenMiniPlayer() {
+        return true;
+    }
+
+    @Override
+    protected View listenMiniPlayerAnchor() {
+        // ItemsList.java's story toolbar floats at the bottom unless it was moved to the top in Settings.
+        return binding != null && storyToolbarAtBottom ? binding.itemlistStoryHeader : null;
+    }
+
+    @Override
+    protected boolean showsListenMiniPlayerInThisPane() {
+        return !(StorySplitView.isInSplit(this) && Reading.peekSplitReader(getTaskId()) != null);
+    }
+
+    @Override
+    protected void onListenMiniPlayerInsetChanged(int insetPx) {
+        // ItemsList.java pads the story list like Main.java pads the feed list, only while the mini player shows.
+        if (itemSetFragment != null) itemSetFragment.setListenMiniPlayerInset(insetPx);
+    }
+
+    private static class StoryHeaderPalette {
+        final int headerBackgroundColor;
+        final int pillBackgroundColor;
+        final int pillBorderColor;
+        final int pillTextColor;
+        final int selectedBackgroundColor;
+        final int selectedBorderColor;
+        final int selectedTextColor;
+        final int markReadBackgroundColor;
+        final int markReadDividerColor;
+
+        StoryHeaderPalette(
+                int headerBackgroundColor,
+                int pillBackgroundColor,
+                int pillBorderColor,
+                int pillTextColor,
+                int selectedBackgroundColor,
+                int selectedBorderColor,
+                int selectedTextColor,
+                int markReadBackgroundColor,
+                int markReadDividerColor
+        ) {
+            this.headerBackgroundColor = headerBackgroundColor;
+            this.pillBackgroundColor = pillBackgroundColor;
+            this.pillBorderColor = pillBorderColor;
+            this.pillTextColor = pillTextColor;
+            this.selectedBackgroundColor = selectedBackgroundColor;
+            this.selectedBorderColor = selectedBorderColor;
+            this.selectedTextColor = selectedTextColor;
+            this.markReadBackgroundColor = markReadBackgroundColor;
+            this.markReadDividerColor = markReadDividerColor;
+        }
+    }
+
+    String getSaveSearchFeedId() {
+        return kind.saveSearchFeedId();
+    }
 
 }

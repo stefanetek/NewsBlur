@@ -48,6 +48,7 @@ NewsBlur is free to use at [newsblur.com](https://www.newsblur.com) (up to 64 si
 - **YouTube Channels** - Even sites that don't publish RSS feeds can be followed
 - **Third-party Apps** - Supports Reeder, ReadKit, Unread, and many more
 - **IFTTT Integration** - Hook NewsBlur up to nearly every service on the web
+- **MCP Server** - Connect AI agents to your feeds, stories, and classifiers
 - **Native Mobile Apps** - Free iOS, macOS, and Android apps jam-packed with features
 
 ## Technology
@@ -85,6 +86,14 @@ Visit `https://localhost` (type `thisisunsafe` to bypass the self-signed certifi
 - `make lint` - Format code (isort, black, flake8)
 - `make down` - Stop containers
 
+**Bootstrap discover feeds (without fetching):**
+
+```bash
+docker exec -t newsblur_web python manage.py bootstrap_popular_feeds --skip-fetch
+```
+
+This creates `PopularFeed` records from the curated fixtures file without fetching any feed content. You can filter by type with `--type youtube`, `--type reddit`, `--type podcast`, `--type newsletter`, or `--type rss`.
+
 **Database access:**
 - `make mongo` - MongoDB shell
 - `make redis` - Redis CLI
@@ -98,7 +107,7 @@ To customize your NewsBlur installation, create `newsblur_web/local_settings.py`
 
 **Settings for self-hosted installations:**
 
-- `NEWSBLUR_URL` - Your domain (default: `https://localhost`)
+- `NEWSBLUR_URL` - Your domain (default: `https://localhost`). Also used for Archive browser extension OAuth.
 - `SESSION_COOKIE_DOMAIN` - Cookie domain for authentication
 - `AUTO_PREMIUM` - Give new users premium features (default: `True`)
 - `AUTO_ENABLE_NEW_USERS` - Auto-activate new accounts (default: `True`)
@@ -153,6 +162,79 @@ make worktree-close  # Stops containers and removes worktree if no uncommitted c
 ```
 
 All worktrees share the same database services (PostgreSQL, MongoDB, Redis, Elasticsearch), so you can test multiple features without duplicating data.
+
+## MCP Server & CLI
+
+NewsBlur includes an [MCP server](https://modelcontextprotocol.io) that lets AI agents (Claude Desktop, Claude Code, Cursor, or any MCP-compatible client) interact with your feeds, stories, and classifiers. Premium subscription required.
+
+### Connect
+
+**Claude Code:**
+```bash
+claude mcp add --transport http newsblur https://newsblur.com/mcp/
+```
+
+**Codex:** Add to `~/.codex/config.toml`:
+```toml
+[mcp_servers.newsblur]
+url = "https://newsblur.com/mcp"
+```
+
+On first use, a browser window opens for you to log in to NewsBlur and authorize access.
+
+### What you can do
+
+**Read your feeds** - Get unread stories from any feed or folder, search across all subscriptions, retrieve saved stories by tag.
+
+**Take action** - Mark stories as read, save stories with tags and notes, subscribe to new feeds, share stories to your blurblog.
+
+**Train intelligence** - View and update classifiers to like/dislike authors, tags, titles, and feeds. Let an AI agent analyze your reading patterns and suggest training rules.
+
+**Discover** - Find new feeds by topic, see trending feeds, find feeds similar to ones you already follow.
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `newsblur_list_feeds` | All subscribed feeds with folders and unread counts |
+| `newsblur_get_stories` | Load stories from feeds, folders, or all subscriptions |
+| `newsblur_get_saved_stories` | Saved stories filtered by tag |
+| `newsblur_search_stories` | Full-text search across feeds |
+| `newsblur_get_original_text` | Fetch full article from source website |
+| `newsblur_get_feed_info` | Detailed feed metadata and statistics |
+| `newsblur_get_account_info` | User profile and subscription tier |
+| `newsblur_mark_stories_read` | Mark stories read by hash, feed, or folder |
+| `newsblur_save_story` | Save a story with tags, notes, and highlights |
+| `newsblur_unsave_story` | Remove from saved stories |
+| `newsblur_subscribe` | Subscribe to a feed by URL |
+| `newsblur_unsubscribe` | Remove a feed subscription |
+| `newsblur_organize_feed` | Move feeds between folders, rename feeds/folders |
+| `newsblur_share_story` | Share to your blurblog with comments |
+| `newsblur_train_classifier` | Train like/dislike on title, author, tag, or feed |
+| `newsblur_get_classifiers` | View all trained intelligence classifiers |
+| `newsblur_discover_feeds` | Search, similar, or trending feed discovery |
+| `newsblur_manage_notifications` | View/configure per-feed notifications |
+
+### Prompt templates
+
+The MCP server includes prompt templates for common workflows:
+
+- **Daily Briefing** - Summarize today's unread stories by folder
+- **Triage Inbox** - Review and categorize unread stories, save interesting ones
+- **Research Topic** - Search feeds and saved stories on a topic
+- **Train from Reading** - Analyze reading patterns and suggest classifier rules
+- **Feed Health Check** - Audit subscriptions for dead or unused feeds
+- **Discover New Feeds** - Find feeds based on interests
+
+### Self-hosted MCP server
+
+If you self-host NewsBlur, the MCP server runs as a separate container on port 8099:
+
+```bash
+docker compose up newsblur_mcp
+```
+
+Point your MCP client to `https://your-newsblur-domain/mcp/`.
 
 ## Contributing
 

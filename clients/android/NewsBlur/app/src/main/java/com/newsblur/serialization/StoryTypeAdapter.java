@@ -8,6 +8,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonParseException;
 
 import com.newsblur.NbApplication;
+import com.newsblur.domain.Comment;
 import com.newsblur.domain.Story;
 import com.newsblur.network.APIConstants;
 import com.newsblur.util.StoryUtil;
@@ -40,10 +41,25 @@ public class StoryTypeAdapter implements JsonDeserializer<Story> {
     @Override
     public Story deserialize(JsonElement jsonElement, Type type, JsonDeserializationContext jsonDeserializationContext) throws JsonParseException {
         Story story = gson.fromJson(jsonElement, Story.class);
+        if (story.content == null) story.content = "";
+        if (story.title == null) story.title = "";
+        if (story.sharedUserIds == null) story.sharedUserIds = new String[]{};
+        if (story.friendUserIds == null) story.friendUserIds = new String[]{};
+        if (story.tags == null) story.tags = new String[]{};
+        if (story.userTags == null) story.userTags = new String[]{};
+        if (story.publicComments == null) story.publicComments = new Comment[]{};
+        if (story.friendsComments == null) story.friendsComments = new Comment[]{};
+        if (story.friendsShares == null) story.friendsShares = new Comment[]{};
+        if (story.imageUrls == null) story.imageUrls = new String[]{};
+        if (story.clusterStories == null) story.clusterStories = new Story.ClusterStory[]{};
 
         // Convert story_timestamp to milliseconds
         story.timestamp = story.timestamp * 1000;
         story.starredTimestamp = story.starredTimestamp * 1000;
+        for (Story.ClusterStory clusterStory : story.clusterStories) {
+            if (clusterStory == null) continue;
+            clusterStory.timestamp = clusterStory.timestamp * 1000;
+        }
 
         // due to android.os.TransactionTooLargeException and
         // android.database.sqlite.SQLiteBlobTooBigException

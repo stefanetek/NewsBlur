@@ -23,7 +23,6 @@ UIActionSheetDelegate, WKNavigationDelegate> {
     BOOL inTextView;
     BOOL inDoubleTap;
     BOOL hasScrolled;
-    NSURL *activeLongPressUrl;
     CGSize preRotateSize;
     CGFloat scrollPct;
     
@@ -42,6 +41,16 @@ UIActionSheetDelegate, WKNavigationDelegate> {
 @property (nonatomic, assign) BOOL inTextView;
 @property (nonatomic, assign) BOOL isRecentlyUnread;
 @property (nonatomic) BOOL hasStory;
+@property (nonatomic, readonly) BOOL readyForPresentation;
+- (void)prepareCurrentStoryForPresentation;
+- (void)finishStoryPresentation;
+- (void)beginStoryPresentationFade;
+- (void)cancelStoryPresentationFade;
+- (void)cancelStoryPresentationFadePreservingStory;
+- (void)receiveStoryReadyMessage:(WKScriptMessage *)message;
+- (BOOL)isCurrentStoryImageLoad:(NSString *)loadID;
+- (BOOL)canOpenStoryImageForAccessibility:(BOOL)accessibility NS_SWIFT_NAME(canOpenStoryImage(accessibility:));
+@property (nonatomic) BOOL lastDragDirectionDown;
 @property (nonatomic,  readonly) BOOL isSinglePage;
 
 @property NSInteger pageIndex;
@@ -52,7 +61,12 @@ UIActionSheetDelegate, WKNavigationDelegate> {
 - (void)drawStory;
 - (void)drawStory:(BOOL)force withOrientation:(UIInterfaceOrientation)orientation;
 - (void)updateStoryTheme;
+- (void)updateStoryDirection;
 - (void)drawFeedGradient;
+- (void)updateFeedTitleGradientPosition;
+- (void)updateContentInsetForNavigationBarAlpha:(CGFloat)alpha;
+- (void)updateContentInsetForNavigationBarAlpha:(CGFloat)alpha maintainVisualPosition:(BOOL)maintainVisualPosition;
+- (void)updateContentInsetForNavigationBarAlpha:(CGFloat)alpha maintainVisualPosition:(BOOL)maintainVisualPosition force:(BOOL)force;
 - (void)showStory;
 - (void)clearStory;
 - (void)hideStory;

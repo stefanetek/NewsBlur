@@ -46,6 +46,16 @@ class LastSeenMiddleware(object):
 
             request.user.profile.last_seen_on = datetime.datetime.utcnow()
             request.user.profile.last_seen_ip = ip[-15:]
+            # middleware.py records the same activity used by the existing monthly-active user metric.
+            from utils.languages import normalize_language
+
+            language = normalize_language(getattr(request, "LANGUAGE_CODE", None))
+            has_language_context = (
+                getattr(request, "language_preference", "auto") != "auto"
+                or request.META.get("HTTP_ACCEPT_LANGUAGE", "").strip()
+            )
+            if language and language != "auto" and has_language_context:
+                request.user.profile.last_read_language = language
             request.user.profile.save()
 
         return response
@@ -149,14 +159,23 @@ class SQLLogToConsoleMiddleware:
             hasattr(request, "activated_segments") and "db_profiler" in request.activated_segments
         )
 
+    def process_request(self, request):
+        # Turns on recording of this request's Mongo and Redis commands onto connection.queriesx
+        # (utils/mongo_command_monitor.py recording_queries); process_response reads them and turns
+        # recording off again, so unprofiled requests don't keep a list that only grows.
+        if self.activated(request):
+            connection.queriesx = []
+
     def process_response(self, request, response):
         if not self.activated(request):
             return response
+        # Take what was recorded and turn recording off whatever happens below, so a profiled request
+        # or task that ran no SQL doesn't leave it on for every later one on this thread.
+        recorded = getattr(connection, "queriesx", None) or []
+        connection.queriesx = None
         if connection.queries:
             queries = connection.queries
-            if getattr(connection, "queriesx", False):
-                queries.extend(connection.queriesx)
-                connection.queriesx = []
+            queries.extend(recorded)
             time_elapsed = sum([float(q["time"]) for q in connection.queries])
             for query in queries:
                 sql_time = float(query["time"])
@@ -201,25 +220,38 @@ class SQLLogToConsoleMiddleware:
                         )
                     )
                 )
+            sql_queries = [
+                q
+                for q in queries
+                if not q.get("mongo")
+                and not q.get("redis_user")
+                and not q.get("redis_story")
+                and not q.get("redis_session")
+                and not q.get("redis_pubsub")
+            ]
+            mongo_queries = [q for q in queries if q.get("mongo")]
+            redis_user_queries = [q for q in queries if q.get("redis_user")]
+            redis_story_queries = [q for q in queries if q.get("redis_story")]
+            redis_session_queries = [q for q in queries if q.get("redis_session")]
+            redis_pubsub_queries = [q for q in queries if q.get("redis_pubsub")]
             times_elapsed = {
-                "sql": sum(
-                    [
-                        float(q["time"])
-                        for q in queries
-                        if not q.get("mongo")
-                        and not q.get("redis_user")
-                        and not q.get("redis_story")
-                        and not q.get("redis_session")
-                        and not q.get("redis_pubsub")
-                    ]
-                ),
-                "mongo": sum([float(q["time"]) for q in queries if q.get("mongo")]),
-                "redis_user": sum([float(q["time"]) for q in queries if q.get("redis_user")]),
-                "redis_story": sum([float(q["time"]) for q in queries if q.get("redis_story")]),
-                "redis_session": sum([float(q["time"]) for q in queries if q.get("redis_session")]),
-                "redis_pubsub": sum([float(q["time"]) for q in queries if q.get("redis_pubsub")]),
+                "sql": sum(float(q["time"]) for q in sql_queries),
+                "mongo": sum(float(q["time"]) for q in mongo_queries),
+                "redis_user": sum(float(q["time"]) for q in redis_user_queries),
+                "redis_story": sum(float(q["time"]) for q in redis_story_queries),
+                "redis_session": sum(float(q["time"]) for q in redis_session_queries),
+                "redis_pubsub": sum(float(q["time"]) for q in redis_pubsub_queries),
+            }
+            call_counts = {
+                "sql": len(sql_queries),
+                "mongo": len(mongo_queries),
+                "redis_user": len(redis_user_queries),
+                "redis_story": len(redis_story_queries),
+                "redis_session": len(redis_session_queries),
+                "redis_pubsub": len(redis_pubsub_queries),
             }
             setattr(request, "sql_times_elapsed", times_elapsed)
+            setattr(request, "sql_call_counts", call_counts)
         else:
             print(" ***> No queries")
         if not getattr(settings, "ORIGINAL_DEBUG", settings.DEBUG):
@@ -528,6 +560,62 @@ class ServerHostnameMiddleware:
         return response
 
 
+class ServerTimingMiddleware:
+    """Adds Server-Timing header for full request lifecycle visibility.
+
+    Must be first in MIDDLEWARE to capture total time including all middleware.
+    Measures three phases:
+      - haproxy_queue: HAProxy accept to Gunicorn worker pickup (requires X-Request-Start header)
+      - middleware: Gunicorn worker pickup to TimingMiddleware (Session, Auth, etc.)
+      - app: TimingMiddleware to response (view processing + DB queries)
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        request._server_timing_start = time.time()
+        response = self.get_response(request)
+
+        now = time.time()
+        total = now - request._server_timing_start
+        metrics = []
+        metrics.append("total;dur=%.1f" % (total * 1000))
+
+        if hasattr(request, "start_time"):
+            middleware_time = request.start_time - request._server_timing_start
+            app_time = now - request.start_time
+            metrics.append("middleware;dur=%.1f" % (middleware_time * 1000))
+            metrics.append("app;dur=%.1f" % (app_time * 1000))
+
+        haproxy_start = request.META.get("HTTP_X_REQUEST_START")
+        if haproxy_start:
+            try:
+                # HAProxy sends %[date()]%[date_us()] = epoch_seconds + microseconds
+                # e.g. "1711152000123456" where 1711152000 is epoch and 123456 is microseconds
+                raw = haproxy_start.strip()
+                if len(raw) > 10:
+                    epoch_s = int(raw[:10])
+                    us = int(raw[10:])
+                    haproxy_ts = epoch_s + us / 1_000_000.0
+                else:
+                    haproxy_ts = float(raw)
+                queue_time = request._server_timing_start - haproxy_ts
+                if queue_time >= 0:
+                    metrics.append("queue;dur=%.1f" % (queue_time * 1000))
+            except (ValueError, TypeError):
+                pass
+
+        if hasattr(request, "sql_times_elapsed"):
+            times = request.sql_times_elapsed
+            for key in ["sql", "mongo"]:
+                if key in times and times[key] > 0:
+                    metrics.append("%s;dur=%.1f" % (key, times[key] * 1000))
+
+        response["Server-Timing"] = ", ".join(metrics)
+        return response
+
+
 class TimingMiddleware:
     def __init__(self, get_response=None):
         self.get_response = get_response
@@ -568,23 +656,49 @@ class UserAgentBanMiddleware:
             return
         if "push" in request.path:
             return
+        # Public OAuth discovery documents (apps/mcp/views.py). The Python MCP SDK
+        # fetches them without a User-Agent, so banning "missing" here made
+        # server-side MCP clients like Littlebird skip OAuth (forum #13806).
+        if request.path.startswith("/.well-known/"):
+            return
         if getattr(settings, "TEST_DEBUG"):
             return
         if any(ua in user_agent for ua in BANNED_USER_AGENTS):
             data = {"error": "User agent banned: %s" % user_agent, "code": -1}
+            ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+            host = request.META.get("HTTP_HOST", "unknown")
+            full_path = request.get_full_path()  # Includes query string
+            body = ""
+            if request.method == "POST":
+                try:
+                    body = " body=%s" % dict(request.POST)
+                except Exception:
+                    pass
             logging.user(
-                request, "~FB~SN~BBBanned UA: ~SB%s / %s (%s)" % (user_agent, request.path, request.META)
+                request,
+                "~FW~BR~SB BLOCKED ~BT~FR Banned UA: ~SB%s~SN~FR %s %s%s" % (ip, host, full_path, body),
             )
 
             return HttpResponse(json.encode(data), status=403, content_type="text/json")
 
-        if request.user.is_authenticated and any(
-            username == request.user.username for username in BANNED_USERNAMES
+        if (
+            getattr(request, "user", None)
+            and request.user.is_authenticated
+            and any(username == request.user.username for username in BANNED_USERNAMES)
         ):
             data = {"error": "User banned: %s" % request.user.username, "code": -1}
+            ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+            full_path = request.get_full_path()
+            body = ""
+            if request.method == "POST":
+                try:
+                    body = " body=%s" % dict(request.POST)
+                except Exception:
+                    pass
             logging.user(
                 request,
-                "~FB~SN~BBBanned Username: ~SB%s / %s (%s)" % (request.user, request.path, request.META),
+                "~FW~BR~SB BLOCKED ~BT~FR Banned User: ~SB%s~SN~FR %s %s%s"
+                % (request.user.username, ip, full_path, body),
             )
 
             return HttpResponse(json.encode(data), status=403, content_type="text/json")
@@ -599,3 +713,213 @@ class UserAgentBanMiddleware:
             response = self.process_response(request, response)
 
         return response
+
+
+class AttackBanMiddleware:
+    """
+    Detect malicious payloads (JNDI/Log4Shell, XSS, SQLi, path traversal, null bytes)
+    in query strings, POST bodies, and URL paths. Auto-bans offending IPs for 24 hours.
+
+    Banned IPs are checked first (fast Redis GET) before payload inspection.
+    Placed after AuthenticationMiddleware so request.user is available for logging.
+
+    See utils/ip_rate_tracker.py AttackDetector for pattern details.
+    """
+
+    # Paths to skip: health checks, and endpoints that receive third-party
+    # content by design (HTML in emails, RSS/Atom feed entries). Content on
+    # these paths is sanitized downstream by the Scrubber, not here.
+    SKIP_PATHS = ("/haproxy", "/dbcheck", "/newsletters/", "/push/")
+
+    # IPs to never ban: localhost and CGNAT range (100.64.0.0/10) used by
+    # internal proxies. Banning shared infrastructure IPs blocks many users.
+    SKIP_IP_PREFIXES = ("127.", "100.64.")
+
+    def __init__(self, get_response=None):
+        self.get_response = get_response
+        self._detector = None
+
+    @property
+    def detector(self):
+        if self._detector is None:
+            from utils.ip_rate_tracker import AttackDetector
+
+            self._detector = AttackDetector()
+        return self._detector
+
+    def __call__(self, request):
+        # Skip health check paths and test mode (Redis mocks leak into detector)
+        if any(request.path.startswith(p) for p in self.SKIP_PATHS):
+            return self.get_response(request)
+        if getattr(settings, "TEST_DEBUG", False):
+            return self.get_response(request)
+
+        # Skip attack detection for authenticated users — legitimate users
+        # regularly submit content containing code snippets, template syntax,
+        # and HTML that would trigger false positives (e.g. archived web pages).
+        if hasattr(request, "user") and request.user.is_authenticated:
+            return self.get_response(request)
+
+        try:
+            ip = self.detector.get_ip(request)
+
+            # Skip internal/infrastructure IPs that should never be banned
+            if any(ip.startswith(prefix) for prefix in self.SKIP_IP_PREFIXES):
+                return self.get_response(request)
+
+            # Fast path: check if IP is already banned
+            if self.detector.is_banned(ip):
+                from utils.ip_rate_tracker import ATTACK_BANNED_CHECK_TOTAL
+
+                ATTACK_BANNED_CHECK_TOTAL.inc()
+                logging.user(
+                    request,
+                    "~FW~BR~SB BLOCKED ~BT~FR Banned attacker: ~SB%s~SN~FR %s"
+                    % (ip, request.get_full_path()[:200]),
+                )
+                data = {"error": "Forbidden", "code": -1}
+                return HttpResponse(json.encode(data), status=403, content_type="text/json")
+
+            # Inspect request for attack payloads
+            attack_type, payload_sample = self.detector.check_request(request)
+            if attack_type:
+                from utils.ip_rate_tracker import ATTACK_DETECTED_TOTAL
+
+                ATTACK_DETECTED_TOTAL.labels(attack_type=attack_type).inc()
+                self.detector.ban_ip(ip, attack_type, payload_sample, request)
+                logging.user(
+                    request,
+                    "~FW~BR~SB ATTACK ~BT~FR %s from ~SB%s~SN~FR %s payload=%s"
+                    % (attack_type, ip, request.get_full_path()[:200], payload_sample[:100]),
+                )
+                data = {"error": "Forbidden", "code": -1}
+                return HttpResponse(json.encode(data), status=403, content_type="text/json")
+        except Exception as e:
+            logging.debug(" ***> Attack detection error: %s" % e)
+
+        return self.get_response(request)
+
+
+class ScannerTrackingMiddleware:
+    """
+    Fail2ban-style tracking for vulnerability scanners.
+
+    Tracks 404 responses and suspicious paths (.php, wp-*, etc.) per IP.
+    Data is stored in Redis and exposed via Prometheus metrics for Grafana.
+
+    This middleware only tracks; it does not block.
+    See utils/ip_rate_tracker.py ScannerTracker for implementation.
+    """
+
+    def __init__(self, get_response=None):
+        self.get_response = get_response
+        self._tracker = None
+
+    @property
+    def tracker(self):
+        if self._tracker is None:
+            from utils.ip_rate_tracker import ScannerTracker
+
+            self._tracker = ScannerTracker()
+        return self._tracker
+
+    def __call__(self, request):
+        response = self.get_response(request)
+
+        # Track 404 responses
+        if response.status_code == 404:
+            try:
+                self.tracker.track_404(request, request.path)
+            except Exception as e:
+                logging.debug(" ***> Scanner tracking error: %s" % e)
+
+        return response
+
+
+class IPRateTrackingMiddleware:
+    """
+    Track request rates by IP for /reader/* story-fetching endpoints.
+
+    Records IP, user, user agent type, and endpoint for each request.
+    Data is stored in Redis and exposed via Prometheus metrics for Grafana.
+
+    IPs exceeding IP_RATE_LIMIT_THRESHOLD (default 500) requests per 5-min
+    window are blocked with 429. Controlled by IP_RATE_LIMITING_ENABLED in settings.
+    See utils/ip_rate_tracker.py for implementation details.
+    """
+
+    # Map URL prefixes to endpoint shortcodes
+    ENDPOINT_PATTERNS = {
+        "/reader/feeds": "feeds",
+        "/reader/feed/": "feed",
+        "/reader/refresh_feeds": "refresh",
+        "/reader/river_stories": "river",
+        "/reader/starred_stories": "starred",
+        "/reader/read_stories": "read",
+    }
+
+    def __init__(self, get_response=None):
+        self.get_response = get_response
+        self._tracker = None
+
+    @property
+    def tracker(self):
+        """Lazy initialization of IPRateTracker."""
+        if self._tracker is None:
+            from utils.ip_rate_tracker import IPRateTracker
+
+            self._tracker = IPRateTracker()
+        return self._tracker
+
+    def get_endpoint(self, path):
+        """
+        Match request path to endpoint shortcode.
+        Returns None if path doesn't match any tracked endpoints.
+        """
+        for prefix, endpoint in self.ENDPOINT_PATTERNS.items():
+            if path.startswith(prefix):
+                return endpoint
+        return None
+
+    def __call__(self, request):
+        endpoint = self.get_endpoint(request.path)
+
+        if endpoint:
+            try:
+                # Track the request
+                self.tracker.track_request(request, endpoint)
+
+                # Check if rate limit would be exceeded
+                ip = self.tracker.get_ip(request)
+                if self.tracker.is_rate_limited(ip):
+                    full_path = request.get_full_path()
+                    user_info = ""
+                    if hasattr(request, "user") and request.user.is_authenticated:
+                        user_info = " user=%s" % request.user.username
+
+                    # Track this "would be denied" event for soft launch monitoring
+                    self.tracker.track_would_be_denied(request, endpoint)
+
+                    # Log what would have been blocked
+                    logging.user(
+                        request,
+                        "~FY~SB WOULD BLOCK ~SN~FR Rate Limit: ~SB%s~SN~FR %s%s" % (ip, full_path, user_info),
+                    )
+
+                    # SOFT LAUNCH: Only block if explicitly enabled
+                    if getattr(settings, "IP_RATE_LIMITING_ENABLED", False):
+                        logging.user(
+                            request,
+                            "~FW~BR~SB BLOCKED ~BT~FR Rate Limit: ~SB%s~SN~FR %s%s"
+                            % (ip, full_path, user_info),
+                        )
+                        return HttpResponse(
+                            '{"error": "Rate limit exceeded", "code": -1}',
+                            status=429,
+                            content_type="application/json",
+                        )
+            except Exception as e:
+                # Don't let tracking errors break the request
+                logging.debug(" ***> IP rate tracking error: %s" % e)
+
+        return self.get_response(request)

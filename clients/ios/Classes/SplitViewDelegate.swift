@@ -10,40 +10,112 @@ import UIKit
 
 /// Split view delegate.
 class SplitViewDelegate: NSObject, UISplitViewControllerDelegate {
+    private weak var collapsingDetailController: DetailViewController?
+    private var compactRestorationGeneration: UInt?
     
     func splitViewController(_ svc: UISplitViewController, topColumnForCollapsingToProposedTopColumn proposedTopColumn: UISplitViewController.Column) -> UISplitViewController.Column {
-        if UIDevice.current.userInterfaceIdiom == .phone {
-            if let navController = svc.viewController(for: .secondary) as? UINavigationController, let detailController = navController.viewControllers[0] as? DetailViewController, let storyController = detailController.currentStoryController, storyController.hasStory {
-                return .secondary
-            } else {
-                return .primary
-            }
-        } else {
+        guard let detailNavController = svc.viewController(for: .secondary) as? UINavigationController,
+              let detailController = detailNavController.viewControllers[0] as? DetailViewController else {
             return .primary
         }
+
+        let hasFeed = detailController.isFeedShown
+        let hasStory = detailController.hasVisibleStoryForSidebarLayout || detailController.isStoryShown
+        let topColumn = SplitCollapseColumnDecision.topColumn(
+            hasFeed: hasFeed,
+            hasStory: hasStory,
+            proposedTopColumn: splitCollapseTopColumn(for: proposedTopColumn)
+        )
+        
+        collapsingDetailController?.cancelCompactNavigationRestoration()
+        collapsingDetailController = detailController
+        compactRestorationGeneration = detailController.beginCompactNavigationRestoration(showFeed: hasFeed, showStory: hasStory)
+        detailController.collapseToSingleColumn()
+        
+        return uiSplitViewColumn(for: topColumn)
+    }
+
+    func splitViewControllerDidCollapse(_ svc: UISplitViewController) {
+        guard let detail = collapsingDetailController, let generation = compactRestorationGeneration else { return }
+        detail.completeCompactNavigationRestoration(generation: generation, split: svc)
     }
     
     func splitViewController(_ svc: UISplitViewController, displayModeForExpandingToProposedDisplayMode proposedDisplayMode: UISplitViewController.DisplayMode) -> UISplitViewController.DisplayMode {
-        if let supplementaryNav = svc.viewController(for: .supplementary) as? UINavigationController,
-           supplementaryNav.viewControllers.isEmpty,
-           let primaryNav = svc.viewController(for: .primary) as? UINavigationController,
-           let feedsList = primaryNav.viewControllers[0] as? FeedsViewController {
-            if primaryNav.viewControllers.count > 1,
-               let feedDetail = primaryNav.viewControllers[1] as? FeedDetailViewController {
-                supplementaryNav.viewControllers = [feedDetail]
-            } else if let feedDetail = feedsList.appDelegate.feedDetailViewController {
-                supplementaryNav.viewControllers = [feedDetail]
-            }
-        }
-        
-        if UIDevice.current.userInterfaceIdiom == .phone, proposedDisplayMode == .twoOverSecondary {
-            return .oneOverSecondary
-        } else {
+        collapsingDetailController?.cancelCompactNavigationRestoration()
+        collapsingDetailController = nil
+        compactRestorationGeneration = nil
+        guard let detailNavController = svc.viewController(for: .secondary) as? UINavigationController,
+              let detailController = detailNavController.viewControllers[0] as? DetailViewController else {
             return proposedDisplayMode
         }
+        
+        let feeds = detailController.appDelegate.feedsViewController
+        let wasShowingFeeds = feeds != nil && detailController.appDelegate.feedsNavigationController?.topViewController === feeds
+        detailController.expandToTwoColumns()
+        if detailController.isDuoFullscreenReader {
+            return detailController.fullscreenSidebarPresentation == .fullscreen ? .secondaryOnly : .oneOverSecondary
+        }
+
+        if detailController.isPhone, detailController.storyTitlesOnLeft, !detailController.isDiscoverSitesVisible {
+            // SplitViewDelegate.swift preserves the compact source screen before expansion reparents its navigation stack.
+            if wasShowingFeeds {
+                return detailController.behavior == .overlay ? .oneOverSecondary : .oneBesideSecondary
+            }
+            // SplitViewDelegate.swift must not restore a pre-fold three-column proposal while the phone reader is visible.
+            return .secondaryOnly
+        }
+        
+        return proposedDisplayMode
     }
     
     func splitViewController(_ svc: UISplitViewController, willChangeTo displayMode: UISplitViewController.DisplayMode) {
-        
+        switch displayMode {
+            case .automatic:
+                NSLog("split will change to automatic")
+            case .secondaryOnly:
+                NSLog("split will change to secondary only")
+            case .oneBesideSecondary:
+                NSLog("split will change to one beside secondary")
+            case .oneOverSecondary:
+                NSLog("split will change to one over secondary")
+            case .twoBesideSecondary:
+                NSLog("split will change to two beside secondary")
+            case .twoOverSecondary:
+                NSLog("split will change to two over secondary")
+            case .twoDisplaceSecondary:
+                NSLog("split will change to two displace secondary")
+            default:
+                NSLog("split will change to an unexpected mode")
+        }
+
+        // If display mode changed away from secondaryOnly while temporary fullscreen is active,
+        // something external (e.g. Mac sidebar toggle) changed the mode, so exit temporary fullscreen.
+        if let detail = NewsBlurAppDelegate.shared?.detailViewController,
+           detail.isTemporaryFullScreen,
+           displayMode != .secondaryOnly {
+            detail.resetTemporaryFullScreenIfNeeded()
+        }
+
+        NewsBlurAppDelegate.shared?.detailViewController.syncFullscreenSidebarPresentation(for: displayMode)
+        NewsBlurAppDelegate.shared?.feedsViewController.updateSidebarButton(for: displayMode)
+        NewsBlurAppDelegate.shared?.feedDetailViewController.updateSidebarButton(for: displayMode)
+    }
+
+    private func splitCollapseTopColumn(for column: UISplitViewController.Column) -> SplitCollapseTopColumn {
+        switch column {
+        case .secondary:
+            return .secondary
+        default:
+            return .primary
+        }
+    }
+
+    private func uiSplitViewColumn(for column: SplitCollapseTopColumn) -> UISplitViewController.Column {
+        switch column {
+        case .secondary:
+            return .secondary
+        case .primary:
+            return .primary
+        }
     }
 }

@@ -59,8 +59,9 @@
     
     NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle defaultParagraphStyle] mutableCopy];
     paragraphStyle.lineBreakMode = NSLineBreakByTruncatingTail;
-    paragraphStyle.alignment = NSTextAlignmentLeft;
-    [self.title drawInRect:CGRectMake(36.0, titleOffsetY, rect.size.width - 36 - 36, font.pointSize)
+    // FeedChooserTitleView.m mirrors the folder icon and title within the header for a right-to-left interface.
+    paragraphStyle.alignment = self.nb_leadingTextAlignment;
+    [self.title drawInRect:[self nb_directionalRect:CGRectMake(36.0, titleOffsetY, rect.size.width - 36 - 36, font.pointSize) within:rect]
      withAttributes:@{NSFontAttributeName: font,
                       NSForegroundColorAttributeName: textColor,
                       NSParagraphStyleAttributeName: paragraphStyle}];
@@ -69,23 +70,50 @@
     self.invisibleHeaderButton.frame = CGRectMake(0, 0, customView.frame.size.width, customView.frame.size.height);
     self.invisibleHeaderButton.alpha = 0.1;
     self.invisibleHeaderButton.tag = self.section;
-    self.invisibleHeaderButton.accessibilityLabel = [NSString stringWithFormat:@"%@ folder", self.title];
+    self.invisibleHeaderButton.accessibilityLabel = [NSString stringWithFormat:[NBLocalization text:@"%@ folder"], self.title];
     self.invisibleHeaderButton.accessibilityTraits = UIAccessibilityTraitNone;
     [self.invisibleHeaderButton addTarget:self.delegate
                               action:@selector(didSelectTitleView:)
                     forControlEvents:UIControlEventTouchUpInside];
     [customView addSubview:self.invisibleHeaderButton];
     
-    UIImage *folderImage = [UIImage imageNamed:@"folder-open"];
+    UIImage *folderImage = nil;
+    NewsBlurAppDelegate *appDelegate = (NewsBlurAppDelegate *)[[UIApplication sharedApplication] delegate];
+
+    // Check for custom folder icon
+    NSDictionary *customIcon = appDelegate.dictFolderIcons[self.title];
+    if (customIcon && ![customIcon[@"icon_type"] isEqualToString:@"none"]) {
+        folderImage = [CustomIconRenderer renderIcon:customIcon size:CGSizeMake(20, 20)];
+    }
+    if (!folderImage) {
+        folderImage = [UIImage imageNamed:self.imageName];
+    }
+
     CGFloat folderImageViewX = 10.0;
-    
-    if (((NewsBlurAppDelegate *)[[UIApplication sharedApplication] delegate]).isPhone) {
+
+    if (appDelegate.isPhone) {
         folderImageViewX = 7.0;
     }
-    
-    [folderImage drawInRect:CGRectMake(folderImageViewX, 8.0, 20.0, 20.0)];
+
+    [folderImage drawInRect:[self nb_directionalRect:CGRectMake(folderImageViewX, 8.0, 20.0, 20.0) within:rect]];
     
     [self addSubview:customView];
+}
+
+- (NSString *)imageName {
+    if (self.isSelected) {
+        return @"accept";
+    } else if (self.isFlat) {
+        return @"dialog-organize";
+    } else if ([self.title isEqualToString:@"All Shared Stories"]) {
+        return @"all-shares";
+    } else if ([self.title isEqualToString:@"Saved Searches"]) {
+        return @"search";
+    } else if ([self.title isEqualToString:@"Saved Stories"]) {
+        return @"saved-stories";
+    } else {
+        return @"folder-open";
+    }
 }
 
 - (UIFontDescriptor *)fontDescriptor {

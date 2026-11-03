@@ -36,6 +36,7 @@ _.extend(NEWSBLUR.ReaderNotifications.prototype, {
 
         this.$modal.bind('click', $.rescope(this.handle_click, this));
         this.$modal.bind('change', $.rescope(this.handle_change, this));
+        this.load_classifier_notifications();
     },
 
     initialize_feed: function (feed_id) {
@@ -45,7 +46,7 @@ _.extend(NEWSBLUR.ReaderNotifications.prototype, {
         NEWSBLUR.Modal.prototype.initialize_feed.call(this, feed_id);
 
         var $site = $(".NB-modal-section-site", this.$modal);
-        $site.html(this.make_feed_notification(this.feed));
+        $site.html(this.make_site_notification());
 
         var $all = $(".NB-modal-section-all", this.$modal);
         $all.html(this.make_feed_notifications());
@@ -83,30 +84,30 @@ _.extend(NEWSBLUR.ReaderNotifications.prototype, {
             $.make('h2', { className: 'NB-modal-title' }, [
                 $.make('div', { className: 'NB-modal-loading' }),
                 $.make('div', { className: 'NB-icon' }),
-                'Notifications',
+                gettext('Notifications'),
                 $.make('div', { className: 'NB-icon-dropdown' })
             ]),
             $.make('div', { className: 'NB-fieldset NB-modal-submit' }, [
                 $.make('fieldset', [
-                    $.make('legend', 'Notification Preferences'),
+                    $.make('legend', gettext('Notification Preferences')),
                     $.make('div', { className: 'NB-modal-section NB-modal-section-preferences' }, [
                         $.make('div', { className: 'NB-preference NB-preference-notification-title-only' }, [
                             $.make('div', { className: 'NB-preference-options' }, [
                                 $.make('div', [
                                     $.make('input', { id: 'NB-preference-notificationtitleonly-1', type: 'radio', name: 'notification_title_only', value: 0 }),
                                     $.make('label', { 'for': 'NB-preference-notificationtitleonly-1' }, [
-                                        'See the story title and a short content preview'
+                                        gettext('See the story title and a short content preview')
                                     ])
                                 ]),
                                 $.make('div', [
                                     $.make('input', { id: 'NB-preference-notificationtitleonly-2', type: 'radio', name: 'notification_title_only', value: 1 }),
                                     $.make('label', { 'for': 'NB-preference-notificationtitleonly-2' }, [
-                                        'Only see the full story title'
+                                        gettext('Only see the full story title')
                                     ])
                                 ])
                             ]),
                             $.make('div', { className: 'NB-preference-label' }, [
-                                'Story preview',
+                                gettext('Story preview'),
                                 $.make('div', { className: 'NB-preference-sublabel' }, '')
                             ])
                         ])
@@ -115,15 +116,15 @@ _.extend(NEWSBLUR.ReaderNotifications.prototype, {
             ]),
             (this.feed && $.make('div', { className: 'NB-fieldset NB-modal-submit' }, [
                 $.make('fieldset', [
-                    $.make('legend', 'Site Notifications'),
+                    $.make('legend', gettext('Site Notifications')),
                     $.make('div', { className: 'NB-modal-section NB-modal-section-site' }, [
-                        this.make_feed_notification(this.feed)
+                        this.make_site_notification()
                     ])
                 ])
             ])),
             $.make('div', { className: 'NB-fieldset NB-modal-submit' }, [
                 $.make('fieldset', [
-                    $.make('legend', 'All Notifications'),
+                    $.make('legend', gettext('All Notifications')),
                     $.make('div', { className: 'NB-modal-section NB-modal-section-all' }, [
                         this.make_feed_notifications()
                     ])
@@ -147,19 +148,133 @@ _.extend(NEWSBLUR.ReaderNotifications.prototype, {
         return $feed.render().$el;
     },
 
-    make_feed_notifications: function () {
-        var site_feed_id = this.feed && this.feed.id;
-        var notifications = this.model.get_feeds().select(function (feed) {
-            return feed.get('notification_types') && feed.id != site_feed_id;
-        });
-        var $feeds = [];
+    sort_classifiers: function (a, b) {
+        if (a.classifier_type !== b.classifier_type) {
+            return a.classifier_type < b.classifier_type ? -1 : 1;
+        }
+        return a.classifier_value < b.classifier_value ? -1 : (a.classifier_value > b.classifier_value ? 1 : 0);
+    },
 
-        notifications.sort(function (a, b) { return a.get('feed_title') < b.get('feed_title'); });
-        for (var feed in notifications) {
-            $feeds.push(this.make_feed_notification(notifications[feed]));
+    make_feed_notifications: function () {
+        var self = this;
+        var site_feed_id = this.feed && this.feed.id;
+        var classifier_notifs = this.classifier_notifications || {};
+
+        // Group classifier notifications by scope
+        var global_classifiers = [];
+        var folder_classifiers = {};
+        var feed_classifiers = {};
+
+        _.each(classifier_notifs, function (notif) {
+            // Skip feed-scoped classifiers for the site feed (shown in Site section)
+            if (site_feed_id && notif.scope === 'feed' && notif.feed_id == site_feed_id) return;
+
+            if (notif.scope === 'global') {
+                global_classifiers.push(notif);
+            } else if (notif.scope === 'folder') {
+                var folder = notif.folder_name || gettext('Uncategorized');
+                if (!folder_classifiers[folder]) folder_classifiers[folder] = [];
+                folder_classifiers[folder].push(notif);
+            } else {
+                var fid = notif.feed_id;
+                if (!feed_classifiers[fid]) feed_classifiers[fid] = [];
+                feed_classifiers[fid].push(notif);
+            }
+        });
+
+        global_classifiers.sort(this.sort_classifiers);
+        _.each(folder_classifiers, function (notifs) { notifs.sort(self.sort_classifiers); });
+        _.each(feed_classifiers, function (notifs) { notifs.sort(self.sort_classifiers); });
+
+        var $elements = [];
+
+        // Global classifiers at top
+        if (global_classifiers.length) {
+            var $global_rows = _.map(global_classifiers, function (notif) {
+                return self.make_classifier_notification_row(notif);
+            });
+            $elements.push($.make('div', { className: 'NB-notification-scope-section' }, [
+                $.make('div', { className: 'NB-notification-scope-label' }, gettext('Global'))
+            ].concat($global_rows)));
         }
 
-        return $feeds;
+        // Folder classifiers
+        var folder_names = _.keys(folder_classifiers).sort();
+        _.each(folder_names, function (folder_name) {
+            var $folder_rows = _.map(folder_classifiers[folder_name], function (notif) {
+                return self.make_classifier_notification_row(notif);
+            });
+            $elements.push($.make('div', { className: 'NB-notification-scope-section' }, [
+                $.make('div', { className: 'NB-notification-scope-label' }, folder_name)
+            ].concat($folder_rows)));
+        });
+
+        // Feeds with feed-scoped classifiers underneath
+        var feed_notifications = this.model.get_feeds().select(function (feed) {
+            return (feed.get('notification_types') && feed.id != site_feed_id) ||
+                   (feed_classifiers[feed.id] && feed.id != site_feed_id);
+        });
+
+        feed_notifications.sort(function (a, b) { return a.get('feed_title') < b.get('feed_title'); });
+
+        for (var i = 0; i < feed_notifications.length; i++) {
+            var feed = feed_notifications[i];
+            var classifiers = feed_classifiers[feed.id];
+
+            if (classifiers && classifiers.length) {
+                var $children = [this.make_feed_notification(feed)];
+                _.each(classifiers, function (notif) {
+                    $children.push(self.make_classifier_notification_row(notif));
+                });
+                $elements.push($.make('div', { className: 'NB-feed-notification-group' }, $children));
+            } else {
+                $elements.push(this.make_feed_notification(feed));
+            }
+        }
+
+        return $elements;
+    },
+
+    load_classifier_notifications: function () {
+        var self = this;
+        this.model.load_classifier_notifications(function (data) {
+            self.classifier_notifications = (data && data.classifier_notifications) || {};
+            var $all = $(".NB-modal-section-all", self.$modal);
+            $all.html(self.make_feed_notifications());
+            if (self.feed_id && self.feed) {
+                var $site = $(".NB-modal-section-site", self.$modal);
+                $site.html(self.make_site_notification());
+            }
+            self.resize();
+        });
+    },
+
+    make_site_notification: function () {
+        var self = this;
+        var $content = [this.make_feed_notification(this.feed)];
+
+        if (this.classifier_notifications) {
+            var feed_id = this.feed_id;
+            var classifiers = [];
+            _.each(this.classifier_notifications, function (notif) {
+                if (notif.scope === 'feed' && notif.feed_id == feed_id) {
+                    classifiers.push(notif);
+                }
+            });
+            classifiers.sort(self.sort_classifiers);
+            _.each(classifiers, function (notif) {
+                $content.push(self.make_classifier_notification_row(notif));
+            });
+        }
+
+        return $content;
+    },
+
+    make_classifier_notification_row: function (notif) {
+        var view = new NEWSBLUR.Views.ClassifierNotificationView({
+            notification: notif
+        });
+        return view.render().$el;
     },
 
     // ===========
@@ -193,14 +308,14 @@ _.extend(NEWSBLUR.ReaderNotifications.prototype, {
             e.preventDefault();
 
             self.close(function () {
-                NEWSBLUR.reader.open_feedchooser_modal({ premium_only: true });
+                NEWSBLUR.reader.open_premium_upgrade_modal({ highlight_feature: 'notifications' });
             });
         });
     },
 
     animate_saved: function () {
         var $status = $('.NB-exception-option-view .NB-exception-option-status', this.$modal);
-        $status.text('Saved').animate({
+        $status.text(gettext('Saved')).animate({
             'opacity': 1
         }, {
             'queue': false,

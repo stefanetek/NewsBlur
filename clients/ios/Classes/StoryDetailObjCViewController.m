@@ -30,8 +30,54 @@
 @interface StoryDetailObjCViewController ()
 
 @property (nonatomic, strong) NSString *fullStoryHTML;
+@property (nonatomic, strong) NSString *fallbackStoryHeaderHTML;
+@property (nonatomic) NSUInteger storyLoadGeneration;
+@property (nonatomic) NSUInteger readyStoryLoadGeneration;
+@property (nonatomic) NSUInteger storyScrollActivityGeneration;
+@property (nonatomic) NSUInteger scrollToTopGeneration;
+@property (nonatomic, copy) NSString *storyLoadHash;
+@property (nonatomic, strong) WKNavigation *storyNavigation;
+@property (nonatomic) BOOL restoredStoryScrollPosition;
+@property (nonatomic) BOOL awaitingStoryScrollRestoration;
+@property (nonatomic) BOOL preparedWebViewFonts;
+@property (nonatomic, readwrite) BOOL readyForPresentation;
+@property (nonatomic) BOOL preparingStoryPresentation;
+@property (nonatomic) BOOL fadesPreparedStory;
+@property (nonatomic) NSUInteger presentationLayoutGeneration;
+@property (nonatomic) BOOL checkingPresentationLayout;
+@property (nonatomic) BOOL failedWebViewFontPreparation;
+@property (nonatomic, strong) WKNavigation *fontWarmupNavigation;
+@property (nonatomic, strong) WKNavigation *measuredFontWarmupNavigation;
+@property (nonatomic) CFTimeInterval fontWarmupStarted;
+@property (nonatomic) NSUInteger fontPreparationWaitGeneration;
+@property (nonatomic, strong) NSString *lastWidthClassKey;
+@property (nonatomic) BOOL appliesDuoFullscreenFeedTitleInset;
+@property (nonatomic) BOOL isUpdatingContentInset;
+@property (nonatomic) BOOL isUserScrolling;
+@property (nonatomic) BOOL hasScrolledAwayFromTop;
+@property (nonatomic) BOOL hasLiveScrollFraction;
+@property (nonatomic, weak) UIScrollView *readerIndicatorScrollView;
+@property (nonatomic) BOOL readerIndicatorWasAutomatic;
+@property (nonatomic) UIEdgeInsets readerIndicatorPreviousInsets;
+@property (nonatomic) UIEdgeInsets readerIndicatorAppliedInsets;
+@property (nonatomic) UIEdgeInsets readerIndicatorPreviousHorizontalInsets;
+@property (nonatomic) UIEdgeInsets readerIndicatorAppliedHorizontalInsets;
+@property (nonatomic) BOOL suppressStoryImageTap;
 
 - (NSString *)embedResourcesInCSS:(NSString *)css bundle:(NSBundle *)bundle;
+- (NSInteger)storyContentWidth;
+- (BOOL)openDailyBriefingStoryForURL:(NSURL *)url;
+- (NSString *)clusterStoriesHTML;
+- (NSString *)dataURLForImage:(UIImage *)image mimeType:(NSString *)mimeType;
+- (BOOL)isClusterMarkReadEnabled;
+- (BOOL)isClusterStoryRead:(NSDictionary *)clusterStory;
+- (NSString *)clusterSentimentHTMLForScore:(NSInteger)score;
+- (NSString *)clusterTierBadgeHTMLForStory:(NSDictionary *)clusterStory;
+- (void)refreshClusterStories;
+- (void)invalidateStoryLoad;
+- (BOOL)isCurrentStoryLoad:(NSUInteger)generation;
+- (NSTimeInterval)fontPreparationTimeout;
+- (void)updateReaderScrollIndicatorInsets:(BOOL)independentHeader;
 
 @end
 
@@ -84,7 +130,10 @@
 
     configuration.allowsInlineMediaPlayback = ![videoPlayback isEqualToString:@"fullscreen"];
 
-    self.webView = [[WKWebView alloc] initWithFrame:self.view.frame configuration:configuration];
+    self.webView = [[WKWebView alloc] initWithFrame:self.view.bounds configuration:configuration];
+    self.preparedWebViewFonts = NO;
+    self.failedWebViewFontPreparation = NO;
+    self.webView.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x000000);
 
     [self.view addSubview:self.webView];
 
@@ -92,16 +141,17 @@
     self.webView.navigationDelegate = self;
     self.webView.allowsLinkPreview = YES;
     
+    [self.webView.scrollView setDirectionalLockEnabled:YES];
     [self.webView.scrollView setAlwaysBounceVertical:appDelegate.storyPagesViewController.isHorizontal];
     [self.webView.scrollView setDelaysContentTouches:NO];
     [self.webView.scrollView setDecelerationRate:UIScrollViewDecelerationRateNormal];
     [self.webView.scrollView setAutoresizingMask:(UIViewAutoresizingFlexibleWidth |
                                                      UIViewAutoresizingFlexibleHeight)];
     
-    if (!self.isPhone) {
-        self.webView.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
-    }
-    
+    self.webView.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    // Content inset is set dynamically in updateContentInsetForNavigationBarAlpha:
+    self.webView.scrollView.delegate = self;
+
     [self.webView.scrollView addObserver:self forKeyPath:@"contentOffset"
                                  options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld
                                  context:nil];
@@ -121,6 +171,8 @@
     tapGesture.numberOfTapsRequired = 1;
     tapGesture.delegate = self;
     [tapGesture requireGestureRecognizerToFail:doubleTapGesture];
+    // StoryDetailObjCViewController.m lets article scrolling win over a short image tap.
+    [tapGesture requireGestureRecognizerToFail:self.webView.scrollView.panGestureRecognizer];
     [self.webView addGestureRecognizer:tapGesture];
     
     UITapGestureRecognizer *doubleDoubleTapGesture = [[UITapGestureRecognizer alloc]
@@ -131,30 +183,26 @@
     doubleDoubleTapGesture.delegate = self;
     [self.webView addGestureRecognizer:doubleDoubleTapGesture];
     
-    UILongPressGestureRecognizer *longPressGesture = [[UILongPressGestureRecognizer alloc]
-                                                      initWithTarget:self
-                                                      action:@selector(longPress:)];
-    longPressGesture.numberOfTouchesRequired = 1;
-    longPressGesture.delegate = self;
-    [self.webView addGestureRecognizer:longPressGesture];
-    
-    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPhone) {
-        UIPinchGestureRecognizer *pinchGesture = [[UIPinchGestureRecognizer alloc]
-                                                  initWithTarget:self action:@selector(pinchGesture:)];
-        [self.webView addGestureRecognizer:pinchGesture];
-    }
+    UIPinchGestureRecognizer *pinchGesture = [[UIPinchGestureRecognizer alloc]
+                                              initWithTarget:self action:@selector(pinchGesture:)];
+    [self.webView addGestureRecognizer:pinchGesture];
     
     [[ThemeManager themeManager] addThemeGestureRecognizerToView:self.webView];
     
     self.pageIndex = -2;
     self.inTextView = NO;
     
-    _orientation = self.view.window.windowScene.interfaceOrientation;
+    _orientation = (self.view.window ?: self.webView.window).windowScene.interfaceOrientation;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
 //    NSLog(@"%@: taps: %@, state: %@", gestureRecognizer.class, @(touch.tapCount), @(gestureRecognizer.state));
     inDoubleTap = (touch.tapCount == 2);
+    if ([gestureRecognizer isKindOfClass:UITapGestureRecognizer.class] &&
+        ((UITapGestureRecognizer *)gestureRecognizer).numberOfTapsRequired == 1) {
+        // StoryDetailObjCViewController.m remembers momentum before this touch can stop it.
+        self.suppressStoryImageTap = self.webView.scrollView.isDragging || self.webView.scrollView.isDecelerating;
+    }
     
     CGPoint pt = [self pointForGesture:gestureRecognizer];
     if (pt.x == CGPointZero.x && pt.y == CGPointZero.y) return YES;
@@ -174,34 +222,58 @@
     return YES;
 }
 
+- (BOOL)canOpenStoryImageForAccessibility:(BOOL)accessibility {
+    UIScrollView *scrollView = self.webView.scrollView;
+    return !scrollView.isDragging && !scrollView.isDecelerating &&
+        (accessibility || (!self.suppressStoryImageTap && !inDoubleTap));
+}
+
 - (void)tap:(UITapGestureRecognizer *)gestureRecognizer {
 //    NSLog(@"Gesture tap: %ld (%ld) - %d", (long)gestureRecognizer.state, (long)UIGestureRecognizerStateEnded, inDoubleTap);
-    
+    [[ReadTimeTracker shared] recordActivity];
+
     if (gestureRecognizer.state == UIGestureRecognizerStateEnded && gestureRecognizer.numberOfTouches == 1 && self.presentedViewController == nil) {
+        if (![self canOpenStoryImageForAccessibility:NO]) return;
         CGPoint pt = [self pointForGesture:gestureRecognizer];
         if (pt.x == CGPointZero.x && pt.y == CGPointZero.y) return;
         if (inDoubleTap) return;
-//        NSLog(@"Tapped point: %@", NSStringFromCGPoint(pt));
-        [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'tagName');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *tagName, NSError *error) {
-            // Special case to handle the story title, Train, Save, and Share buttons.
-            if ([self isTag:tagName equalTo:@"DIV"]) {
-                [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'id');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *identifier, NSError *error) {
-                    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'outerHTML');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *outerHTML, NSError *error) {
-                        if ([identifier isEqualToString:@"NB-story"] || ![outerHTML containsString:@"NB-"]) {
-                            [self.appDelegate.storyPagesViewController tappedStory];
-                        }
-                    }];
-                }];
-                
+        // storyDetailView.js opens article images without triggering the reader's chrome gesture.
+        CGPoint offset = self.webView.scrollView.contentOffset;
+        [self.webView evaluateJavaScript:[NSString stringWithFormat:@"newsblurOpenImageAt(%f, %f, %f, %f, %f)",
+                                         pt.x, pt.y, offset.x, offset.y, self.webView.bounds.size.width] completionHandler:^(id openedImage, NSError *error) {
+            if ([openedImage isKindOfClass:NSNumber.class] && [openedImage boolValue]) return;
+            if (![self isKindOfClass:StoryDetailViewController.class]) {
+                [self continueTapAtPoint:pt];
                 return;
             }
-            
-            // Ignore links, videos, and iframes (e.g. embedded YouTube videos).
-            if (![@[@"A", @"VIDEO", @"IFRAME"] containsObject:tagName]) {
-                [self.appDelegate.storyPagesViewController tappedStory];
-            }
+            // Listen/ListenStoryBridge.swift jumps playback to a tapped paragraph of the story being read aloud.
+            [(StoryDetailViewController *)self listenHandleTapAt:pt completion:^(BOOL handled) {
+                if (!handled) [self continueTapAtPoint:pt];
+            }];
         }];
     }
+}
+
+- (void)continueTapAtPoint:(CGPoint)pt {
+    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'tagName');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *tagName, NSError *error) {
+        // Special case to handle the story title, Train, Save, and Share buttons.
+        if ([self isTag:tagName equalTo:@"DIV"]) {
+            [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'id');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *identifier, NSError *error) {
+                [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'outerHTML');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *outerHTML, NSError *error) {
+                    if ([identifier isEqualToString:@"NB-story"] || ![outerHTML containsString:@"NB-"]) {
+                        [self.appDelegate.storyPagesViewController tappedStory];
+                    }
+                }];
+            }];
+
+            return;
+        }
+
+        // Ignore links, videos, and iframes (e.g. embedded YouTube videos).
+        if (![@[@"A", @"IMG", @"VIDEO", @"IFRAME"] containsObject:tagName]) {
+            [self.appDelegate.storyPagesViewController tappedStory];
+        }
+    }];
 }
 
 - (void)doubleTap:(UITapGestureRecognizer *)gestureRecognizer {
@@ -252,22 +324,8 @@
     }
 }
 
-- (void)longPress:(UILongPressGestureRecognizer *)gestureRecognizer {
-    if (gestureRecognizer.state == UIGestureRecognizerStateBegan) {
-        CGPoint pt = [self pointForGesture:gestureRecognizer];
-        if (pt.x == CGPointZero.x && pt.y == CGPointZero.y) return;
-        if (inDoubleTap) return;
-        
-        [webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'tagName');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *tagName, NSError *error) {
-            if ([self isTag:tagName equalTo:@"IMG"]) {
-                [self showImageMenu:pt];
-            }
-        }];
-    }
-}
-
 - (void)pinchGesture:(UIPinchGestureRecognizer *)gestureRecognizer {
-    if (gestureRecognizer.state != UIGestureRecognizerStateEnded) {
+    if ([[UIDevice currentDevice] userInterfaceIdiom] != UIUserInterfaceIdiomPhone || gestureRecognizer.state != UIGestureRecognizerStateEnded) {
         return;
     }
     
@@ -286,11 +344,28 @@
 }
 
 - (void)deferredEnableScrolling {
-    self.webView.scrollView.scrollEnabled = self.appDelegate.detailViewController.isPhone || !self.appDelegate.detailViewController.storyTitlesInGrid;
+    StoryPagesViewController *pages = self.appDelegate.storyPagesViewController;
+    BOOL horizontalPaging = pages.isHorizontal && pages.isDraggingScrollview;
+    // StoryDetailObjCViewController.m keeps asynchronous article loading and double-tap callbacks from interrupting a page swipe.
+    self.webView.scrollView.scrollEnabled = !horizontalPaging &&
+        (self.appDelegate.detailViewController.isPhoneOrCompact || !self.appDelegate.detailViewController.storyTitlesInGridView);
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
     [super viewDidDisappear:animated];
+
+    StoryPagesViewController *pages = appDelegate.storyPagesViewController;
+    // StoryDetailObjCViewController.m retains only the captured article while UIKit temporarily removes the compact stack.
+    if (self.parentViewController == pages && pages.currentPage == self && self.hasStory &&
+        [appDelegate.detailViewController preservesArticleDuringSplitCollapse:self]) return;
+    BOOL isOwnedActiveArticle = self.parentViewController == pages && pages.currentPage == self &&
+        self.hasStory && [self.activeStoryId isEqualToString:appDelegate.activeStory[@"story_hash"]];
+    BOOL isVisibleCompactReader = pages.parentViewController == appDelegate.feedsNavigationController &&
+        appDelegate.feedsNavigationController.topViewController == pages;
+    BOOL isOwnedExpandedReader = pages.parentViewController == appDelegate.detailViewController &&
+        !appDelegate.detailViewController.isCompact;
+    // StoryDetailObjCViewController.m can receive a departing split column's disappearance after its reader has moved.
+    if (isOwnedActiveArticle && (isVisibleCompactReader || isOwnedExpandedReader)) return;
     
     if (!appDelegate.showingSafariViewController &&
         appDelegate.feedsNavigationController.visibleViewController != (UIViewController *)appDelegate.shareViewController &&
@@ -306,27 +381,49 @@
         [appDelegate.feedDetailViewController.view endEditing:YES];
     }
     [self storeScrollPosition:NO];
-    
-    self.fullStoryHTML = nil;
+
+    // StoryDetailObjCViewController.m keeps a visible document alive while Safari or sharing covers it.
+    if (!self.hasStory || self.webView.hidden) {
+        [self invalidateStoryLoad];
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    
+
 #if TARGET_OS_MACCATALYST
     [self.navigationController setNavigationBarHidden:YES animated:animated];
     [self.navigationController setToolbarHidden:YES animated:animated];
 #endif
-    
+
     if (!self.isPhoneOrCompact) {
         [appDelegate.feedDetailViewController.view endEditing:YES];
     }
 
-    if (_orientation != self.view.window.windowScene.interfaceOrientation) {
-        _orientation = self.view.window.windowScene.interfaceOrientation;
+    UINavigationController *navController = appDelegate.storyPagesViewController.navigationController ?: self.navigationController;
+    if (navController.interactivePopGestureRecognizer) {
+        [self.webView.scrollView.panGestureRecognizer requireGestureRecognizerToFail:navController.interactivePopGestureRecognizer];
+    }
+
+    // Set initial content inset based on nav bar visibility
+    [self updateContentInsetForNavigationBarAlpha:appDelegate.storyPagesViewController.navigationBarFadeAlpha];
+
+    // When custom toolbar is hidden, scroll up to fill the toolbar gap
+    StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+    if (pagesVC.isCustomToolbarActive) {
+        CGFloat toolbarOffset = pagesVC.toolbarScrollHandler.toolbarOffset;
+        if (toolbarOffset > 0 && !self.restoredStoryScrollPosition && !self.hasScrolledAwayFromTop) {
+            UIScrollView *sv = self.webView.scrollView;
+            CGFloat topRest = -sv.contentInset.top;
+            sv.contentOffset = CGPointMake(sv.contentOffset.x, topRest + toolbarOffset);
+        }
+    }
+
+    if (_orientation != (self.view.window ?: self.webView.window).windowScene.interfaceOrientation) {
+        _orientation = (self.view.window ?: self.webView.window).windowScene.interfaceOrientation;
         NSLog(@"Found stale orientation in story detail: %@", NSStringFromCGSize(self.view.bounds.size));
     }
-    
+
     if (!self.hasStory) {
         [self drawStory];
     }
@@ -347,23 +444,37 @@
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
 
-    scrollPct = self.webView.scrollView.contentOffset.y / self.webView.scrollView.contentSize.height;
-//    NSLog(@"Current scroll is %2.2f%% (offset %.0f - height %.0f)", scrollPct*100, self.webView.scrollView.contentOffset.y,
-//          self.webView.scrollView.contentSize.height);
+    BOOL preserveLivePosition = hasScrolled && !self.awaitingStoryScrollRestoration &&
+        !self.preparingStoryPresentation && self.hasStory && self.webView.scrollView.contentSize.height > 0 &&
+        !CGSizeEqualToSize(self.view.bounds.size, size);
+    if (preserveLivePosition) {
+        // StoryDetailObjCViewController.m captures current progress only for a real resize, never an overlay's return.
+        scrollPct = MAX(0, self.webView.scrollView.contentOffset.y) / self.webView.scrollView.contentSize.height;
+        self.hasLiveScrollFraction = YES;
+    }
+    NSUInteger generation = self.storyLoadGeneration;
+    NSUInteger scrollActivity = self.storyScrollActivityGeneration;
+    WKWebView *resizingWebView = self.webView;
 
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
-        self->_orientation = self.view.window.windowScene.interfaceOrientation;
+        self->_orientation = (self.view.window ?: self.webView.window).windowScene.interfaceOrientation;
         [self changeWebViewWidth];
         [self drawFeedGradient];
-        [self scrollToLastPosition:NO];
+        if (preserveLivePosition && [self isCurrentStoryLoad:generation] && self.webView == resizingWebView &&
+            self.storyScrollActivityGeneration == scrollActivity && !resizingWebView.scrollView.isTracking &&
+            !resizingWebView.scrollView.isDragging && !resizingWebView.scrollView.isDecelerating) {
+            self->hasScrolled = NO;
+            [self scrollToLastPosition:NO];
+        }
     } completion:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
     }];
 }
 
 - (void)viewWillLayoutSubviews {
-    UIInterfaceOrientation orientation = self.view.window.windowScene.interfaceOrientation;
+    UIInterfaceOrientation orientation = (self.view.window ?: self.webView.window).windowScene.interfaceOrientation;
     [super viewWillLayoutSubviews];
     dispatch_async(dispatch_get_main_queue(), ^{
+        if ([self.appDelegate.storyPagesViewController hasHiddenReaderAncestor]) return;
         [self.appDelegate.storyPagesViewController layoutForInterfaceOrientation:orientation];
         [self changeWebViewWidth];
         [self drawFeedGradient];
@@ -382,7 +493,8 @@
 }
 
 - (BOOL)isPhoneOrCompact {
-    return [[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPhone || self.appDelegate.isCompactWidth;
+    if (self.appDelegate.detailViewController) return self.appDelegate.detailViewController.isPhoneOrCompact;
+    return self.isPhone || self.appDelegate.isCompactWidth;
 }
 
 // allow keyboard commands
@@ -402,6 +514,14 @@
 }
 
 - (void)loadHTMLString:(NSString *)html {
+    // StoryDetailViewController.swift keeps document readiness separate from URL navigation.
+    WKUserContentController *contentController = self.webView.configuration.userContentController;
+    [contentController removeScriptMessageHandlerForName:@"newsblurStoryReady"];
+    [contentController addScriptMessageHandler:[[StoryReadyMessageHandler alloc] initWithPage:self]
+                                         name:@"newsblurStoryReady"];
+    [contentController removeScriptMessageHandlerForName:@"newsblurStoryImage"];
+    [contentController addScriptMessageHandler:[[StoryReadyMessageHandler alloc] initWithPage:self]
+                                         name:@"newsblurStoryImage"];
     // Use HTTPS baseURL so YouTube embeds get a valid Referer header (fixes Error 153).
     // CSS/JS are inlined directly in the HTML to avoid custom scheme issues.
     static NSURL *baseURL;
@@ -410,15 +530,210 @@
         baseURL = [NSURL URLWithString:@"https://newsblur.com/"];
     });
 
-    [self.webView loadHTMLString:html baseURL:baseURL];
+    self.storyNavigation = [self.webView loadHTMLString:html baseURL:baseURL];
+}
+
+- (void)invalidateStoryLoad {
+    self.storyLoadGeneration++;
+    self.readyForPresentation = NO;
+    self.presentationLayoutGeneration++;
+    self.checkingPresentationLayout = NO;
+    self.fullStoryHTML = nil;
+    self.fallbackStoryHeaderHTML = nil;
+    self.storyLoadHash = nil;
+    self.storyNavigation = nil;
+    self.awaitingStoryScrollRestoration = NO;
+    self.scrollToTopGeneration = 0;
+    if (self.webView.hidden) self.hasStory = NO;
+}
+
+- (BOOL)isCurrentStoryLoad:(NSUInteger)generation {
+    NSString *storyHash = self.activeStory[@"story_hash"];
+    return generation == self.storyLoadGeneration &&
+        ((self.storyLoadHash == nil && storyHash == nil) || [self.storyLoadHash isEqualToString:storyHash]);
 }
 
 - (void)hideNoStoryMessage {
     self.noStoryMessage.hidden = YES;
 }
 
+- (NSString *)dataURLForImage:(UIImage *)image mimeType:(NSString *)mimeType {
+    if (!image || !mimeType.length) {
+        return nil;
+    }
+
+    NSData *data = [mimeType isEqualToString:@"image/jpeg"] ? UIImageJPEGRepresentation(image, 0.82) : UIImagePNGRepresentation(image);
+    if (!data.length) {
+        return nil;
+    }
+
+    NSString *base64 = [data base64EncodedStringWithOptions:0];
+    return [NSString stringWithFormat:@"data:%@;base64,%@", mimeType, base64];
+}
+
+- (BOOL)isClusterMarkReadEnabled {
+    return appDelegate.isPremiumArchive &&
+        [StoryClusterDisplayDecision isClusterMarkReadEnabledWithUserProfile:appDelegate.dictUserProfile];
+}
+
+- (BOOL)isClusterStoryRead:(NSDictionary *)clusterStory {
+    BOOL isClusterRead = [clusterStory[@"read_status"] boolValue];
+    BOOL isParentRead = self.activeStory ? ![appDelegate.storiesCollection isStoryUnread:self.activeStory] : NO;
+
+    return [StoryClusterDisplayDecision effectiveClusterReadStatusWithIsClusterRead:isClusterRead
+                                                                         parentRead:isParentRead
+                                                             clusterMarkReadEnabled:[self isClusterMarkReadEnabled]
+                                                                   isPremiumArchive:appDelegate.isPremiumArchive];
+}
+
+- (NSString *)clusterSentimentHTMLForScore:(NSInteger)score {
+    UIImage *indicatorImage = [UIImage imageNamed:[StoryClusterDisplayDecision indicatorImageNameForScore:score]];
+    NSString *indicatorDataURL = [self dataURLForImage:indicatorImage mimeType:@"image/png"];
+    if (!indicatorDataURL.length) {
+        return @"";
+    }
+
+    NSString *sizeClass = score == 0 ? @" NB-cluster-sentiment-unread" : @"";
+    return [NSString stringWithFormat:@"<img class=\"NB-cluster-sentiment%@\" src=\"%@\" />",
+            sizeClass,
+            indicatorDataURL];
+}
+
+- (NSString *)clusterTierBadgeHTMLForStory:(NSDictionary *)clusterStory {
+    NSString *tierLabel = [StoryClusterDisplayDecision clusterTierLabelForValue:clusterStory[@"cluster_tier"]];
+    if (!tierLabel.length) {
+        return @"";
+    }
+
+    return [NSString stringWithFormat:@"<span class=\"NB-cluster-tier-badge\">%@</span>",
+            [tierLabel stringByEncodingHTMLEntities]];
+}
+
+- (NSString *)clusterStoriesHTML {
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"story_clustering"]) {
+        return @"";
+    }
+
+    NSArray<NSDictionary *> *clusterStories = [self.activeStory[@"cluster_stories"] isKindOfClass:[NSArray class]] ? self.activeStory[@"cluster_stories"] : nil;
+    if (!clusterStories.count) {
+        return @"";
+    }
+
+    NSArray<NSDictionary *> *allClusterStories = [StoryClusterDisplayDecision visibleClusterStories:clusterStories
+                                                                                   subscribedFeedIds:[appDelegate subscribedFeedIdsForStoryClusters]
+                                                                                    isPremiumArchive:YES];
+    if (!allClusterStories.count) {
+        return @"";
+    }
+
+    NSArray<NSDictionary *> *visibleClusterStories = [StoryClusterDisplayDecision visibleClusterStories:clusterStories
+                                                                                       subscribedFeedIds:[appDelegate subscribedFeedIdsForStoryClusters]
+                                                                                        isPremiumArchive:appDelegate.isPremiumArchive];
+    NSInteger hiddenCount = allClusterStories.count - visibleClusterStories.count;
+
+    // StoryDetailObjCViewController.m words the cluster counts with the interface language's plural rules.
+    NSString *premiumArchiveLabel = [[NBLocalization text:@"Premium Archive"] stringByEncodingHTMLEntities];
+    NSMutableString *clusterHTML = [NSMutableString string];
+    [clusterHTML appendFormat:@"<div class=\"NB-story-cluster-detail\">"
+     "<div class=\"NB-story-cluster-detail-header\">"
+     "<span class=\"NB-story-cluster-detail-title\">%@</span>",
+     [[NBLocalization plural:@"Also published by %@ sites" groupedCount:allClusterStories.count] stringByEncodingHTMLEntities]];
+
+    if (!appDelegate.isPremiumArchive && hiddenCount == 0) {
+        [clusterHTML appendFormat:@"<a href=\"http://ios.newsblur.com/premium-archive\" class=\"NB-clustering-detail-upgrade-pill\">%@</a>", premiumArchiveLabel];
+    }
+
+    [clusterHTML appendString:@"</div>"];
+
+    for (NSDictionary *clusterStory in visibleClusterStories) {
+        NSString *feedId = [NSString stringWithFormat:@"%@", clusterStory[@"story_feed_id"] ?: @""];
+        NSString *storyHash = [NSString stringWithFormat:@"%@", clusterStory[@"story_hash"] ?: @""];
+        NSString *storyTitle = [clusterStory[@"story_title"] isKindOfClass:[NSString class]] ?
+            [[clusterStory[@"story_title"] stringByDecodingHTMLEntities] stringByEncodingHTMLEntities] : @"";
+        NSString *encodedTitle = [clusterStory[@"story_title"] isKindOfClass:[NSString class]] ?
+            [[clusterStory[@"story_title"] stringByDecodingHTMLEntities] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] : @"";
+        NSDictionary *feed = [appDelegate feedMetadataForStory:clusterStory preferActiveFeeds:NO];
+        NSString *borderOuter = [feed[@"favicon_color"] isKindOfClass:[NSString class]] ? feed[@"favicon_color"] : @"505050";
+        NSString *borderInner = [feed[@"favicon_fade"] isKindOfClass:[NSString class]] ? feed[@"favicon_fade"] : @"707070";
+        NSInteger score = [clusterStory[@"score"] respondsToSelector:@selector(integerValue)] ? [clusterStory[@"score"] integerValue] : 0;
+        NSString *scoreClass = score > 0 ? @"NB-story-positive" : (score < 0 ? @"NB-story-negative" : @"NB-story-neutral");
+        NSString *readClass = [self isClusterStoryRead:clusterStory] ? @" read" : @"";
+        NSString *tierClass = [NSString stringWithFormat:@" NB-cluster-tier-%@",
+                               [StoryClusterDisplayDecision normalizedClusterTierValue:clusterStory[@"cluster_tier"]]];
+        NSString *tierBadgeHTML = [self clusterTierBadgeHTMLForStory:clusterStory];
+        NSString *dateText = [Utilities formatClusterDateFromTimestamp:[clusterStory[@"story_timestamp"] integerValue]];
+        NSString *sentimentHTML = [self clusterSentimentHTMLForScore:score];
+
+        NSString *faviconDataURL = nil;
+        UIImage *favicon = [Utilities roundCorneredImage:[appDelegate getFavicon:feedId] radius:4 convertToSize:CGSizeMake(16, 16)];
+        if (favicon) {
+            faviconDataURL = [self dataURLForImage:favicon mimeType:@"image/png"];
+        }
+
+        NSString *imageHTML = @"";
+        UIImage *cachedStoryImage = [appDelegate cachedImageForStoryHash:storyHash];
+        NSString *clusterImageURL = nil;
+        if (cachedStoryImage && ![cachedStoryImage isKindOfClass:[NSNull class]]) {
+            clusterImageURL = [self dataURLForImage:cachedStoryImage mimeType:@"image/jpeg"];
+        } else {
+            NSArray *imageURLs = [clusterStory[@"image_urls"] isKindOfClass:[NSArray class]] ? clusterStory[@"image_urls"] : nil;
+            NSString *firstImageURL = imageURLs.firstObject;
+            if ([firstImageURL hasPrefix:@"http://"]) {
+                NSString *secureURL = [clusterStory[@"secure_image_thumbnails"] isKindOfClass:[NSDictionary class]] ? clusterStory[@"secure_image_thumbnails"][firstImageURL] : nil;
+                if ([secureURL isKindOfClass:[NSString class]] && secureURL.length) {
+                    firstImageURL = secureURL;
+                }
+            }
+            clusterImageURL = [[firstImageURL ?: @"" stringByReplacingOccurrencesOfString:@"'" withString:@"%27"] stringByEncodingHTMLEntities];
+        }
+
+        if (clusterImageURL.length) {
+            imageHTML = [NSString stringWithFormat:@"<span class=\"NB-cluster-detail-image\" style=\"background-image:url('%@');\"></span>", clusterImageURL];
+        }
+
+        [clusterHTML appendFormat:@"<a href=\"http://ios.newsblur.com/open-cluster-story?feed_id=%@&story_hash=%@&story_title=%@\" class=\"NB-story-cluster-detail-item %@%@%@\">"
+         "<span class=\"NB-cluster-feed-border-outer\" style=\"background-color:#%@;\"></span>"
+         "<span class=\"NB-cluster-feed-border-inner\" style=\"background-color:#%@;\"></span>"
+         "%@"
+         "%@"
+         "<span class=\"NB-cluster-detail-title-text\"%@>%@</span>"
+         "%@"
+         "%@"
+         "<span class=\"NB-cluster-detail-date\">%@</span>"
+         "</a>",
+         [feedId stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"",
+         [storyHash stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"",
+         encodedTitle ?: @"",
+         scoreClass,
+         readClass,
+         tierClass,
+         borderOuter,
+         borderInner,
+         sentimentHTML,
+         faviconDataURL.length ? [NSString stringWithFormat:@"<img class=\"NB-cluster-detail-favicon\" src=\"%@\" />", faviconDataURL] : @"<span class=\"NB-cluster-detail-favicon NB-cluster-detail-favicon-empty\"></span>",
+         [self contentDirectionAttribute],
+         storyTitle,
+         tierBadgeHTML,
+         imageHTML,
+         [dateText stringByEncodingHTMLEntities]];
+    }
+
+    if (!appDelegate.isPremiumArchive && hiddenCount > 0) {
+        [clusterHTML appendFormat:@"<a href=\"http://ios.newsblur.com/premium-archive\" class=\"NB-cluster-locked-upsell\">"
+         "<span class=\"NB-cluster-locked-text\">%@</span>"
+         "<span class=\"NB-clustering-detail-upgrade-pill\">%@</span>"
+         "</a>",
+         [[NBLocalization plural:@"+ %@ more sites" groupedCount:hiddenCount] stringByEncodingHTMLEntities],
+         premiumArchiveLabel];
+    }
+
+    [clusterHTML appendString:@"</div>"];
+
+    return clusterHTML;
+}
+
 - (void)drawStory {
-    UIInterfaceOrientation orientation = self.view.window.windowScene.interfaceOrientation;
+    UIInterfaceOrientation orientation = (self.view.window ?: self.webView.window).windowScene.interfaceOrientation;
     [self drawStory:NO withOrientation:orientation];
 }
 
@@ -429,11 +744,21 @@
     }
     
     if (self.activeStory == nil) {
+        [self invalidateStoryLoad];
         return;
     }
 
+    if ([appDelegate.storyPagesViewController deferStoryRedrawDuringSelection:(StoryDetailViewController *)self]) return;
+
+    [self invalidateStoryLoad];
+    NSUInteger generation = self.storyLoadGeneration;
+    self.storyLoadHash = [self.activeStory[@"story_hash"] copy];
+    self.restoredStoryScrollPosition = NO;
+    self.lastWidthClassKey = nil;
     scrollPct = 0;
+    self.hasLiveScrollFraction = NO;
     hasScrolled = NO;
+    self.hasScrolledAwayFromTop = NO;
     
     if (appDelegate.storyPagesViewController.currentPage == self) {
         self.appDelegate.feedDetailViewController.storyHeight = 200;
@@ -441,6 +766,7 @@
     
     NSString *shareBarString = [self getShareBar];
     NSString *commentString = [self getComments];
+    NSString *clusterStoriesString = [self clusterStoriesHTML];
     NSString *headerString;
     NSString *sharingHtmlString;
     NSString *footerString;
@@ -460,8 +786,11 @@
 
     NSUserDefaults *userPreferences = [NSUserDefaults standardUserDefaults];
     
+    // StoryDetailObjCViewController.m translates the whole sentence with its link markup, which localization/manage.py
+    // keeps intact in every language.
     NSString *premiumTextString = [NSString stringWithFormat:@"<div class=\"NB-feed-story-premium-only-divider\"></div>"
-                                   "<div class=\"NB-feed-story-premium-only-text\">The full Text view is a <a href=\"http://ios.newsblur.com/premium\">premium feature</a></div>"];
+                                   "<div class=\"NB-feed-story-premium-only-text\">%@</div>",
+                                   [NBLocalization text:@"The full Text view is a <a href=\"http://ios.newsblur.com/premium\">premium feature</a>"]];
     
     fontStyleClass = [userPreferences stringForKey:@"fontStyle"];
     if (!fontStyleClass) {
@@ -480,10 +809,8 @@
         lineSpacingClass = [lineSpacingClass stringByAppendingString:@"medium"];
     }
     
-    int contentWidth = CGRectGetWidth(self.webView.scrollView.bounds);
+    NSInteger contentWidth = [self storyContentWidth];
     NSString *contentWidthClass;
-//    NSLog(@"Drawing story: %@ / %d", [self.activeStory objectForKey:@"story_title"], contentWidth);
-    
 #if TARGET_OS_MACCATALYST
     // CATALYST: probably will want to add custom CSS for Macs.
     contentWidthClass = @"NB-mac NB-ipad-pro-12-wide";
@@ -511,16 +838,16 @@
     }
 #endif
     
-    contentWidthClass = [NSString stringWithFormat:@"%@ NB-width-%d",
-                         contentWidthClass, (int)floorf(CGRectGetWidth(self.view.frame))];
-    
-    NSLog(@"📚 drawStory: content width class: %@", contentWidthClass);  // log
+    if (appDelegate.storyPagesViewController.usesVerticalReaderToolbar) {
+        contentWidthClass = [contentWidthClass stringByAppendingString:@" NB-vertical-reader-toolbar"];
+    }
+    contentWidthClass = [NSString stringWithFormat:@"%@ NB-width-%ld",
+                         contentWidthClass, (long)contentWidth];
     
     // if (appDelegate.feedsViewController.isOffline) {
         NSFileManager *manager = [NSFileManager defaultManager];
         NSString *storyHash = [self.activeStory objectForKey:@"story_hash"];
         NSArray *imageUrls = [appDelegate.activeCachedImages objectForKey:storyHash];
-        NSLog(@"📚 %@ %@ imageUrls: %@", activeStory[@"story_title"], storyHash, imageUrls);
         if (imageUrls) {
             NSString *storyImagesDirectory = [appDelegate.documentsURL.path
                                               stringByAppendingPathComponent:@"story_images"];
@@ -542,9 +869,7 @@
                 if (imageBase64 != nil) {
                     cachedUrl = [NSURL URLWithString:[NSString stringWithFormat:@"data:image/jpeg;base64,%@", imageBase64]];
                 }
-                
-                NSLog(@"📚 %@ %@ imageURL: %@ cachedURL: %@", activeStory[@"story_title"], storyHash, imageUrl, cachedUrl);
-                
+
                 storyContent = [storyContent
                                 stringByReplacingOccurrencesOfString:imageUrl
                                 withString:cachedUrl.absoluteString];
@@ -554,6 +879,7 @@
                 storyContent = [storyContent
                                 stringByReplacingOccurrencesOfString:escapedURL
                                 withString:cachedUrl.absoluteString];
+                storyContent = [StoryImageOfflineSource annotate:storyContent cachedURL:cachedUrl.absoluteString originalURL:imageUrl];
             }
         }
     // }
@@ -561,7 +887,7 @@
     NSString *feedIdStr = [NSString stringWithFormat:@"%@",
                            [self.activeStory
                             objectForKey:@"story_feed_id"]];
-    NSDictionary *feed = [appDelegate getFeed:feedIdStr];
+    NSDictionary *feed = [appDelegate feedMetadataForStory:self.activeStory preferActiveFeeds:NO];
     NSString *storyClassSuffix = @"";
     
     if ([feed[@"is_newsletter"] isEqualToNumber:[NSNumber numberWithInt:1]]) {
@@ -572,49 +898,46 @@
                             appDelegate.storiesCollection.isSocialView ||
                             appDelegate.storiesCollection.isSavedView ||
                             appDelegate.storiesCollection.isWidgetView ||
-                            appDelegate.storiesCollection.isReadView) ?
+                            appDelegate.storiesCollection.isReadView ||
+                            appDelegate.storiesCollection.isTrending) ?
                             @"NB-river" : @"NB-non-river";
     
     // Inline CSS and JS to avoid custom URL scheme issues with HTTPS baseURL
     // (WKWebView blocks custom schemes as "insecure" when baseURL is HTTPS)
     NSBundle *bundle = [NSBundle mainBundle];
+    StoryDetailAssetCache *assetCache = StoryDetailAssetCache.shared;
 
     // Read and inline CSS, embedding fonts and images as data URLs
-    NSString *mainCSSPath = [bundle pathForResource:@"storyDetailView" ofType:@"css"];
-    NSString *mainCSS = mainCSSPath ? [NSString stringWithContentsOfFile:mainCSSPath encoding:NSUTF8StringEncoding error:nil] : @"";
-    mainCSS = [self embedResourcesInCSS:mainCSS bundle:bundle];
+    NSString *mainCSS = [assetCache embeddedMainCSSWithLoader:^NSString *(NSString *css) {
+        return [self embedResourcesInCSS:css bundle:bundle];
+    }];
 
     NSString *themeSuffix = [ThemeManager themeManager].themeCSSSuffix;
     NSString *themeCSS = @"";
     if (themeSuffix.length) {
-        NSString *themeCSSPath = [bundle pathForResource:[NSString stringWithFormat:@"storyDetailView%@", themeSuffix] ofType:@"css"];
-        themeCSS = themeCSSPath ? [NSString stringWithContentsOfFile:themeCSSPath encoding:NSUTF8StringEncoding error:nil] : @"";
+        themeCSS = [assetCache textForResource:[NSString stringWithFormat:@"storyDetailView%@", themeSuffix] ofType:@"css"];
     }
 
     // Read and inline JS
-    NSString *zeptoPath = [bundle pathForResource:@"zepto" ofType:@"js"];
-    NSString *zeptoJS = zeptoPath ? [NSString stringWithContentsOfFile:zeptoPath encoding:NSUTF8StringEncoding error:nil] : @"";
-
-    NSString *fitvidPath = [bundle pathForResource:@"fitvid" ofType:@"js"];
-    NSString *fitvidJS = fitvidPath ? [NSString stringWithContentsOfFile:fitvidPath encoding:NSUTF8StringEncoding error:nil] : @"";
-
-    NSString *storyDetailPath = [bundle pathForResource:@"storyDetailView" ofType:@"js"];
-    NSString *storyDetailJS = storyDetailPath ? [NSString stringWithContentsOfFile:storyDetailPath encoding:NSUTF8StringEncoding error:nil] : @"";
-
-    NSString *fastTouchPath = [bundle pathForResource:@"fastTouch" ofType:@"js"];
-    NSString *fastTouchJS = fastTouchPath ? [NSString stringWithContentsOfFile:fastTouchPath encoding:NSUTF8StringEncoding error:nil] : @"";
+    NSString *zeptoJS = [assetCache textForResource:@"zepto" ofType:@"js"];
+    NSString *fitvidJS = [assetCache textForResource:@"fitvid" ofType:@"js"];
+    NSString *markJS = [assetCache textForResource:@"mark" ofType:@"js"];
+    NSString *storyDetailJS = [assetCache textForResource:@"storyDetailView" ofType:@"js"];
+    NSString *fastTouchJS = [assetCache textForResource:@"fastTouch" ofType:@"js"];
 
     // set up layout values based on iPad/iPhone
     headerString = [NSString stringWithFormat:@
                     "<style>%@</style><style id=\"NB-theme-style\">%@</style>"
-                    "<meta name=\"viewport\" id=\"viewport\" content=\"width=%d, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no\"/>",
-                    mainCSS, themeCSS, contentWidth];
+                    "<meta name=\"newsblur-story-load\" content=\"%lu\"/>"
+                    "<meta name=\"viewport\" id=\"viewport\" content=\"width=%ld, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no\"/>",
+                    mainCSS, themeCSS, (unsigned long)generation, (long)contentWidth];
     footerString = [NSString stringWithFormat:@
                     "<script>%@</script>"
                     "<script>%@</script>"
                     "<script>%@</script>"
+                    "<script>%@</script>"
                     "<script>%@</script>",
-                    zeptoJS, fitvidJS, storyDetailJS, fastTouchJS];
+                    zeptoJS, fitvidJS, markJS, storyDetailJS, fastTouchJS];
     
     sharingHtmlString = [self getSideOptions];
 
@@ -622,7 +945,7 @@
     
     NSString *htmlTop = [NSString stringWithFormat:@
                             "<!DOCTYPE html>\n"
-                            "<html>"
+                            "<html%@>"
                             "<head>%@</head>" // header string
                             "<body id=\"story_pane\" class=\"%@ %@\">"
                             "    <div class=\"%@\" id=\"NB-premium-check\">"
@@ -631,6 +954,7 @@
                             "    <div class=\"%@\" id=\"NB-line-spacing\">"
                             "        <div id=\"NB-header-container\">%@</div>" // storyHeader
                             "        %@", // shareBar
+                            [self interfaceDirectionAttributes],
                             headerString,
                             contentWidthClass,
                             riverClass,
@@ -654,7 +978,8 @@
     
     NSString *htmlContent = [NSString stringWithFormat:@
                              "%@" // header
-                             "        <div id=\"NB-story\" class=\"NB-story%@\">%@</div>"
+                             "        <div id=\"NB-story\" class=\"NB-story%@\"%@>%@</div>"
+                             "        <div id=\"NB-cluster-stories-container\">%@</div>"
                              "        <div class=\"NB-text-view-premium-only\">%@</div>"
                              "        <div id=\"NB-sideoptions-container\">%@</div>"
                              "        <div id=\"NB-comments-wrapper\">"
@@ -664,7 +989,9 @@
                              "%@", // footer
                              htmlTop,
                              storyClassSuffix,
+                             [self contentDirectionAttribute],
                              storyContent,
+                             clusterStoriesString,
                              premiumTextString,
                              sharingHtmlString,
                              commentString,
@@ -672,29 +999,19 @@
                              htmlBottom
                              ];
     
-    NSString *htmlTopAndBottom = [htmlTop stringByAppendingString:htmlBottom];
-    
     // NSLog(@"\n\n\n\nStory html (%@):\n\n\n%@\n\n\n", self.activeStory[@"story_title"], htmlContent);
     self.hasStory = NO;
     self.fullStoryHTML = htmlContent;
-    
-    NSLog(@"📚 full story for: %@", self.activeStory[@"story_title"]);  // log
+    if (self.fontWarmupNavigation || self.failedWebViewFontPreparation) {
+        self.fallbackStoryHeaderHTML = [htmlTop stringByAppendingString:htmlBottom];
+    }
     
     dispatch_async(dispatch_get_main_queue(), ^{
-//        NSLog(@"Drawing Story: %@", [self.activeStory objectForKey:@"story_title"]);
-        NSLog(@"📚 %@ story: %@", self.hasStory ? @"has" : @"hasn't", self.activeStory[@"story_title"]);  // log
-        
-        if (self.hasStory)
-            return;
-        
-        [self loadHTMLString:htmlTopAndBottom];
-        [self.appDelegate.storyPagesViewController setTextButton:(StoryDetailViewController *)self];
-        
-        NSLog(@"📚 loaded top & bottom for: %@", self.activeStory[@"story_title"]);  // log
-    });
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (![self isCurrentStoryLoad:generation]) return;
+
+        // StoryDetailObjCViewController.m already has the full document; avoid a header navigation and its resource wait.
         [self loadStory];
+        [self.appDelegate.storyPagesViewController setTextButton:(StoryDetailViewController *)self];
     });
     
     self.activeStoryId = [self.activeStory objectForKey:@"story_hash"];
@@ -702,17 +1019,8 @@
 
 - (void)drawFeedGradient {
     BOOL shouldHideStatusBar = appDelegate.storyPagesViewController.shouldHideStatusBar;
-    CGFloat yOffset = -1;
-    NSString *feedIdStr = [NSString stringWithFormat:@"%@",
-                           [self.activeStory
-                            objectForKey:@"story_feed_id"]];
-    NSDictionary *feed = [appDelegate getFeed:feedIdStr];
-    
-    if (appDelegate.storyPagesViewController.view.safeAreaInsets.top > 0.0 && !appDelegate.storyPagesViewController.isNavigationBarHidden) {
-        // Push gradient down below the navigation bar on notched iPhones
-        CGFloat navBarHeight = appDelegate.feedsNavigationController.navigationBar.frame.size.height;
-        yOffset += navBarHeight;
-    }
+    CGFloat yOffset = [self feedTitleGradientBaseYOffset];
+    NSDictionary *feed = [appDelegate feedMetadataForStory:self.activeStory preferActiveFeeds:NO];
     
     if (self.feedTitleGradient) {
         [self.feedTitleGradient removeFromSuperview];
@@ -724,6 +1032,19 @@
                               withRect:CGRectMake(0, yOffset, CGRectGetWidth(self.view.bounds), 25)]; // 1024 hack for self.webView.frame.size.width
     self.feedTitleGradient.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     self.feedTitleGradient.tag = FEED_TITLE_GRADIENT_TAG; // Not attached yet. Remove old gradients, first.
+
+    if (appDelegate.storiesCollection.isRiverView ||
+        appDelegate.storiesCollection.isSocialView ||
+        appDelegate.storiesCollection.isSavedView ||
+        appDelegate.storiesCollection.isWidgetView ||
+        appDelegate.storiesCollection.isReadView ||
+        appDelegate.storiesCollection.isTrending) {
+        self.feedTitleGradient.userInteractionEnabled = YES;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+                                       initWithTarget:self
+                                       action:@selector(openFeedFromGradient:)];
+        [self.feedTitleGradient addGestureRecognizer:tap];
+    }
     
     for (UIView *subview in self.webView.subviews) {
         if (subview.tag == FEED_TITLE_GRADIENT_TAG) {
@@ -735,7 +1056,8 @@
         appDelegate.storiesCollection.isSocialView ||
         appDelegate.storiesCollection.isSavedView ||
         appDelegate.storiesCollection.isWidgetView ||
-        appDelegate.storiesCollection.isReadView) {
+        appDelegate.storiesCollection.isReadView ||
+        appDelegate.storiesCollection.isTrending) {
         self.webView.scrollView.scrollIndicatorInsets = UIEdgeInsetsMake(24, 0, 0, 0);
     } else {
         self.webView.scrollView.scrollIndicatorInsets = UIEdgeInsetsMake(9, 0, 0, 0);
@@ -749,6 +1071,271 @@
             self.feedTitleGradient.alpha = self.appDelegate.storyPagesViewController.isNavigationBarHidden ? 0 : 1;
         }];
     }
+
+    [self updateFeedTitleGradientPosition];
+}
+
+- (void)openFeedFromGradient:(UITapGestureRecognizer *)recognizer {
+    NSString *feedIdStr = [NSString stringWithFormat:@"%@",
+                           [self.activeStory objectForKey:@"story_feed_id"]];
+
+    appDelegate.storiesCollection.isRiverView = NO;
+    appDelegate.storiesCollection.isSocialView = NO;
+    appDelegate.storiesCollection.isSavedView = NO;
+    appDelegate.storiesCollection.isReadView = NO;
+    appDelegate.storiesCollection.isWidgetView = NO;
+
+    if (appDelegate.detailViewController.isPhoneOrCompact) {
+        // Pop back from story pages to feed detail, then load the feed
+        [appDelegate.feedsNavigationController popViewControllerAnimated:NO];
+    }
+
+    [appDelegate loadFolder:nil feedID:feedIdStr];
+}
+
+- (CGFloat)feedTitleGradientBaseYOffset {
+    StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+    if (pagesVC.isCustomToolbarActive) {
+        CGFloat safeAreaTop = self.view.window.safeAreaInsets.top;
+        if (safeAreaTop <= 0) safeAreaTop = self.view.safeAreaInsets.top;
+        return safeAreaTop + StoryToolbar.toolbarHeight;
+    }
+    // With content inset, gradient should be at the top of visible content
+    CGFloat contentInsetTop = self.webView.scrollView.contentInset.top;
+    return contentInsetTop > 0 ? contentInsetTop : -1;
+}
+
+- (void)updateFeedTitleGradientContentLayout {
+    BOOL fullscreen = appDelegate.detailViewController.isDuoFullscreenReader;
+    if (!fullscreen && !self.appliesDuoFullscreenFeedTitleInset) return;
+
+    // StoryDetailObjCViewController.m aligns fullscreen's favicon with storyDetailView.css's 30pt NB-ipad-wide/narrow header padding.
+    CGFloat iconLeading = fullscreen ? 30 : 8;
+    for (UIView *content in self.feedTitleGradient.subviews) {
+        CGRect frame = content.frame;
+        if ([content isKindOfClass:UIImageView.class]) {
+            frame.origin.x = iconLeading;
+        } else if ([content isKindOfClass:UILabel.class]) {
+            frame.origin.x = iconLeading + 24;
+            frame.size.width = MAX(0, CGRectGetWidth(self.feedTitleGradient.bounds) - frame.origin.x);
+        } else {
+            continue;
+        }
+        if (!CGRectEqualToRect(content.frame, frame)) content.frame = frame;
+    }
+    self.appliesDuoFullscreenFeedTitleInset = fullscreen;
+}
+
+- (void)updateFeedTitleGradientPosition {
+    if (!self.feedTitleGradient || self.feedTitleGradient.superview != self.webView) {
+        return;
+    }
+
+    [self updateFeedTitleGradientContentLayout];
+
+    StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+    BOOL pinsFeedHeader = pagesVC.usesVerticalReaderToolbar ||
+        (appDelegate.detailViewController.isPhone && !self.isPhoneOrCompact);
+
+    // StoryDetailObjCViewController.m keeps the pinned article feed header opaque above scrolling article content.
+    self.feedTitleGradient.backgroundColor = pinsFeedHeader ? UIColorFromRGB(NEWSBLUR_WHITE_COLOR) : nil;
+    [self updateReaderScrollIndicatorInsets:pinsFeedHeader];
+
+    if (pinsFeedHeader) {
+        CGFloat scale = self.webView.window.screen.scale ?: UIScreen.mainScreen.scale;
+        CGRect frame = self.feedTitleGradient.frame;
+        // StoryDetailObjCViewController.m follows the page only during a top pull; ordinary reading keeps the feed header pinned.
+        CGFloat top = MAX(self.webView.scrollView.contentInset.top, -self.webView.scrollView.contentOffset.y);
+        frame.origin.y = floor(top * scale) / scale;
+        self.feedTitleGradient.frame = frame;
+        return;
+    }
+
+    // Get current scroll state
+    CGFloat contentInsetTop = self.webView.scrollView.contentInset.top;
+    CGFloat contentOffset = self.webView.scrollView.contentOffset.y;
+    CGFloat scrolledAmount = contentOffset + contentInsetTop;
+
+    CGPoint webViewOriginInWindow = [self.webView convertPoint:CGPointZero toView:nil];
+    BOOL isEdgeToEdge = webViewOriginInWindow.y < 1;
+    CGFloat safeAreaTop = isEdgeToEdge ? self.view.window.safeAreaInsets.top : 0;
+
+    CGFloat targetY;
+
+    if (pagesVC.isCustomToolbarActive) {
+        // Custom toolbar: gradient follows the toolbar's bottom edge
+        CGFloat toolbarHeight = pagesVC.toolbarScrollHandler.toolbarHeight;
+        CGFloat toolbarOffset = pagesVC.toolbarScrollHandler.toolbarOffset;
+        CGFloat toolbarBottom = safeAreaTop + (toolbarHeight - toolbarOffset);
+        targetY = toolbarBottom;
+
+        // If scrolled past the gradient's natural position, let it scroll away
+        CGFloat basePosition = safeAreaTop + toolbarHeight;
+        CGFloat naturalPositionWhenScrolled = basePosition - scrolledAmount;
+        if (naturalPositionWhenScrolled < targetY) {
+            targetY = naturalPositionWhenScrolled;
+        }
+    } else {
+        // Legacy alpha-fade path
+        UINavigationBar *navBar = pagesVC.navigationController.navigationBar;
+        CGFloat navBarAlpha = navBar.alpha;
+        CGFloat navBarBottom = navBar.frame.origin.y + navBar.frame.size.height;
+        CGFloat basePositionInWebView = navBarBottom - webViewOriginInWindow.y;
+
+        targetY = safeAreaTop + (basePositionInWebView - safeAreaTop) * navBarAlpha;
+
+        CGFloat naturalPositionWhenScrolled = basePositionInWebView - scrolledAmount;
+        if (naturalPositionWhenScrolled < targetY) {
+            targetY = naturalPositionWhenScrolled;
+        }
+    }
+
+    // When overscrolling at top (pulling down), feed bar follows content down
+    if (scrolledAmount < 0) {
+        targetY -= scrolledAmount;
+    }
+
+    // Pixel-align and clamp to safe area top
+    CGFloat scale = [UIScreen mainScreen].scale;
+    CGFloat pixelAdjust = 1.0 / scale;
+    CGFloat minY = safeAreaTop - pixelAdjust;
+
+    targetY = MAX(minY, targetY);
+    targetY = floor(targetY * scale) / scale;
+
+    if (fabs(self.feedTitleGradient.frame.origin.y - targetY) > 0.5) {
+        CGRect frame = self.feedTitleGradient.frame;
+        frame.origin.y = targetY;
+        self.feedTitleGradient.frame = frame;
+    }
+}
+
+- (void)updateContentInsetForNavigationBarAlpha:(CGFloat)alpha {
+    // Default to maintaining visual position - the main method handles scroll detection
+    [self updateContentInsetForNavigationBarAlpha:alpha maintainVisualPosition:YES];
+}
+
+- (void)updateReaderScrollIndicatorInsets:(BOOL)independentHeader {
+    UIScrollView *scroll = self.webView.scrollView;
+    UIScrollView *previousScroll = self.readerIndicatorScrollView;
+    if (previousScroll && (!independentHeader || previousScroll != scroll)) {
+        // StoryDetailObjCViewController.m restores only its own manual geometry; a newer legacy layout may already have supplied its insets.
+        if (UIEdgeInsetsEqualToEdgeInsets(previousScroll.verticalScrollIndicatorInsets, self.readerIndicatorAppliedInsets)) {
+            previousScroll.verticalScrollIndicatorInsets = self.readerIndicatorPreviousInsets;
+        }
+        if (UIEdgeInsetsEqualToEdgeInsets(previousScroll.horizontalScrollIndicatorInsets, self.readerIndicatorAppliedHorizontalInsets)) {
+            previousScroll.horizontalScrollIndicatorInsets = self.readerIndicatorPreviousHorizontalInsets;
+        }
+        if (!previousScroll.automaticallyAdjustsScrollIndicatorInsets) {
+            previousScroll.automaticallyAdjustsScrollIndicatorInsets = self.readerIndicatorWasAutomatic;
+        }
+        self.readerIndicatorScrollView = nil;
+    }
+    if (!independentHeader || !scroll) return;
+
+    if (!self.readerIndicatorScrollView) {
+        self.readerIndicatorScrollView = scroll;
+        self.readerIndicatorWasAutomatic = scroll.automaticallyAdjustsScrollIndicatorInsets;
+        self.readerIndicatorPreviousInsets = scroll.verticalScrollIndicatorInsets;
+        self.readerIndicatorPreviousHorizontalInsets = scroll.horizontalScrollIndicatorInsets;
+    }
+
+    // StoryDetailObjCViewController.m uses the pager's window protection for every cached page, excluding the other column's navigation header.
+    StoryPagesViewController *pages = appDelegate.storyPagesViewController;
+    UIView *viewport = pages.scrollView ?: self.webView;
+    UIWindow *window = viewport.window;
+    CGFloat protectedBottom = scroll.safeAreaInsets.bottom;
+    if (window) {
+        CGRect viewportFrame = [viewport convertRect:viewport.bounds toView:window];
+        protectedBottom = MAX(0, CGRectGetMaxY(viewportFrame) - (CGRectGetMaxY(window.bounds) - window.safeAreaInsets.bottom));
+    }
+    // StoryDetailObjCViewController.m leaves the article's bottom clear when the native toolbar occupies the side rail.
+    CGFloat bottomInset = pages.usesVerticalReaderToolbar ? scroll.contentInset.bottom :
+        MAX(scroll.contentInset.bottom, protectedBottom);
+    CGFloat headerInset = MAX(0, CGRectGetHeight(self.feedTitleGradient.bounds) - 1);
+    UIEdgeInsets insets = UIEdgeInsetsMake(MAX(0, scroll.contentInset.top) + headerInset,
+                                          0, bottomInset, 0);
+    UIEdgeInsets horizontalInsets = self.readerIndicatorPreviousHorizontalInsets;
+    horizontalInsets.bottom = pages.usesVerticalReaderToolbar ? bottomInset :
+        MAX(horizontalInsets.bottom, bottomInset);
+    self.readerIndicatorAppliedInsets = insets;
+    self.readerIndicatorAppliedHorizontalInsets = horizontalInsets;
+    if (scroll.automaticallyAdjustsScrollIndicatorInsets) scroll.automaticallyAdjustsScrollIndicatorInsets = NO;
+    if (!UIEdgeInsetsEqualToEdgeInsets(scroll.verticalScrollIndicatorInsets, insets)) {
+        scroll.verticalScrollIndicatorInsets = insets;
+    }
+    if (!UIEdgeInsetsEqualToEdgeInsets(scroll.horizontalScrollIndicatorInsets, horizontalInsets)) {
+        scroll.horizontalScrollIndicatorInsets = horizontalInsets;
+    }
+}
+
+- (void)updateContentInsetForNavigationBarAlpha:(CGFloat)alpha maintainVisualPosition:(BOOL)maintainVisualPosition {
+    [self updateContentInsetForNavigationBarAlpha:alpha maintainVisualPosition:maintainVisualPosition force:NO];
+}
+
+- (void)updateContentInsetForNavigationBarAlpha:(CGFloat)alpha maintainVisualPosition:(BOOL)maintainVisualPosition force:(BOOL)force {
+    if ([appDelegate.storyPagesViewController hasHiddenReaderAncestor]) return;
+    // StoryDetailObjCViewController.m clears a compact reader's old inset when unfolding into regular columns.
+    if (!self.isPhoneOrCompact && !appDelegate.storyPagesViewController.usesVerticalReaderToolbar && fabs(self.webView.scrollView.contentInset.top) < 0.5) {
+        [self updateFeedTitleGradientPosition];
+        return;
+    }
+
+    // Prevent re-entry from KVO notifications when we change contentOffset
+    if (self.isUpdatingContentInset) {
+        return;
+    }
+    self.isUpdatingContentInset = YES;
+
+    StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+
+    // When custom toolbar is active, content insets are fixed (toolbar overlays content)
+    if (pagesVC.isCustomToolbarActive) {
+        UIScrollView *scrollView = self.webView.scrollView;
+        CGFloat topInset = [pagesVC topInsetForNavigationBarAlpha:1.0];
+        UIEdgeInsets currentInset = scrollView.contentInset;
+        if (fabs(currentInset.top - topInset) > 0.5) {
+            UIEdgeInsets newInset = UIEdgeInsetsMake(topInset, 0, currentInset.bottom, 0);
+            scrollView.contentInset = newInset;
+            scrollView.scrollIndicatorInsets = newInset;
+        }
+        [self updateFeedTitleGradientPosition];
+        self.isUpdatingContentInset = NO;
+        return;
+    }
+
+    UIScrollView *scrollView = self.webView.scrollView;
+    BOOL isCurrentPage = self == pagesVC.currentPage;
+
+    // Don't update inset while this page is actively scrolling
+    BOOL isActivelyScrolling = scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating;
+    if (!force && isActivelyScrolling && isCurrentPage) {
+        self.isUpdatingContentInset = NO;
+        return;
+    }
+
+    UIEdgeInsets currentInset = scrollView.contentInset;
+    CGFloat currentOffset = scrollView.contentOffset.y;
+
+    UINavigationBar *navBar = pagesVC.navigationController.navigationBar;
+    CGFloat actualAlpha = navBar.alpha;
+    CGFloat topInset = [pagesVC topInsetForNavigationBarAlpha:actualAlpha];
+
+    if (fabs(currentInset.top - topInset) > 0.5) {
+        UIEdgeInsets newInset = UIEdgeInsetsMake(topInset, 0, currentInset.bottom, 0);
+        self.webView.scrollView.contentInset = newInset;
+        self.webView.scrollView.scrollIndicatorInsets = newInset;
+
+        if (maintainVisualPosition) {
+            CGFloat visualPosition = currentOffset + currentInset.top;
+            CGFloat newOffset = visualPosition - topInset;
+            self.webView.scrollView.contentOffset = CGPointMake(0, newOffset);
+        }
+    }
+
+    [self updateFeedTitleGradientPosition];
+
+    self.isUpdatingContentInset = NO;
 }
 
 - (void)showStory {
@@ -766,6 +1353,8 @@
 }
 
 - (void)hideStory {
+    [self invalidateStoryLoad];
+    self.hasStory = NO;
     self.activeStoryId = nil;
     self.webView.hidden = YES;
     self.noStoryMessage.hidden = NO;
@@ -777,14 +1366,76 @@
 #pragma mark Story layout
 
 - (void)clearWebView {
+    [self invalidateStoryLoad];
     self.hasStory = NO;
+    self.lastWidthClassKey = nil;
 
-    self.view.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x111111);
+    self.view.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x000000);
+    self.webView.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x000000);
     self.webView.hidden = YES;
     self.activityIndicator.color = UIColorFromRGB(NEWSBLUR_BLACK_COLOR);
     [self.activityIndicator startAnimating];
 
-    [self loadHTMLString:@"<html><body></body></html>"];
+    if (!self.preparedWebViewFonts && !self.failedWebViewFontPreparation) {
+        self.fontWarmupStarted = [ReaderPerformance start];
+        [self loadHTMLString:[self fontWarmupHTML]];
+        self.fontWarmupNavigation = self.storyNavigation;
+        self.measuredFontWarmupNavigation = self.fontWarmupStarted > 0 ? self.fontWarmupNavigation : nil;
+    } else {
+        [self loadHTMLString:@"<html><body></body></html>"];
+    }
+}
+
+- (NSString *)fontWarmupHTML {
+    static NSString *html;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSBundle *bundle = NSBundle.mainBundle;
+        NSString *css = [StoryDetailAssetCache.shared embeddedMainCSSWithLoader:^NSString *(NSString *source) {
+            return [self embedResourcesInCSS:source bundle:bundle];
+        }];
+        NSRegularExpression *fontFaces = [NSRegularExpression regularExpressionWithPattern:@"@font-face\\s*\\{[^}]+\\}" options:0 error:nil];
+        NSMutableString *fonts = [NSMutableString string];
+        for (NSTextCheckingResult *match in [fontFaces matchesInString:css ?: @"" options:0 range:NSMakeRange(0, css.length)]) {
+            [fonts appendString:[css substringWithRange:match.range]];
+        }
+        // StoryDetailObjCViewController.m warms the exact local font bytes without requesting an article or its images.
+        html = [NSString stringWithFormat:@"<!DOCTYPE html><html><head><style>%@</style></head><body>"
+                "<span style=\"font-family:ChronicleSSm-Book;font-size:1px\">Aa0</span>"
+                "<span style=\"font-family:GothamNarrow-Book;font-size:1px\">Aa0</span>"
+                "<span style=\"font-family:WhitneySSm-Book;font-size:1px\">Aa0</span>"
+                "</body></html>", fonts];
+    });
+    return html;
+}
+
+- (NSInteger)storyContentWidth {
+    CGFloat width = 0.0;
+    if (self.webView) {
+        width = CGRectGetWidth(self.webView.scrollView.bounds);
+        if (width <= 0.0) {
+            width = CGRectGetWidth(self.webView.bounds);
+        }
+    }
+    if (width <= 0.0) {
+        width = CGRectGetWidth(self.view.bounds);
+    }
+    if (self.webView) {
+        UIEdgeInsets insets = self.webView.scrollView.adjustedContentInset;
+        width -= (insets.left + insets.right);
+    }
+    // On iPhone/compact, the story page always fills the screen width.
+    // Before the view is in the hierarchy, the webView may report its XIB
+    // default size (414pt) which is wrong for narrower devices. Clamp to
+    // the screen width so the viewport meta tag is never too wide.
+    if (self.isPhoneOrCompact) {
+        CGFloat screenWidth = CGRectGetWidth([UIScreen mainScreen].bounds);
+        width = MIN(width, screenWidth);
+    }
+    if (width < 1.0) {
+        width = CGRectGetWidth([UIScreen mainScreen].bounds);
+    }
+    return (NSInteger)floorf(width);
 }
 
 // Convert font and image URLs in CSS to inline base64 data URLs.
@@ -878,6 +1529,26 @@
     return result;
 }
 
+- (NSString *)scoreIconHtml:(int)score {
+    static NSString *thumbsUpBase64 = @"PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHN2ZyB3aWR0aD0iMTUwcHgiIGhlaWdodD0iMTUwcHgiIHZpZXdCb3g9IjAgMCAxNTAgMTUwIiB2ZXJzaW9uPSIxLjEiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiPgogICAgPHRpdGxlPnRodW1icy11cDwvdGl0bGU+CiAgICA8ZyBpZD0idGh1bWJzLXVwIiBzdHJva2U9Im5vbmUiIHN0cm9rZS13aWR0aD0iMSIgZmlsbD0ibm9uZSIgZmlsbC1ydWxlPSJldmVub2RkIj4KICAgICAgICA8ZyBpZD0ibm91bi10aHVtYnMtdXAtMjAwMzU5Mi05NTk3OEUiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDkuNzgyNiwgMTguNDc4MykiIGZpbGw9IiNGRkMwMjEiPgogICAgICAgICAgICA8cGF0aCBkPSJNNDguMDg0NjQ3OCw0MC40NjU3MDMzIEw0OC4wODQ2NDc4LDEwNy42Nzg5NTkgQzUyLjMwNzMwOTEsMTEwLjY1NjE5NiA1NS4wNDMwOTk1LDExMy4wNDM0NzggNjEuMTA5OTk0MSwxMTMuMDQzNDc4IEwxMTAuODI2NDI2LDExMy4wNDM0NzggQzEyMC43MDMzNzMsMTEzLjA0MzQ3OCAxMjcuMzU1Nzk0LDEwNS41NTM3OTkgMTI0Ljc2NDIxLDk3Ljg3MDcwNzQgQzEyOS42MzI2NDcsOTMuMDM3NDExNSAxMzAuODYwMzU5LDg3LjQxMDUwMzcgMTI3Ljg3ODEzNSw4MS42MDgxMTExIEMxMzIuMzgxMTYxLDc1LjUzOTc5NzYgMTMyLjk5Mjg5Nyw2OS4wMzcxNDM3IDEyOC4xMTYwMzIsNjIuOTY4OTE4NSBDMTM1LjQxNDMzNyw1MS43MzI0MTMgMTI4Ljc0NDc1NSwzOC43MjMzOTU4IDExMi41MDQ1MzksMzguNzIzMzk1OCBMOTIuNjQ0MDY3MiwzOC43MjMzOTU4IEM5Mi42NjUzMDc3LDMwLjc5MjEzNDUgOTIuMTQ3MDMzMywxNy44MzQ3ODI1IDg4Ljc3Mzk4MywxMC41MjA0MTE4IEM4MS44NzQ5MTA1LC00LjQ0MTI4MjcyIDYwLjI3NzQzNTUsLTIuNjc0OTUzMTYgNjAuOTUyNzkxNiwxMC45NTUwOTY3IEM2MC4zMzY4MDM4LDIxLjY4NzMxNTEgNTcuMTkzMjAwNiwzMi4zNDc5OTcxIDQ4LjA4NDY0NzgsNDAuNDY1MTY0NiBNMCwzOC45NzgyNjgzIEwwLDExMy4wNDMxMTYgTDQwLjE3NDQ0NDIsMTEzLjA0MzExNiBMNDAuMTc0NDQ0MiwzOC45NzgyNjgzIEwwLDM4Ljk3ODI2ODMgWiIgaWQ9IlNoYXBlIj48L3BhdGg+CiAgICAgICAgPC9nPgogICAgPC9nPgo8L3N2Zz4=";
+    static NSString *thumbsDownBase64 = @"PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHN2ZyB3aWR0aD0iMTUwcHgiIGhlaWdodD0iMTUwcHgiIHZpZXdCb3g9IjAgMCAxNTAgMTUwIiB2ZXJzaW9uPSIxLjEiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiPgogICAgPHRpdGxlPnRodW1icy1kb3duPC90aXRsZT4KICAgIDxnIGlkPSJ0aHVtYnMtZG93biIgc3Ryb2tlPSJub25lIiBzdHJva2Utd2lkdGg9IjEiIGZpbGw9Im5vbmUiIGZpbGwtcnVsZT0iZXZlbm9kZCI+CiAgICAgICAgPGcgaWQ9Im5vdW4tdGh1bWJzLXVwLTIwMDM1OTItOTU5NzhFIiB0cmFuc2Zvcm09InRyYW5zbGF0ZSg3NS41NDM1LCA3NSkgcm90YXRlKC0xODApIHRyYW5zbGF0ZSgtNzUuNTQzNSwgLTc1KXRyYW5zbGF0ZSg5Ljc4MjYsIDE4LjQ3ODMpIiBmaWxsPSIjRkZDMDIxIj4KICAgICAgICAgICAgPHBhdGggZD0iTTQ4LjA4NDY0NzgsNDAuNDY1NzAzMyBMNDguMDg0NjQ3OCwxMDcuNjc4OTU5IEM1Mi4zMDczMDkxLDExMC42NTYxOTYgNTUuMDQzMDk5NSwxMTMuMDQzNDc4IDYxLjEwOTk5NDEsMTEzLjA0MzQ3OCBMMTEwLjgyNjQyNiwxMTMuMDQzNDc4IEMxMjAuNzAzMzczLDExMy4wNDM0NzggMTI3LjM1NTc5NCwxMDUuNTUzNzk5IDEyNC43NjQyMSw5Ny44NzA3MDc0IEMxMjkuNjMyNjQ3LDkzLjAzNzQxMTUgMTMwLjg2MDM1OSw4Ny40MTA1MDM3IDEyNy44NzgxMzUsODEuNjA4MTExMSBDMTMyLjM4MTE2MSw3NS41Mzk3OTc2IDEzMi45OTI4OTcsNjkuMDM3MTQzNyAxMjguMTE2MDMyLDYyLjk2ODkxODUgQzEzNS40MTQzMzcsNTEuNzMyNDEzIDEyOC43NDQ3NTUsMzguNzIzMzk1OCAxMTIuNTA0NTM5LDM4LjcyMzM5NTggTDkyLjY0NDA2NzIsMzguNzIzMzk1OCBDOTIuNjY1MzA3NywzMC43OTIxMzQ1IDkyLjE0NzAzMzMsMTcuODM0NzgyNSA4OC43NzM5ODMsMTAuNTIwNDExOCBDODEuODc0OTEwNSwtNC40NDEyODI3MiA2MC4yNzc0MzU1LC0yLjY3NDk1MzE2IDYwLjk1Mjc5MTYsMTAuOTU1MDk2NyBDNjAuMzM2ODAzOCwyMS42ODczMTUxIDU3LjE5MzIwMDYsMzIuMzQ3OTk3MSA0OC4wODQ2NDc4LDQwLjQ2NTE2NDYgTS0yLjkzMzE1OTUzZS0xNCwzOC45NzgyNjgzIEwtMi45MzMxNTk1M2UtMTQsMTEzLjA0MzExNiBMNDAuMTc0NDQ0MiwxMTMuMDQzMTE2IEw0MC4xNzQ0NDQyLDM4Ljk3ODI2ODMgTC0yLjkzMzE1OTUzZS0xNCwzOC45NzgyNjgzIFoiIGlkPSJTaGFwZSI+PC9wYXRoPgogICAgICAgIDwvZz4KICAgIDwvZz4KPC9zdmc+";
+
+    if (score >= 1) {
+        return [NSString stringWithFormat:@"<img src=\"data:image/svg+xml;base64,%@\" class=\"NB-score-icon NB-score-icon-like\" />",
+                thumbsUpBase64];
+    } else if (score <= -2) {
+        return [NSString stringWithFormat:@"<span class=\"NB-score-icon-double\">"
+                "<img src=\"data:image/svg+xml;base64,%@\" class=\"NB-score-icon NB-score-icon-super-dislike NB-score-icon-super-dislike-back\" />"
+                "<img src=\"data:image/svg+xml;base64,%@\" class=\"NB-score-icon NB-score-icon-super-dislike\" />"
+                "</span>",
+                thumbsDownBase64, thumbsDownBase64];
+    } else if (score <= -1) {
+        return [NSString stringWithFormat:@"<img src=\"data:image/svg+xml;base64,%@\" class=\"NB-score-icon NB-score-icon-dislike\" />",
+                thumbsDownBase64];
+    }
+    return @"";
+}
+
 - (NSString *)getHeader {
     NSString *feedId = [NSString stringWithFormat:@"%@", [self.activeStory
                                                           objectForKey:@"story_feed_id"]];
@@ -892,11 +1563,13 @@
             int authorScore = [[[[appDelegate.storiesCollection.activeClassifiers objectForKey:feedId]
                                  objectForKey:@"authors"]
                                 objectForKey:author] intValue];
+            NSString *authorIcon = [self scoreIconHtml:authorScore];
             storyAuthor = [NSString stringWithFormat:@"<span class=\"NB-middot\">&middot;</span><a href=\"http://ios.newsblur.com/classify-author/%@\" "
-                           "class=\"NB-story-author %@\" id=\"NB-story-author\"><div class=\"NB-highlight\"></div>%@</a>",
+                           "class=\"NB-story-author %@\" id=\"NB-story-author\"><div class=\"NB-highlight\"></div>%@%@</a>",
                            author,
                            authorScore > 0 ? @"NB-story-author-positive" : authorScore < 0 ? @"NB-story-author-negative" : @"",
-                           author];
+                           author,
+                           authorIcon];
         }
     }
     NSString *storyTags = @"";
@@ -908,11 +1581,13 @@
                 int tagScore = [[[[appDelegate.storiesCollection.activeClassifiers objectForKey:feedId]
                                   objectForKey:@"tags"]
                                  objectForKey:tag] intValue];
+                NSString *tagIcon = [self scoreIconHtml:tagScore];
                 NSString *tagHtml = [NSString stringWithFormat:@"<a href=\"http://ios.newsblur.com/classify-tag/%@\" "
-                                     "class=\"NB-story-tag %@\"><div class=\"NB-highlight\"></div>%@</a>",
+                                     "class=\"NB-story-tag %@\"><div class=\"NB-highlight\"></div>%@%@</a>",
                                      tag,
                                      tagScore > 0 ? @"NB-story-tag-positive" : tagScore < 0 ? @"NB-story-tag-negative" : @"",
-                                     tag];
+                                     tag,
+                                     tagIcon];
                 [tagStrings addObject:tagHtml];
             }
             storyTags = [NSString
@@ -926,8 +1601,9 @@
     NSString *storyUserTags = @"";
     NSMutableArray *tagStrings = [NSMutableArray array];
     if ([self.activeStory objectForKey:@"starred"] && [self.activeStory objectForKey:@"starred_date"]) {
-        storyStarred = [NSString stringWithFormat:@"<div class=\"NB-story-starred-date\">Saved on %@</div>",
-                        [self.activeStory objectForKey:@"starred_date"]];
+        storyStarred = [NSString stringWithFormat:@"<div class=\"NB-story-starred-date\">%@</div>",
+                        [[NSString stringWithFormat:[NBLocalization text:@"Saved on %@"],
+                          [self.activeStory objectForKey:@"starred_date"]] stringByEncodingHTMLEntities]];
         
         if ([self.activeStory objectForKey:@"user_tags"]) {
             NSArray *tagArray = [self.activeStory objectForKey:@"user_tags"];
@@ -945,14 +1621,15 @@
         storyUserTags = [NSString
                          stringWithFormat:@"<div id=\"NB-user-tags\" class=\"NB-user-tags\">"
                          "%@"
-                         "<a class=\"NB-user-tag NB-add-user-tag\" href=\"http://ios.newsblur.com/add-user-tag/add-user-tag/\"><div class=\"NB-highlight\"></div>Add Tag</a>"
+                         "<a class=\"NB-user-tag NB-add-user-tag\" href=\"http://ios.newsblur.com/add-user-tag/add-user-tag/\"><div class=\"NB-highlight\"></div>%@</a>"
                          "</div>",
-                         [tagStrings componentsJoinedByString:@""]];
+                         [tagStrings componentsJoinedByString:@""],
+                         [[NBLocalization text:@"Add Tag"] stringByEncodingHTMLEntities]];
 
     }
     
     NSString *storyUnread = @"";
-    if (self.isRecentlyUnread && [appDelegate.storiesCollection isStoryUnread:self.activeStory]) {
+    if ([appDelegate.storiesCollection isStoryUnread:self.activeStory]) {
         NSInteger score = [NewsBlurAppDelegate computeStoryScore:[self.activeStory objectForKey:@"intelligence"]];
         storyUnread = [NSString stringWithFormat:@"<div class=\"NB-story-unread NB-%@\"></div>",
                        score > 0 ? @"positive" : score < 0 ? @"negative" : @"neutral"];
@@ -966,23 +1643,116 @@
     for (NSString *titleClassifier in titleClassifiers) {
         if ([storyTitle containsString:titleClassifier]) {
             int titleScore = [[titleClassifiers objectForKey:titleClassifier] intValue];
+            NSString *titleIcon = [self scoreIconHtml:titleScore];
             storyTitle = [storyTitle
                           stringByReplacingOccurrencesOfString:titleClassifier
-                          withString:[NSString stringWithFormat:@"<span class=\"NB-story-title-%@\">%@</span>",
+                          withString:[NSString stringWithFormat:@"<span class=\"NB-story-title-%@\">%@%@</span>",
                                        titleScore > 0 ? @"positive" : titleScore < 0 ? @"negative" : @"",
-                                       titleClassifier]];
+                                       titleClassifier,
+                                       titleIcon]];
+        }
+    }
+
+    // Title regex classifiers
+    NSDictionary *titleRegexClassifiers = [[appDelegate.storiesCollection.activeClassifiers
+                                            objectForKey:feedId]
+                                           objectForKey:@"title_regex"];
+    for (NSString *pattern in titleRegexClassifiers) {
+        NSError *error = nil;
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:&error];
+        if (!error && regex) {
+            int regexScore = [[titleRegexClassifiers objectForKey:pattern] intValue];
+            NSArray<NSTextCheckingResult *> *matches = [regex matchesInString:storyTitle options:0 range:NSMakeRange(0, storyTitle.length)];
+            NSString *regexIcon = [self scoreIconHtml:regexScore];
+            // Apply replacements in reverse order to preserve indices
+            for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
+                NSString *matchedText = [storyTitle substringWithRange:match.range];
+                NSString *replacement = [NSString stringWithFormat:@"<span class=\"NB-story-title-%@\">%@%@</span>",
+                                         regexScore > 0 ? @"positive" : regexScore < 0 ? @"negative" : @"",
+                                         matchedText,
+                                         regexIcon];
+                storyTitle = [storyTitle stringByReplacingCharactersInRange:match.range withString:replacement];
+            }
         }
     }
     
+    // URL match classifiers
+    NSString *storyUrlMatch = @"";
+    NSDictionary *urlClassifiers = [[appDelegate.storiesCollection.activeClassifiers objectForKey:feedId] objectForKey:@"urls"];
+    NSDictionary *urlRegexClassifiers = [[appDelegate.storiesCollection.activeClassifiers objectForKey:feedId] objectForKey:@"url_regex"];
+    if ((urlClassifiers.count > 0 || urlRegexClassifiers.count > 0) && storyPermalink.length > 0) {
+        NSString *matchedBefore = nil, *matchedText = nil, *matchedAfter = nil;
+        int matchScore = 0;
+        NSInteger maxDisplayLength = 80;
+
+        // Check exact URL matches
+        for (NSString *classifierUrl in urlClassifiers) {
+            NSRange range = [storyPermalink rangeOfString:classifierUrl options:NSCaseInsensitiveSearch];
+            if (range.location != NSNotFound) {
+                matchScore = [[urlClassifiers objectForKey:classifierUrl] intValue];
+                matchedText = [storyPermalink substringWithRange:range];
+                matchedBefore = [storyPermalink substringToIndex:range.location];
+                matchedAfter = [storyPermalink substringFromIndex:NSMaxRange(range)];
+                break;
+            }
+        }
+
+        // Check regex URL matches
+        if (!matchedText) {
+            for (NSString *pattern in urlRegexClassifiers) {
+                NSError *error = nil;
+                NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:&error];
+                if (!error && regex) {
+                    NSTextCheckingResult *result = [regex firstMatchInString:storyPermalink options:0 range:NSMakeRange(0, storyPermalink.length)];
+                    if (result) {
+                        matchScore = [[urlRegexClassifiers objectForKey:pattern] intValue];
+                        matchedText = [storyPermalink substringWithRange:result.range];
+                        matchedBefore = [storyPermalink substringToIndex:result.range.location];
+                        matchedAfter = [storyPermalink substringFromIndex:NSMaxRange(result.range)];
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (matchedText && matchScore != 0) {
+            // Truncate before/after for display
+            NSInteger availableForContext = maxDisplayLength - (NSInteger)matchedText.length;
+            NSInteger beforeMax = availableForContext / 2;
+            NSInteger afterMax = availableForContext - beforeMax;
+            if ((NSInteger)matchedBefore.length > beforeMax && beforeMax > 1) {
+                matchedBefore = [NSString stringWithFormat:@"\u2026%@", [matchedBefore substringFromIndex:matchedBefore.length - beforeMax + 1]];
+            }
+            if ((NSInteger)matchedAfter.length > afterMax && afterMax > 1) {
+                matchedAfter = [NSString stringWithFormat:@"%@\u2026", [matchedAfter substringToIndex:afterMax - 1]];
+            }
+
+            NSString *urlIcon = [self scoreIconHtml:matchScore];
+            storyUrlMatch = [NSString stringWithFormat:@"<div class=\"NB-story-url-match\">"
+                             "<span class=\"NB-story-url NB-score-%d\">"
+                             "<span class=\"NB-story-url-label\">URL: </span>"
+                             "<span class=\"NB-story-url-before\">%@</span>"
+                             "<span class=\"NB-story-url-matched\">%@</span>"
+                             "<span class=\"NB-story-url-after\">%@</span>"
+                             "%@"
+                             "</span></div>",
+                             matchScore,
+                             matchedBefore,
+                             matchedText,
+                             matchedAfter,
+                             urlIcon];
+        }
+    }
+
     NSString *storyToggleChanges = [self.activeStory[@"has_modifications"] boolValue] ? [NSString stringWithFormat:@"<a href=\"http://ios.newsblur.com/togglechanges\" "
-                                                                           "class=\"NB-story-toggle-changes\" id=\"NB-story-toggle-changes\">%@</a><span class=\"NB-middot\">&middot;</span>", self.activeStory[@"story_changes"] != nil ? @"Hide Changes" : @"Show Changes"] : @"";
+                                                                           "class=\"NB-story-toggle-changes\" id=\"NB-story-toggle-changes\">%@</a><span class=\"NB-middot\">&middot;</span>", [(self.activeStory[@"story_changes"] != nil ? [NBLocalization text:@"Hide Changes"] : [NBLocalization text:@"Show Changes"]) stringByEncodingHTMLEntities]] : @"";
     
     NSString *storyDate = [Utilities formatLongDateFromTimestamp:[[self.activeStory
                                                                   objectForKey:@"story_timestamp"]
                                                                   integerValue]];
     NSString *storyHeader = [NSString stringWithFormat:@
                              "<div class=\"NB-header\"><div class=\"NB-header-inner\">"
-                             "<div class=\"NB-story-title\">"
+                             "<div class=\"NB-story-title\"%@>"
                              "  %@"
                              "  <a href=\"%@\" class=\"NB-story-permalink\">%@</a>"
                              "</div>"
@@ -992,7 +1762,9 @@
                              "%@"
                              "%@"
                              "%@"
+                             "%@"
                              "</div></div>",
+                             [self contentDirectionAttribute],
                              storyUnread,
                              storyPermalink,
                              storyTitle,
@@ -1000,56 +1772,101 @@
                              storyDate,
                              storyAuthor,
                              storyTags,
+                             storyUrlMatch,
                              storyStarred,
                              storyUserTags];
     return storyHeader;
+}
+
+// StoryDetailObjCViewController.m mirrors the reader's own controls for an Arabic or Hebrew interface
+// (storyDetailView.css styles html[dir="rtl"]). A left-to-right interface keeps its markup unchanged.
+- (NSString *)interfaceDirectionAttributes {
+    if (!NBLocalization.isRightToLeft) return @"";
+    return [NSString stringWithFormat:@" dir=\"rtl\" lang=\"%@\"", NBLocalization.resolvedLanguage];
+}
+
+// StoryDetailObjCViewController.m lets story text, titles and comments inside a right-to-left interface take
+// their own direction, so an English story still reads left to right.
+- (NSString *)contentDirectionAttribute {
+    return NBLocalization.isRightToLeft ? @" dir=\"auto\"" : @"";
 }
 
 - (NSString *)getSideOptions {
     BOOL isSaved = [[self.activeStory objectForKey:@"starred"] boolValue];
     BOOL isShared = [[self.activeStory objectForKey:@"shared"] boolValue];
 
-    NSUserDefaults *userPreferences = [NSUserDefaults standardUserDefaults];
-    BOOL showAskAI = [userPreferences objectForKey:@"show_ask_ai"] == nil || [userPreferences boolForKey:@"show_ask_ai"];
+    // StoryDetailObjCViewController.m shows each story button unless it's hidden in preferences; the choices sync
+    // through the server's show_sideoption_* preferences (Listen/ListenPreferences.swift).
+    BOOL showTrain = [ListenStoryBridge showsStoryButton:@"train"];
+    BOOL showShare = [ListenStoryBridge showsStoryButton:@"share"];
+    BOOL showSave = [ListenStoryBridge showsStoryButton:@"save"];
+    BOOL showAskAI = [ListenStoryBridge showsStoryButton:@"ask_ai"];
+    BOOL showListen = [ListenStoryBridge showsStoryButton:@"listen"];
 
-    NSString *askAIButton = showAskAI ? @
-                             "  <div class='NB-share-button NB-ask-ai-button NB-button'>"
-                             "    <a href=\"http://ios.newsblur.com/ask-ai\"><div>"
-                             "      <span class=\"NB-icon\"></span>"
-                             "      <span class=\"NB-sideoption-text\">Ask AI</span>"
-                             "    </div></a>"
-                             "  </div>" : @"";
+    // StoryDetailObjCViewController.m escapes the translated button labels for the story document. Each label is an
+    // explicit NBLocalization call so localization/manage.py extracts it.
+    NSString *(^label)(NSString *) = ^NSString *(NSString *translated) {
+        return [translated stringByEncodingHTMLEntities];
+    };
 
+    NSMutableArray<NSString *> *buttons = [NSMutableArray array];
+    if (showTrain) {
+        [buttons addObject:[NSString stringWithFormat:@
+                            "  <div class='NB-share-button NB-train-button NB-button'>"
+                            "    <a href=\"http://ios.newsblur.com/train\"><div>"
+                            "      <span class=\"NB-sideoption-text\">%@</span>"
+                            "      <span class=\"NB-icon\"></span>"
+                            "    </div></a>"
+                            "  </div>", label([NBLocalization text:@"Train"])]];
+    }
+    if (showShare) {
+        [buttons addObject:[NSString stringWithFormat:@
+                            "  <div class='NB-share-button NB-share-share-button NB-button %@'>"
+                            "    <a href=\"http://ios.newsblur.com/share\"><div>"
+                            "      <span class=\"NB-sideoption-text\">%@</span>"
+                            "      <span class=\"NB-icon\"></span>"
+                            "    </div></a>"
+                            "  </div>",
+                            isShared ? @"NB-button-active" : @"",
+                            isShared ? label([NBLocalization text:@"Shared"]) : label([NBLocalization text:@"Share"])]];
+    }
+    if (showSave) {
+        [buttons addObject:[NSString stringWithFormat:@
+                            "  <div class='NB-share-button NB-save-button NB-button %@'>"
+                            "    <a href=\"http://ios.newsblur.com/save/save/\"><div>"
+                            "      <span class=\"NB-sideoption-text\">%@</span>"
+                            "      <span class=\"NB-icon\"></span>"
+                            "    </div></a>"
+                            "  </div>",
+                            isSaved ? @"NB-button-active" : @"",
+                            isSaved ? label([NBLocalization text:@"Saved"]) : label([NBLocalization text:@"Save"])]];
+    }
+    if (showAskAI) {
+        [buttons addObject:[NSString stringWithFormat:@
+                            "  <div class='NB-share-button NB-ask-ai-button NB-button'>"
+                            "    <a href=\"http://ios.newsblur.com/ask-ai\"><div>"
+                            "      <span class=\"NB-sideoption-text\">%@</span>"
+                            "      <span class=\"NB-icon\"></span>"
+                            "    </div></a>"
+                            "  </div>", label([NBLocalization text:@"Ask AI"])]];
+    }
+    if (showListen) {
+        [buttons addObject:[ListenStoryBridge listenButtonHTMLForStory:self.activeStory]];
+    }
+
+    if (!buttons.count) {
+        return @"";
+    }
+
+    // storyDetailView.css wraps five buttons into rows of three and two on a portrait iPhone.
     NSString *sideOptions = [NSString stringWithFormat:@
-                             "<div class='NB-sideoptions'>"
+                             "<div class='NB-sideoptions%@'>"
                              "<div class='NB-share-header'></div>"
                              "<div class='NB-share-wrapper'><div class='NB-share-inner-wrapper'>"
-                             "  <div class='NB-share-button NB-train-button NB-button'>"
-                             "    <a href=\"http://ios.newsblur.com/train\"><div>"
-                             "      <span class=\"NB-icon\"></span>"
-                             "      <span class=\"NB-sideoption-text\">Train</span>"
-                             "    </div></a>"
-                             "  </div>"
-                             "  <div class='NB-share-button NB-share-share-button NB-button %@'>"
-                             "    <a href=\"http://ios.newsblur.com/share\"><div>"
-                             "      <span class=\"NB-icon\"></span>"
-                             "      <span class=\"NB-sideoption-text\">%@</span>"
-                             "    </div></a>"
-                             "  </div>"
-                             "  <div class='NB-share-button NB-save-button NB-button %@'>"
-                             "    <a href=\"http://ios.newsblur.com/save/save/\"><div>"
-                             "      <span class=\"NB-icon\"></span>"
-                             "      <span class=\"NB-sideoption-text\">%@</span>"
-                             "    </div></a>"
-                             "  </div>"
                              "%@"
                              "</div></div></div>",
-                             isShared ? @"NB-button-active" : @"",
-                             isShared ? @"Shared" : @"Share",
-                             isSaved ? @"NB-button-active" : @"",
-                             isSaved ? @"Saved" : @"Save",
-                             askAIButton
-                             ];
+                             buttons.count == 5 ? @" NB-sideoptions-five" : @"",
+                             [buttons componentsJoinedByString:@""]];
 
     return sideOptions;
 }
@@ -1097,10 +1914,9 @@
             comments = [comments stringByAppendingString:@"<div class=\"NB-story-comments-group NB-story-comment-friend-comments\">"];
             NSString *commentHeader = [NSString stringWithFormat:@
                                        "<div class=\"NB-story-comments-friends-header-wrapper\">"
-                                       "  <div class=\"NB-story-comments-friends-header\">%i comment%@</div>"
+                                       "  <div class=\"NB-story-comments-friends-header\">%@</div>"
                                        "</div>",
-                                       [[story objectForKey:@"comment_count_friends"] intValue],
-                                       [[story objectForKey:@"comment_count_friends"] intValue] == 1 ? @"" : @"s"];
+                                       [[NBLocalization plural:@"%@ comments" groupedCount:[[story objectForKey:@"comment_count_friends"] integerValue]] stringByEncodingHTMLEntities]];
             comments = [comments stringByAppendingString:commentHeader];
             
             // add friends comments
@@ -1118,10 +1934,9 @@
             comments = [comments stringByAppendingString:@"<div class=\"NB-story-comments-group NB-story-comment-friend-shares\">"];
             NSString *commentHeader = [NSString stringWithFormat:@
                                        "<div class=\"NB-story-comments-friend-shares-header-wrapper\">"
-                                       "  <div class=\"NB-story-comments-friends-header\">%ld share%@</div>"
+                                       "  <div class=\"NB-story-comments-friends-header\">%@</div>"
                                        "</div>",
-                                       (long)sharedByFriendsCount,
-                                       sharedByFriendsCount == 1 ? @"" : @"s"];
+                                       [[NBLocalization plural:@"%@ shares" groupedCount:sharedByFriendsCount] stringByEncodingHTMLEntities]];
             comments = [comments stringByAppendingString:commentHeader];
             
             // add friend shares
@@ -1139,10 +1954,9 @@
             comments = [comments stringByAppendingString:@"<div class=\"NB-story-comments-group NB-story-comment-public-comments\">"];
             NSString *publicCommentHeader = [NSString stringWithFormat:@
                                              "<div class=\"NB-story-comments-public-header-wrapper\">"
-                                             "  <div class=\"NB-story-comments-public-header\">%i public comment%@</div>"
+                                             "  <div class=\"NB-story-comments-public-header\">%@</div>"
                                              "</div>",
-                                             [[story objectForKey:@"comment_count_public"] intValue],
-                                             [[story objectForKey:@"comment_count_public"] intValue] == 1 ? @"" : @"s"];
+                                             [[NBLocalization plural:@"%@ public comments" groupedCount:[[story objectForKey:@"comment_count_public"] integerValue]] stringByEncodingHTMLEntities]];
             
             comments = [comments stringByAppendingString:publicCommentHeader];
             comments = [comments stringByAppendingFormat:@"<div class=\"NB-feed-story-comments\">"];
@@ -1176,9 +1990,8 @@
                                                                 "%@" // friend avatars
                                                                 "%@" // public avatars
                                                               "</div>",
-                                                              [[self.activeStory objectForKey:@"comment_count"] intValue] == 1
-                                                              ? [NSString stringWithFormat:@"<b>1 comment</b>"] :
-                                                              [NSString stringWithFormat:@"<b>%@ comments</b>", [self.activeStory objectForKey:@"comment_count"]],
+                                                              [NSString stringWithFormat:@"<b>%@</b>",
+                                                               [[NBLocalization plural:@"%@ comments" groupedCount:[[self.activeStory objectForKey:@"comment_count"] integerValue]] stringByEncodingHTMLEntities]],
                                                               
                                                               //replyStr,
                                                               [self getAvatars:@"commented_by_friends"],
@@ -1200,9 +2013,8 @@
                                                               "</div>",
                                                               [self getAvatars:@"shared_by_public"],
                                                               [self getAvatars:@"shared_by_friends"],
-                                                              [[self.activeStory objectForKey:@"share_count"] intValue] == 1
-                                                              ? [NSString stringWithFormat:@"<b>1 share</b>"] : 
-                                                              [NSString stringWithFormat:@"<b>%@ shares</b>", [self.activeStory objectForKey:@"share_count"]]]];
+                                                              [NSString stringWithFormat:@"<b>%@</b>",
+                                                               [[NBLocalization plural:@"%@ shares" groupedCount:[[self.activeStory objectForKey:@"share_count"] integerValue]] stringByEncodingHTMLEntities]]]];
     }
     
     if ([self.activeStory objectForKey:@"share_count"] != [NSNull null] &&
@@ -1253,10 +2065,11 @@
         userEditButton = [NSString stringWithFormat:@
                           "<div class=\"NB-story-comment-edit-button NB-story-comment-share-edit-button NB-button\">"
                             "<a href=\"http://ios.newsblur.com/edit-share/%@\"><div class=\"NB-story-comment-edit-button-wrapper\">"
-                                "Edit"
+                                "%@"
                             "</div></a>"
                           "</div>",
-                          commentUserId];
+                          commentUserId,
+                          [[NBLocalization text:@"Edit"] stringByEncodingHTMLEntities]];
     } else {
         BOOL isInLikingUsers = NO;
         for (int i = 0; i < likingUsersArray.count; i++) {
@@ -1309,6 +2122,11 @@
         locationHtml = [NSString stringWithFormat:@"<div class=\"NB-story-comment-location\">%@</div>", location];
     }
     
+    // StoryDetailObjCViewController.m words the server's relative time (already in the request language) as a whole
+    // translated sentence.
+    NSString *commentDate = [[NSString stringWithFormat:[NBLocalization text:@"%@ ago"],
+                              [commentDict objectForKey:@"shared_date"]] stringByEncodingHTMLEntities];
+    NSString *replyLabel = [[NBLocalization text:@"Reply"] stringByEncodingHTMLEntities];
     if (!self.isPhoneOrCompact) {
         comment = [NSString stringWithFormat:@
                     "<div class=\"NB-story-comment\" id=\"NB-user-comment-%@\">"
@@ -1321,15 +2139,15 @@
                     "<div class=\"NB-story-comment-author-container\">"
                     "   %@"
                     "    <div class=\"NB-story-comment-username\">%@</div>"
-                    "    <div class=\"NB-story-comment-date\">%@ ago</div>"
+                    "    <div class=\"NB-story-comment-date\">%@</div>"
                     "    <div class=\"NB-story-comment-likes\">%@</div>"
                     "</div>"
-                    "<div class=\"NB-story-comment-content\">%@</div>"
+                    "<div class=\"NB-story-comment-content\"%@>%@</div>"
                     "%@" // location
                     "<div class=\"NB-button-wrapper\">"
                     "    <div class=\"NB-story-comment-reply-button NB-button\">"
                     "        <a href=\"http://ios.newsblur.com/reply/%@/%@\"><div class=\"NB-story-comment-reply-button-wrapper\">"
-                    "            Reply"
+                    "            %@"
                     "        </div></a>"
                     "    </div>"
                     "    %@" //User Like Button
@@ -1343,12 +2161,14 @@
                     [user objectForKey:@"photo_url"],
                     userReshareString,
                     [user objectForKey:@"username"],
-                    [commentDict objectForKey:@"shared_date"],
+                    commentDate,
                     likingUsers,
+                    [self contentDirectionAttribute],
                     commentContent,
                     locationHtml,
                     [commentDict objectForKey:@"user_id"],
                     [user objectForKey:@"username"],
+                    replyLabel,
                     userEditButton,
                     userLikeButton,
                     [self getReplies:[commentDict objectForKey:@"replies"] forUserId:[commentDict objectForKey:@"user_id"]]];
@@ -1364,15 +2184,15 @@
                    "<div class=\"NB-story-comment-author-container\">"
                    "    %@"
                    "    <div class=\"NB-story-comment-username\">%@</div>"
-                   "    <div class=\"NB-story-comment-date\">%@ ago</div>"
+                   "    <div class=\"NB-story-comment-date\">%@</div>"
                    "    <div class=\"NB-story-comment-likes\">%@</div>"
                    "</div>"
-                   "<div class=\"NB-story-comment-content\">%@</div>"
+                   "<div class=\"NB-story-comment-content\"%@>%@</div>"
                    "%@" // location
                    "<div class=\"NB-button-wrapper\">"
                    "    <div class=\"NB-story-comment-reply-button NB-button\">"
                    "        <a href=\"http://ios.newsblur.com/reply/%@/%@\"><div class=\"NB-story-comment-reply-button-wrapper\">"
-                   "            Reply"
+                   "            %@"
                    "        </div></a>"
                    "    </div>"
                    "    %@" // User Like Button
@@ -1386,12 +2206,14 @@
                    [user objectForKey:@"photo_url"],
                    userReshareString,
                    [user objectForKey:@"username"],
-                   [commentDict objectForKey:@"shared_date"],
+                   commentDate,
                    likingUsers,
+                   [self contentDirectionAttribute],
                    commentContent,
                    locationHtml,
                    [commentDict objectForKey:@"user_id"],
                    [user objectForKey:@"username"],
+                   replyLabel,
                    userEditButton,
                    userLikeButton,
                    [self getReplies:[commentDict objectForKey:@"replies"] forUserId:[commentDict objectForKey:@"user_id"]]]; 
@@ -1419,13 +2241,14 @@
                                   "<div class=\"NB-story-comment-edit-button NB-story-comment-share-edit-button NB-button\">"
                                   "<a href=\"http://ios.newsblur.com/edit-reply/%@/%@/%@\">"
                                   "<div class=\"NB-story-comment-edit-button-wrapper\">"
-                                  "Edit"
+                                  "%@"
                                   "</div>"
                                   "</a>"
                                   "</div>",
                                   commentUserId,
                                   replyUserId,
-                                  replyId
+                                  replyId,
+                                  [[NBLocalization text:@"Edit"] stringByEncodingHTMLEntities]
                                   ];
             }
             
@@ -1439,6 +2262,8 @@
             }
                         
             NSString *reply;
+            NSString *replyDate = [[NSString stringWithFormat:[NBLocalization text:@"%@ ago"],
+                                    [replyDict objectForKey:@"publish_date"]] stringByEncodingHTMLEntities];
             
             if (!self.isPhoneOrCompact) {
                 reply = [NSString stringWithFormat:@
@@ -1448,8 +2273,8 @@
                          "       <img class=\"NB-story-comment-reply-photo\" src=\"%@\" />"
                          "   </a>"
                          "   <div class=\"NB-story-comment-username NB-story-comment-reply-username\">%@</div>"
-                         "   <div class=\"NB-story-comment-date NB-story-comment-reply-date\">%@ ago</div>"
-                         "   <div class=\"NB-story-comment-reply-content\">%@</div>"
+                         "   <div class=\"NB-story-comment-date NB-story-comment-reply-date\">%@</div>"
+                         "   <div class=\"NB-story-comment-reply-content\"%@>%@</div>"
                          "   %@" // location
                          "   <div class=\"NB-button-wrapper\">"
                          "       %@" // edit
@@ -1459,7 +2284,8 @@
                          [user objectForKey:@"user_id"],
                          [user objectForKey:@"photo_url"],
                          [user objectForKey:@"username"],
-                         [replyDict objectForKey:@"publish_date"],
+                         replyDate,
+                         [self contentDirectionAttribute],
                          replyContent,
                          locationHtml,
                          userEditButton];
@@ -1471,8 +2297,8 @@
                          "       <img class=\"NB-story-comment-reply-photo\" src=\"%@\" />"
                          "   </a>"
                          "   <div class=\"NB-story-comment-username NB-story-comment-reply-username\">%@</div>"
-                         "   <div class=\"NB-story-comment-date NB-story-comment-reply-date\">%@ ago</div>"
-                         "   <div class=\"NB-story-comment-reply-content\">%@</div>"
+                         "   <div class=\"NB-story-comment-date NB-story-comment-reply-date\">%@</div>"
+                         "   <div class=\"NB-story-comment-reply-content\"%@>%@</div>"
                          "   %@"
                          "   <div class=\"NB-button-wrapper\">"
                          "       %@" // edit
@@ -1482,7 +2308,8 @@
                          [user objectForKey:@"user_id"],  
                          [user objectForKey:@"photo_url"],
                          [user objectForKey:@"username"],
-                         [replyDict objectForKey:@"publish_date"],
+                         replyDate,
+                         [self contentDirectionAttribute],
                          replyContent,
                          locationHtml,
                          userEditButton];
@@ -1496,133 +2323,231 @@
 
 #pragma mark - Scrolling
 
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    if (scrollView == self.webView.scrollView) {
+        // StoryDetailObjCViewController.m keeps this touch suppressed even if the drag ends before image delivery.
+        self.suppressStoryImageTap = YES;
+    }
+}
+
+- (BOOL)scrollViewShouldScrollToTop:(UIScrollView *)scrollView {
+    if (scrollView != self.webView.scrollView) return NO;
+    // StoryDetailObjCViewController.m treats the native status-bar action as an explicit new reading position.
+    self.storyScrollActivityGeneration++;
+    self.awaitingStoryScrollRestoration = NO;
+    self.scrollToTopGeneration = self.storyLoadGeneration;
+    self.restoredStoryScrollPosition = NO;
+    self.hasScrolledAwayFromTop = NO;
+    hasScrolled = YES;
+    scrollPct = 0;
+    self.hasLiveScrollFraction = NO;
+    StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+    if (pagesVC.isCustomToolbarActive) {
+        [pagesVC.toolbarScrollHandler reset];
+        [UIView animateWithDuration:0.3 animations:^{
+            [pagesVC setToolbarOffset:0];
+        }];
+    } else {
+        pagesVC.navBarFadeAccumulator = 0.0;
+        pagesVC.traverseFadeAccumulator = 0.0;
+        [UIView animateWithDuration:0.3 animations:^{
+            [pagesVC setNavigationBarFadeAlpha:1.0];
+        }];
+    }
+    return YES;
+}
+
+- (void)scrollViewDidScrollToTop:(UIScrollView *)scrollView {
+    if (scrollView != self.webView.scrollView || !self.scrollToTopGeneration ||
+        ![self isCurrentStoryLoad:self.scrollToTopGeneration]) return;
+    self.scrollToTopGeneration = 0;
+    [self storeScrollPosition:NO];
+}
+
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
     if ([keyPath isEqual:@"contentOffset"]) {
         BOOL isHorizontal = appDelegate.storyPagesViewController.isHorizontal;
-        BOOL isNavBarHidden = appDelegate.storyPagesViewController.isNavigationBarHidden;
-        
-        if (self.webView.scrollView.contentOffset.y < (-1 * self.feedTitleGradient.frame.size.height + 1 + self.webView.scrollView.verticalScrollIndicatorInsets.top)) {
-            // Pulling
-            if (!pullingScrollview) {
-                pullingScrollview = YES;
-                
-                for (id subview in self.webView.scrollView.subviews) {
-                    UIImageView *imgView = [subview isKindOfClass:[UIImageView class]] ?
-                    (UIImageView*)subview : nil;
-                    // image views whose image is 1px wide are shadow images, hide them
-                    if (imgView && imgView.image.size.width > 1) {
-                        [self.webView.scrollView insertSubview:self.feedTitleGradient
-                                                  belowSubview:subview];
-                        [self.webView.scrollView bringSubviewToFront:subview];
-                    }
-                }
-            }
-        } else {
-            // Normal reading
-            if (pullingScrollview) {
-                pullingScrollview = NO;
-                [self.feedTitleGradient.layer setShadowOpacity:0];
-                
-                if (!isNavBarHidden) {
-                    [self.webView insertSubview:self.feedTitleGradient aboveSubview:self.webView.scrollView];
-
-                    CGFloat yOffset = -1;
-                    if (appDelegate.storyPagesViewController.view.safeAreaInsets.top > 0.0) {
-                        CGFloat navBarHeight = appDelegate.feedsNavigationController.navigationBar.frame.size.height;
-                        yOffset += navBarHeight;
-                    }
-                    self.feedTitleGradient.frame = CGRectMake(0, yOffset,
-                                                              self.feedTitleGradient.frame.size.width,
-                                                              self.feedTitleGradient.frame.size.height);
-                }
-                
-                for (id subview in self.webView.scrollView.subviews) {
-                    UIImageView *imgView = [subview isKindOfClass:[UIImageView class]] ?
-                    (UIImageView*)subview : nil;
-                    // image views whose image is 1px wide are shadow images, hide them
-                    if (imgView && imgView.image.size.width == 1) {
-                        imgView.hidden = NO;
-                    }
-                }
-            }
-        }
+        [self updateFeedTitleGradientPosition];
         
         if (appDelegate.storyPagesViewController.currentPage != self) return;
 
-        int webpageHeight = self.webView.scrollView.contentSize.height;
-        int viewportHeight = self.view.frame.size.height;
-        int topPosition = self.webView.scrollView.contentOffset.y;
-        
+        UIScrollView *scrollView = self.webView.scrollView;
+        CGPoint newOffset = [[change objectForKey:NSKeyValueChangeNewKey] CGPointValue];
+        CGPoint oldOffset = [[change objectForKey:NSKeyValueChangeOldKey] CGPointValue];
+        CGFloat deltaY = newOffset.y - oldOffset.y;
+        BOOL isUserDragging = scrollView.isTracking || scrollView.isDragging;
+        CGFloat panTranslationY = isUserDragging ? [scrollView.panGestureRecognizer translationInView:scrollView].y : 0.0;
+
+        if (isUserDragging) {
+            if (fabs(deltaY) > 0.1) {
+                self.isUserScrolling = YES;
+                self.storyScrollActivityGeneration++;
+                self.awaitingStoryScrollRestoration = NO;
+                // Track direction only during actual finger movement, not during
+                // deceleration (isDragging can stay YES with momentum scrolling)
+                UIGestureRecognizerState panState = scrollView.panGestureRecognizer.state;
+                if (panState == UIGestureRecognizerStateChanged) {
+                    if (deltaY > 0.5) {
+                        self.lastDragDirectionDown = YES;
+                    } else if (deltaY < -0.5) {
+                        self.lastDragDirectionDown = NO;
+                    }
+                }
+                [[ReadTimeTracker shared] recordActivity];
+            } else {
+                return;
+            }
+        } else if (!scrollView.isDecelerating) {
+            if (self.isUserScrolling) {
+                self.isUserScrolling = NO;
+                if (appDelegate.storyPagesViewController.currentPage == self) {
+                    StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+                    if (pagesVC.isCustomToolbarActive) {
+                        // Snap toolbar to fully shown or fully hidden
+                        CGFloat target = [pagesVC.toolbarScrollHandler snapTarget];
+                        [UIView animateWithDuration:0.2 animations:^{
+                            [pagesVC setToolbarOffset:target];
+                        }];
+                    } else {
+                        CGFloat currentAlpha = pagesVC.navigationBarFadeAlpha;
+                        CGFloat targetAlpha = currentAlpha > 0.5 ? 1.0 : 0.0;
+                        pagesVC.navBarFadeAccumulator = (targetAlpha < 0.5) ? 80.0 : 0.0;
+                        if (fabs(currentAlpha - targetAlpha) > 0.01) {
+                            [UIView animateWithDuration:0.2 animations:^{
+                                [pagesVC setNavigationBarFadeAlpha:targetAlpha];
+                            }];
+                        }
+                        [self updateContentInsetForNavigationBarAlpha:targetAlpha
+                                               maintainVisualPosition:YES
+                                                                force:YES];
+                    }
+                }
+            }
+            return;
+        }
+
+        if (!(isUserDragging || scrollView.isDecelerating) || !self.isUserScrolling) {
+            return;
+        }
+
+        CGFloat webpageHeight = scrollView.contentSize.height;
+        CGFloat viewportHeight = self.view.frame.size.height;
+        CGFloat topPosition = newOffset.y;
+
         CGFloat bottomInset = appDelegate.detailViewController.view.safeAreaInsets.bottom;
-        
-        int safeBottomMargin = bottomInset;
-        int bottomPosition = webpageHeight - topPosition - viewportHeight;
+
+        CGFloat safeBottomMargin = bottomInset;
+        CGFloat bottomPosition = webpageHeight - topPosition - viewportHeight;
         BOOL singlePage = webpageHeight - 200 <= viewportHeight;
         BOOL atBottom = bottomPosition < 150;
         BOOL atTop = topPosition < 50;
-#if !TARGET_OS_MACCATALYST
-        BOOL pullingDown = topPosition < 0;
-        BOOL nearTop = topPosition < 100;
-#endif
-        
+        // Adjust for content inset so toolbar starts hiding from the very first scroll
+        CGFloat insetAdjustedTop = topPosition + scrollView.contentInset.top;
+        BOOL atTopForFade = insetAdjustedTop < 2;
+
         if (!hasScrolled && topPosition != 0) {
             hasScrolled = YES;
         }
-        
-        if (hasScrolled && !atTop && [appDelegate.storiesCollection isStoryUnread:activeStory]) {
-            [appDelegate.storiesCollection markStoryRead:activeStory];
-            [appDelegate.storiesCollection syncStoryAsRead:activeStory];
-            
-            NSIndexPath *reloadIndexPath = appDelegate.feedDetailViewController.storyTitlesTable.indexPathForSelectedRow;
-            if (reloadIndexPath != nil) {
-                [appDelegate.feedDetailViewController reloadIndexPath:reloadIndexPath withRowAnimation:UITableViewRowAnimationNone];
-            }
+
+        if (hasScrolled && !atTop && [appDelegate.feedDetailViewController markStoryReadIfNeeded:activeStory isScrolling:YES]) {
+            [appDelegate.feedDetailViewController redrawUnreadStory];
+            [self refreshHeader];
         }
-        
+
 #if !TARGET_OS_MACCATALYST
-        if (!isNavBarHidden && self.canHideNavigationBar && !nearTop) {
-            [appDelegate.storyPagesViewController setNavigationBarHidden:YES];
+        if (!atTopForFade) {
+            self.hasScrolledAwayFromTop = YES;
         }
-        
-        if (isNavBarHidden && pullingDown) {
-            [appDelegate.storyPagesViewController setNavigationBarHidden:NO];
+
+        StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+        if (pagesVC.isCustomToolbarActive) {
+            // Scroll-based toolbar: translate toolbar with scroll deltas
+            // Only reset toolbar when user actively scrolls to top (not on programmatic/bounce scrolls)
+            if (atTopForFade && self.hasScrolledAwayFromTop && isUserDragging) {
+                [pagesVC.toolbarScrollHandler reset];
+                [pagesVC setToolbarOffset:0];
+                pagesVC.traverseFadeAccumulator = 0.0;
+            } else if (atTopForFade) {
+                // At very top: hold current state
+            } else if (self.canHideNavigationBar) {
+                // Only apply upward (show toolbar) deltas when user is actively scrolling up,
+                // not during bottom bounce from momentum or interactive scroll
+                CGFloat effectiveDelta = deltaY;
+                if (effectiveDelta < 0 && self.lastDragDirectionDown) {
+                    effectiveDelta = 0;
+                }
+                if (effectiveDelta != 0) {
+                    BOOL nearTop = insetAdjustedTop < 50;
+                    [pagesVC.toolbarScrollHandler handleScrollDelta:effectiveDelta atTop:NO atBottom:NO nearTop:nearTop];
+                    [pagesVC setToolbarOffset:pagesVC.toolbarScrollHandler.toolbarOffset];
+                }
+            }
+        } else {
+            // Legacy alpha-fade path (iPad, non-fullscreen)
+            if (atTopForFade && self.hasScrolledAwayFromTop) {
+                pagesVC.navBarFadeAccumulator = 0.0;
+                pagesVC.traverseFadeAccumulator = 0.0;
+                [pagesVC setNavigationBarFadeAlpha:1.0];
+            } else if (atTopForFade || atBottom) {
+                // At top (first load) or at bottom: hold current nav bar state
+            } else if (self.canHideNavigationBar) {
+                CGFloat fadeDistance = 80.0;
+                CGFloat newAccum = pagesVC.navBarFadeAccumulator + deltaY;
+                newAccum = MAX(0.0, MIN(fadeDistance, newAccum));
+                pagesVC.navBarFadeAccumulator = newAccum;
+                CGFloat alpha = 1.0 - (newAccum / fadeDistance);
+                [pagesVC setNavigationBarFadeAlpha:alpha];
+            }
         }
 #endif
-        
-        if (!atTop && !atBottom && !singlePage) {
-            BOOL traversalVisible = appDelegate.storyPagesViewController.traverseView.alpha > 0;
-            
-            // Hide
-            [UIView animateWithDuration:.3 delay:0
-                                options:UIViewAnimationOptionCurveEaseInOut
-            animations:^{
-                self.appDelegate.storyPagesViewController.traverseView.alpha = 0;
-                
-                if (traversalVisible) {
-                    [self.appDelegate.storyPagesViewController hideAutoscrollImmediately];
-                }
-            } completion:^(BOOL finished) {
-                
-            }];
+
+        if (appDelegate.storyPagesViewController.usesVerticalReaderToolbar) {
+            // StoryDetailObjCViewController.m must not relayout the hidden legacy footer or
+            // outer pager while the native side toolbar's article is rubber-banding.
+            [self storeScrollPosition:YES];
+            return;
+        }
+
+        if (!atTopForFade && !atBottom && !singlePage) {
+            StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+            CGFloat traverseFadeDistance = 80.0;
+            BOOL isUserTraverseScroll = self.isUserScrolling && (isUserDragging || scrollView.isDecelerating);
+            CGFloat newAccum = [StoryTraverseFadeDecision accumulatorWithCurrentAccumulator:pagesVC.traverseFadeAccumulator
+                                                                                     deltaY:deltaY
+                                                                               fadeDistance:traverseFadeDistance
+                                                                               isUserScroll:isUserTraverseScroll];
+            pagesVC.traverseFadeAccumulator = newAccum;
+            CGFloat traverseAlpha = [StoryTraverseFadeDecision alphaWithAccumulator:newAccum
+                                                                       fadeDistance:traverseFadeDistance];
+            pagesVC.traverseView.alpha = traverseAlpha;
+            [pagesVC updateUITestTraverseFadeProbe];
+
+            if (traverseAlpha == 0) {
+                [pagesVC hideAutoscrollImmediately];
+            }
         } else if (singlePage || !isHorizontal) {
+            appDelegate.storyPagesViewController.traverseFadeAccumulator = 0.0;
             appDelegate.storyPagesViewController.traverseView.alpha = 1;
+            [appDelegate.storyPagesViewController updateUITestTraverseFadeProbe];
 //            NSLog(@" ---> Bottom position: %d", bottomPosition);
+            CGFloat gap = appDelegate.storyPagesViewController.traverseBottomGap;
             if (bottomPosition >= 0 || !isHorizontal) {
-                appDelegate.storyPagesViewController.traverseBottomConstraint.constant = 0;
+                appDelegate.storyPagesViewController.traverseBottomConstraint.constant = gap;
             } else {
                 if (webpageHeight > 0 && [[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPhone) {
-                    appDelegate.storyPagesViewController.traverseBottomConstraint.constant = viewportHeight - (webpageHeight - topPosition) - safeBottomMargin;
+                    appDelegate.storyPagesViewController.traverseBottomConstraint.constant = viewportHeight - (webpageHeight - topPosition) + gap;
                 } else {
-                    appDelegate.storyPagesViewController.traverseBottomConstraint.constant = 0;
+                    appDelegate.storyPagesViewController.traverseBottomConstraint.constant = gap;
                 }
             }
-        } else if ((!singlePage && (atTop && !atBottom)) || [[UIDevice currentDevice] userInterfaceIdiom] != UIUserInterfaceIdiomPhone) {
+        } else if ((!singlePage && (atTopForFade && !atBottom)) || [[UIDevice currentDevice] userInterfaceIdiom] != UIUserInterfaceIdiomPhone) {
             // Pin to bottom of viewport, regardless of scrollview
             appDelegate.storyPagesViewController.traversePinned = YES;
             appDelegate.storyPagesViewController.traverseFloating = NO;
+            appDelegate.storyPagesViewController.traverseFadeAccumulator = 0.0;
             [appDelegate.storyPagesViewController.view layoutIfNeeded];
 
-            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = 0;
+            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = appDelegate.storyPagesViewController.traverseBottomGap;
             [appDelegate.storyPagesViewController.view layoutIfNeeded];
             [UIView animateWithDuration:.3 delay:0
                                 options:UIViewAnimationOptionCurveEaseInOut
@@ -1636,7 +2561,7 @@
             appDelegate.storyPagesViewController.traverseFloating = YES;
             [appDelegate.storyPagesViewController.view layoutIfNeeded];
 
-            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = 0;
+            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = appDelegate.storyPagesViewController.traverseBottomGap;
             [appDelegate.storyPagesViewController.view layoutIfNeeded];
             [UIView animateWithDuration:.3 delay:0
                                 options:UIViewAnimationOptionCurveEaseInOut
@@ -1649,8 +2574,9 @@
             // Scroll with bottom of scrollview
             appDelegate.storyPagesViewController.traversePinned = NO;
             appDelegate.storyPagesViewController.traverseFloating = YES;
+            appDelegate.storyPagesViewController.traverseFadeAccumulator = 0.0;
             appDelegate.storyPagesViewController.traverseView.alpha = 1;
-            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = viewportHeight - (webpageHeight - topPosition) - safeBottomMargin;
+            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = viewportHeight - (webpageHeight - topPosition) + appDelegate.storyPagesViewController.traverseBottomGap;
         }
         
         [appDelegate.storyPagesViewController resizeScrollView];
@@ -1659,12 +2585,15 @@
 }
 
 - (NSInteger)scrollPosition {
-    NSInteger updatedPos = floor(self.webView.scrollView.contentOffset.y / self.webView.scrollView.contentSize.height
-                                 * 1000);
-    return updatedPos;
+    UIScrollView *scrollView = self.webView.scrollView;
+    if (scrollView.contentSize.height <= 0) return 0;
+    // StoryDetailObjCViewController.m keeps positive fractions unchanged and records inset-adjusted top offsets as zero.
+    return floor(MAX(0, scrollView.contentOffset.y) / scrollView.contentSize.height * 1000);
 }
 
 - (void)storeScrollPosition:(BOOL)queue {
+    if (self.awaitingStoryScrollRestoration || !self.hasStory ||
+        ![self isCurrentStoryLoad:self.storyLoadGeneration]) return;
     __block NSInteger position = [self scrollPosition];
     __block NSDictionary *story = self.activeStory;
     __weak __typeof(&*self)weakSelf = self;
@@ -1673,11 +2602,12 @@
     if (!hasScrolled) return;
     
     NSString *storyIdentifier = [NSString stringWithFormat:@"markScrollPosition:%@", [story objectForKey:@"story_hash"]];
+    NSUInteger generation = self.storyLoadGeneration;
     if (queue) {
         NSTimeInterval interval = 2;
         [JNWThrottledBlock runBlock:^{
             __strong __typeof(&*weakSelf)strongSelf = weakSelf;
-            if (!strongSelf) return;
+            if (!strongSelf || ![strongSelf isCurrentStoryLoad:generation]) return;
             NSInteger updatedPos = [strongSelf scrollPosition];
             [self.appDelegate markScrollPosition:updatedPos inStory:story];
         } withIdentifier:storyIdentifier throttle:interval];
@@ -1697,8 +2627,17 @@
 - (void)scrollToLastPosition:(BOOL)animated {
     if (hasScrolled) return;
     hasScrolled = YES;
+    self.awaitingStoryScrollRestoration = YES;
+    if (!self.appDelegate.database) {
+        self.awaitingStoryScrollRestoration = NO;
+        [self finishPreparingStoryPresentation];
+        return;
+    }
     
     __block NSString *storyHash = [self.activeStory objectForKey:@"story_hash"];
+    NSUInteger generation = self.storyLoadGeneration;
+    NSUInteger scrollActivity = self.storyScrollActivityGeneration;
+    WKWebView *restoringWebView = self.webView;
     __weak __typeof(&*self)weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW,
                                              (unsigned long)NULL), ^(void) {
@@ -1709,30 +2648,56 @@
                 return;
             }
             FMResultSet *cursor = [db executeQuery:@"SELECT scroll, story_hash FROM story_scrolls s WHERE s.story_hash = ? LIMIT 1", storyHash];
-            
+            CGFloat savedFraction = 0;
             while ([cursor next]) {
-                NSDictionary *story = [cursor resultDictionary];
-                id scroll = [story objectForKey:@"scroll"];
-                if (([scroll isKindOfClass:[NSNull class]] || [scroll integerValue] == 0) && !self->scrollPct) {
-                    NSLog(@" ---> No scroll found for story: %@", [strongSelf.activeStory objectForKey:@"story_title"]);
-                    // No scroll found
-                    continue;
-                }
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (!self->scrollPct) self->scrollPct = [scroll floatValue] / 1000.f;
-                    NSInteger position = floor(self->scrollPct * strongSelf.webView.scrollView.contentSize.height);
-                    NSInteger maxPosition = (NSInteger)(floor(strongSelf.webView.scrollView.contentSize.height - strongSelf.webView.frame.size.height));
-                    if (position > maxPosition) {
-                        NSLog(@"Position too far, scaling back to max position: %@ > %@", @(position), @(maxPosition));
-                        position = maxPosition;
-                    }
-                    if (position > 0) {
-                        NSLog(@"Scrolling to %ld / %.1f%% (%.f+%.f) on %@-%@", (long)position, self->scrollPct*100, strongSelf.webView.scrollView.contentSize.height, strongSelf.webView.frame.size.height, [story objectForKey:@"story_hash"], [strongSelf.activeStory objectForKey:@"story_title"]);
-                            [strongSelf.webView.scrollView setContentOffset:CGPointMake(0, position) animated:animated];
-                    }
-                });
+                id scroll = [[cursor resultDictionary] objectForKey:@"scroll"];
+                // NewsBlurAppDelegate.m persists an explicit top position as the legacy value one.
+                if (![scroll isKindOfClass:[NSNull class]] && [scroll integerValue] > 1) savedFraction = [scroll floatValue] / 1000.f;
             }
             [cursor close];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // StoryDetailObjCViewController.m must not apply an old database result after page reuse or a user's scroll.
+                if (![strongSelf isCurrentStoryLoad:generation] || strongSelf.webView != restoringWebView) return;
+                if (scrollActivity != strongSelf.storyScrollActivityGeneration || restoringWebView.scrollView.isTracking ||
+                    restoringWebView.scrollView.isDragging || restoringWebView.scrollView.isDecelerating) {
+                    strongSelf.awaitingStoryScrollRestoration = NO;
+                    [strongSelf finishPreparingStoryPresentation];
+                    return;
+                }
+                // StoryDetailObjCViewController.m can receive DOM readiness before WK publishes its native content size.
+                if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] restoreLayoutStart page=%p hash=%@ gen=%lu", strongSelf, strongSelf.activeStoryId, (unsigned long)generation);
+                [restoringWebView callAsyncJavaScript:@"await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame); return true;"
+                                           arguments:nil inFrame:nil inContentWorld:WKContentWorld.pageWorld
+                                   completionHandler:^(id result, NSError *error) {
+                    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] restoreLayoutFinished page=%p gen=%lu current=%d error=%@", strongSelf, (unsigned long)generation, [strongSelf isCurrentStoryLoad:generation], error);
+                    if (![strongSelf isCurrentStoryLoad:generation] || strongSelf.webView != restoringWebView) return;
+                    if (error || scrollActivity != strongSelf.storyScrollActivityGeneration ||
+                        restoringWebView.scrollView.isTracking || restoringWebView.scrollView.isDragging ||
+                        restoringWebView.scrollView.isDecelerating) {
+                        strongSelf.awaitingStoryScrollRestoration = NO;
+                        [strongSelf finishPreparingStoryPresentation];
+                        return;
+                    }
+                    strongSelf.awaitingStoryScrollRestoration = NO;
+                    if (!strongSelf.hasLiveScrollFraction && !strongSelf->scrollPct) strongSelf->scrollPct = savedFraction;
+                    NSInteger position = floor(strongSelf->scrollPct * restoringWebView.scrollView.contentSize.height);
+                    NSInteger maxPosition = (NSInteger)floor(restoringWebView.scrollView.contentSize.height - restoringWebView.frame.size.height);
+                    if (position > maxPosition) position = maxPosition;
+                    if (position > 0) {
+                        strongSelf.restoredStoryScrollPosition = YES;
+                        [restoringWebView.scrollView setContentOffset:CGPointMake(0, position) animated:animated && !strongSelf.preparingStoryPresentation];
+                    } else if (strongSelf->scrollPct == 0) {
+                        // StoryDetailObjCViewController.m restores an explicit zero or missing row below the native toolbar.
+                        // A new WK document can reset to y=0 even though the fixed toolbar inset is already installed.
+                        StoryPagesObjCViewController *pagesVC = strongSelf.appDelegate.storyPagesViewController;
+                        [strongSelf updateContentInsetForNavigationBarAlpha:pagesVC.navigationBarFadeAlpha];
+                        CGFloat top = -restoringWebView.scrollView.adjustedContentInset.top;
+                        if (pagesVC.isCustomToolbarActive) top += pagesVC.toolbarScrollHandler.toolbarOffset;
+                        [restoringWebView.scrollView setContentOffset:CGPointMake(0, top) animated:NO];
+                    }
+                    [strongSelf finishPreparingStoryPresentation];
+                }];
+            });
             
         }];
     });
@@ -1751,6 +2716,7 @@
     NSURLRequest *request = navigationAction.request;
     NSURL *url = [request URL];
     NSArray *urlComponents = [url pathComponents];
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     NSString *action = @"";
     NSString *feedId = [NSString stringWithFormat:@"%@", [self.activeStory
                                                           objectForKey:@"story_feed_id"]];
@@ -1763,6 +2729,21 @@
     // the pathComponents do not work correctly unless it is a correctly formed url
     // Is there a better way?  Someone show me the light
     if ([[url host] isEqualToString: @"ios.newsblur.com"]){
+        if ([action isEqualToString:@"notify-loaded"]) {
+            NSString *loadId = nil;
+            for (NSURLQueryItem *item in components.queryItems) {
+                if ([item.name isEqualToString:@"load_id"]) loadId = item.value;
+            }
+            NSString *expectedLoadId = [NSString stringWithFormat:@"%lu", (unsigned long)self.storyLoadGeneration];
+            if (webView == self.webView && navigationAction.sourceFrame.isMainFrame &&
+                self.hasStory && [self isCurrentStoryLoad:self.storyLoadGeneration] &&
+                [loadId isEqualToString:expectedLoadId]) {
+                [self webViewNotifyLoaded];
+            }
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
+        }
+
         // reset the active comment
         appDelegate.activeComment = nil;
         appDelegate.activeShareType = action;
@@ -1844,6 +2825,27 @@
             }
             decisionHandler(WKNavigationActionPolicyCancel);
             return;
+        } else if ([action isEqualToString:@"read"]) {
+            if ([[activeStory objectForKey:@"read_status"] boolValue]) {
+                [appDelegate.storiesCollection markStoryUnread:activeStory];
+                [appDelegate.storiesCollection syncStoryAsUnread:activeStory];
+            } else {
+                [appDelegate.storiesCollection markStoryRead:activeStory];
+                [appDelegate.storiesCollection syncStoryAsRead:activeStory];
+            }
+            [self setActiveStoryAtIndex:-1];
+            [self refreshHeader];
+            [self refreshSideOptions];
+            [appDelegate.feedDetailViewController reload];
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
+        } else if ([action isEqualToString:@"share"] && [urlComponents count] > 5) {
+            [self openShareDialog:[[urlComponents objectAtIndex:2] intValue]
+                      yCoordinate:[[urlComponents objectAtIndex:3] intValue]
+                            width:[[urlComponents objectAtIndex:4] intValue]
+                           height:[[urlComponents objectAtIndex:5] intValue]];
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
         } else if ([action isEqualToString:@"share"]) {
             [self openShareDialog];
             decisionHandler(WKNavigationActionPolicyCancel);
@@ -1857,6 +2859,16 @@
             return;
         } else if ([action isEqualToString:@"ask-ai"]) {
             [appDelegate openAskAIDialog:self.activeStory];
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
+        } else if ([action isEqualToString:@"listen"]) {
+            // StoryDetailObjCViewController.m starts, pauses or resumes reading this story aloud (Listen/ListenPlayer.swift).
+            [ListenStoryBridge toggleListenForStory:self.activeStory];
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
+        } else if ([action isEqualToString:@"listen-queue"]) {
+            // StoryDetailObjCViewController.m: the + beside Listen adds this story to Up Next, or takes it back off.
+            [ListenStoryBridge toggleQueueForStory:self.activeStory];
             decisionHandler(WKNavigationActionPolicyCancel);
             return;
         } else if ([action isEqualToString:@"train"] && [urlComponents count] > 5) {
@@ -1893,6 +2905,28 @@
             [self.appDelegate toggleTagClassifier:tag feedId:feedId];
             decisionHandler(WKNavigationActionPolicyCancel);
             return;
+        } else if ([action isEqualToString:@"open-cluster-story"]) {
+            NSString *targetFeedId = nil;
+            NSString *storyHash = nil;
+            NSString *storyTitle = nil;
+            for (NSURLQueryItem *queryItem in components.queryItems) {
+                if ([queryItem.name isEqualToString:@"feed_id"]) {
+                    targetFeedId = queryItem.value;
+                } else if ([queryItem.name isEqualToString:@"story_hash"]) {
+                    storyHash = queryItem.value;
+                } else if ([queryItem.name isEqualToString:@"story_title"]) {
+                    storyTitle = queryItem.value;
+                }
+            }
+            if (targetFeedId.length && storyHash.length && [self.appDelegate isSubscribedFeedIdForStoryClusters:targetFeedId]) {
+                [self.appDelegate loadFeed:targetFeedId withStory:storyHash storyTitle:storyTitle animated:NO];
+            }
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
+        } else if ([action isEqualToString:@"premium-archive"]) {
+            [self.appDelegate showPremiumDialogForArchive];
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
         } else if ([action isEqualToString:@"premium"]) {
             [self.appDelegate showPremiumDialog];
             decisionHandler(WKNavigationActionPolicyCancel);
@@ -1916,10 +2950,6 @@
                            height:[[urlComponents objectAtIndex:6] intValue]];
             decisionHandler(WKNavigationActionPolicyCancel);
             return;
-        } else if ([action isEqualToString:@"notify-loaded"]) {
-            [self webViewNotifyLoaded];
-            decisionHandler(WKNavigationActionPolicyCancel);
-            return;
         }
     } else if ([url.host hasSuffix:@"itunes.apple.com"]) {
         [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
@@ -1928,6 +2958,10 @@
     }
     
     if (navigationAction.navigationType == WKNavigationTypeLinkActivated) {
+        if ([self openDailyBriefingStoryForURL:url]) {
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
+        }
 //        NSLog(@"Link clicked, views: %@ = %@", appDelegate.navigationController.topViewController, appDelegate.masterContainerViewController.childViewControllers);
         if (appDelegate.isPresentingActivities) {
             decisionHandler(WKNavigationActionPolicyCancel);
@@ -1939,6 +2973,22 @@
     }
     
     decisionHandler(WKNavigationActionPolicyAllow);
+}
+
+- (BOOL)openDailyBriefingStoryForURL:(NSURL *)url {
+    NSString *storyHash = [DailyBriefingLinkDecision storyHashForURL:url
+                                                    isDailyBriefing:appDelegate.storiesCollection.isDailyBriefing];
+    if (![storyHash length]) {
+        return NO;
+    }
+
+    NSInteger location = [appDelegate.storiesCollection locationOfStoryId:storyHash];
+    if (location < 0) {
+        return NO;
+    }
+
+    [appDelegate.feedDetailViewController loadStoryAtRow:location];
+    return YES;
 }
 
 - (void)showOriginalStory:(UIGestureRecognizer *)gesture {
@@ -1996,8 +3046,11 @@
 }
 
 - (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
-    if (!self.hasStory) // other Web page loads aren't visible
-        return;
+    if (webView == self.webView && navigation && navigation == self.measuredFontWarmupNavigation) {
+        [ReaderPerformance finish:@"detail.font_bootstrap_navigation_started" since:self.fontWarmupStarted];
+    }
+    if (webView != self.webView || navigation != self.storyNavigation || !self.hasStory ||
+        ![self isCurrentStoryLoad:self.storyLoadGeneration]) return;
 
     // DOM should already be set up here
     NSUserDefaults *userPreferences = [NSUserDefaults standardUserDefaults];
@@ -2007,22 +3060,122 @@
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] navigationFinished page=%p hash=%@ currentWeb=%d storyNavigation=%d fontNavigation=%d gen=%lu readygen=%lu", self, self.activeStoryId, webView == self.webView, navigation == self.storyNavigation, navigation == self.fontWarmupNavigation, (unsigned long)self.storyLoadGeneration, (unsigned long)self.readyStoryLoadGeneration);
+    if (webView == self.webView && navigation && navigation == self.measuredFontWarmupNavigation) {
+        [ReaderPerformance finish:@"detail.font_bootstrap_navigation_finished" since:self.fontWarmupStarted];
+    }
+    if (webView == self.webView && navigation && navigation == self.fontWarmupNavigation) {
+        __weak typeof(self) weakSelf = self;
+        [webView callAsyncJavaScript:@"await Promise.all(Array.from(document.fonts, font => font.load())); await document.fonts.ready; return true;"
+                          arguments:nil inFrame:nil inContentWorld:WKContentWorld.pageWorld
+                  completionHandler:^(id result, NSError *error) {
+            [weakSelf finishFontPreparationForWebView:webView navigation:navigation error:error];
+        }];
+        return;
+    }
+    if (webView == self.webView && navigation == self.storyNavigation && self.failedWebViewFontPreparation &&
+        !self.hasStory && [self isCurrentStoryLoad:self.storyLoadGeneration]) {
+        [self loadStory];
+        return;
+    }
+    if (webView != self.webView || navigation != self.storyNavigation || !self.hasStory ||
+        ![self isCurrentStoryLoad:self.storyLoadGeneration]) return;
+
+    // After the full story HTML finishes loading, update the viewport width to
+    // match the actual web view size. On initial load, drawStory may fire before
+    // the view is laid out at its final device width (e.g., XIB default 414pt vs
+    // iPhone 13's 390pt), baking the wrong width into the viewport meta tag.
+    if (self.hasStory) {
+        // StoryDetailObjCViewController.m may have cached a resize against the outgoing document before this navigation committed.
+        self.lastWidthClassKey = nil;
+        [self changeWebViewWidth];
+    }
+}
+
+- (void)finishFontPreparationForWebView:(WKWebView *)webView navigation:(WKNavigation *)navigation error:(NSError *)error {
+    if (self.webView != webView || !navigation || self.fontWarmupNavigation != navigation) return;
+    self.preparedWebViewFonts = error == nil;
+    self.failedWebViewFontPreparation = error != nil;
+    self.fontWarmupNavigation = nil;
+    if (self.fontWarmupStarted > 0) {
+        [ReaderPerformance finish:error ? @"detail.font_bootstrap_failed" : @"detail.font_bootstrap" since:self.fontWarmupStarted];
+        if (error) {
+            NSString *domain = [error.domain isEqualToString:WKErrorDomain] ? @"webkit" :
+                               [error.domain isEqualToString:NSURLErrorDomain] ? @"url" : @"other";
+            NSString *metric = [NSString stringWithFormat:@"detail.font_bootstrap_error.%@.%ld", domain, (long)error.code];
+            [ReaderPerformance finish:metric since:self.fontWarmupStarted];
+        }
+    }
     [self loadStory];
 }
 
+- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] navigationFailed page=%p hash=%@ provisional=0 currentWeb=%d storyNavigation=%d preparing=%d gen=%lu error=%@", self, self.activeStoryId, webView == self.webView, navigation == self.storyNavigation, self.preparingStoryPresentation, (unsigned long)self.storyLoadGeneration, error);
+    [self finishFontPreparationForWebView:webView navigation:navigation error:error];
+    if (webView == self.webView && navigation == self.storyNavigation &&
+        [self isCurrentStoryLoad:self.storyLoadGeneration]) {
+        [self.appDelegate.storyPagesViewController storyDetailCouldNotPrepareForPresentation:(StoryDetailViewController *)self];
+        [self invalidateStoryLoad];
+        self.hasStory = NO;
+    }
+}
+
+- (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] navigationFailed page=%p hash=%@ provisional=1 currentWeb=%d storyNavigation=%d preparing=%d gen=%lu error=%@", self, self.activeStoryId, webView == self.webView, navigation == self.storyNavigation, self.preparingStoryPresentation, (unsigned long)self.storyLoadGeneration, error);
+    [self finishFontPreparationForWebView:webView navigation:navigation error:error];
+    if (webView == self.webView && navigation == self.storyNavigation &&
+        [self isCurrentStoryLoad:self.storyLoadGeneration]) {
+        [self.appDelegate.storyPagesViewController storyDetailCouldNotPrepareForPresentation:(StoryDetailViewController *)self];
+        [self invalidateStoryLoad];
+        self.hasStory = NO;
+    }
+}
+
 - (void)loadStory {
+    if (self.fontWarmupNavigation) {
+        NSUInteger generation = self.storyLoadGeneration;
+        if (self.fullStoryHTML && [self isCurrentStoryLoad:generation] && self.fontPreparationWaitGeneration != generation) {
+            // StoryDetailObjCViewController.m bounds an article's wait; idle cold-process startup can finish later.
+            self.fontPreparationWaitGeneration = generation;
+            WKNavigation *navigation = self.fontWarmupNavigation;
+            WKWebView *preparingWebView = self.webView;
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([self fontPreparationTimeout] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (![weakSelf isCurrentStoryLoad:generation] || !weakSelf.fullStoryHTML) return;
+                [weakSelf finishFontPreparationForWebView:preparingWebView navigation:navigation
+                                                   error:[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil]];
+            });
+        }
+        return;
+    }
     if (!self.fullStoryHTML)
         return; // if we're loading anything other than a full story, the view will be hidden
-    
-    NSLog(@"📚 loaded: %@", self.activeStory[@"story_title"]);  // log
+
+    NSUInteger generation = self.storyLoadGeneration;
+    if (![self isCurrentStoryLoad:generation]) return;
+    if (self.failedWebViewFontPreparation && self.fallbackStoryHeaderHTML) {
+        NSString *header = self.fallbackStoryHeaderHTML;
+        self.fallbackStoryHeaderHTML = nil;
+        [self loadHTMLString:header];
+        // StoryDetailObjCViewController.m retains its previous two-stage recovery if local font preparation fails.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if ([self isCurrentStoryLoad:generation]) [self loadStory];
+        });
+        return;
+    }
+    self.fallbackStoryHeaderHTML = nil;
     
     [self.activityIndicator stopAnimating];
     
-    self.webView.scrollView.scrollEnabled = self.appDelegate.detailViewController.isPhone || !self.appDelegate.detailViewController.storyTitlesInGrid;
-    
-    [self loadHTMLString:self.fullStoryHTML];
+    [self deferredEnableScrolling];
+
+    self.lastWidthClassKey = nil; // Force viewport update after full HTML load
+    NSString *html = self.fullStoryHTML;
     self.fullStoryHTML = nil;
     self.hasStory = YES;
+    [self loadHTMLString:html];
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] loadStory page=%p hash=%@ gen=%lu", self, self.activeStoryId, (unsigned long)self.storyLoadGeneration);
     
     [MBProgressHUD hideHUDForView:self.view animated:YES];
     
@@ -2030,32 +3183,197 @@
         self.activeStoryId) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, .15 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{
+                           if (![self isCurrentStoryLoad:generation] || !self.hasStory) return;
                            [self checkTryFeedStory];
                        });
     }
     
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NSLog(@"📚 showing webview for: %@; %@ current page", self.activeStory[@"story_title"], self == self.appDelegate.storyPagesViewController.currentPage ? @"is" : @"isn't");  // log
-        
-        self.webView.hidden = NO;
-        [self.webView setNeedsDisplay];
-        
-        if (self == self.appDelegate.storyPagesViewController.currentPage && !self.appDelegate.detailViewController.isPhone && self.appDelegate.detailViewController.storyTitlesInGrid) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-//                [self.appDelegate.feedDetailViewController changedStoryHeight:self.webView.scrollView.contentSize.height];
-                [self.appDelegate.feedDetailViewController reload];
-            });
+}
+
+- (NSTimeInterval)fontPreparationTimeout {
+    // StoryDetailObjCViewController.m gives an article one second of bundled-font preparation before falling back.
+    return 1.0;
+}
+
+- (void)revealCurrentStory {
+    NSUInteger generation = self.storyLoadGeneration;
+    if (![self isCurrentStoryLoad:generation] || !self.hasStory) return;
+    self.webView.hidden = NO;
+    [self.webView setNeedsDisplay];
+
+    // Initialize content inset for edge-to-edge layout
+    [self updateContentInsetForNavigationBarAlpha:self.appDelegate.storyPagesViewController.navigationBarFadeAlpha];
+
+    // Adjust initial scroll position for hidden toolbar. After setting the
+    // inset, the scroll view rests at -contentInset.top (full toolbar space).
+    // If the toolbar is partially/fully hidden, scroll down to fill the gap.
+    StoryPagesObjCViewController *pagesVC = self.appDelegate.storyPagesViewController;
+    if (pagesVC.isCustomToolbarActive) {
+        CGFloat toolbarOffset = pagesVC.toolbarScrollHandler.toolbarOffset;
+        if (toolbarOffset > 0 && !self.restoredStoryScrollPosition && !self.hasScrolledAwayFromTop) {
+            UIScrollView *sv = self.webView.scrollView;
+            CGFloat topRest = -sv.contentInset.top;
+            sv.contentOffset = CGPointMake(sv.contentOffset.x, topRest + toolbarOffset);
         }
-    });
+    }
+
+    if (self == self.appDelegate.storyPagesViewController.currentPage && !self.appDelegate.detailViewController.isPhoneOrCompact && self.appDelegate.detailViewController.storyTitlesInGridView) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (![self isCurrentStoryLoad:generation] || !self.hasStory) return;
+//                [self.appDelegate.feedDetailViewController changedStoryHeight:self.webView.scrollView.contentSize.height];
+            [self.appDelegate.feedDetailViewController reload];
+        });
+    }
+}
+
+- (void)receiveStoryReadyMessage:(WKScriptMessage *)message {
+    if (message.webView != self.webView || !message.frameInfo.isMainFrame ||
+        ![message.name isEqualToString:@"newsblurStoryReady"] ||
+        ![message.body isKindOfClass:NSString.class] || !self.hasStory ||
+        ![self isCurrentStoryLoad:self.storyLoadGeneration]) return;
+    NSString *expectedLoadId = [NSString stringWithFormat:@"%lu", (unsigned long)self.storyLoadGeneration];
+    if (![message.body isEqualToString:expectedLoadId]) return;
+    [self webViewNotifyLoaded];
+}
+
+- (BOOL)isCurrentStoryImageLoad:(NSString *)loadID {
+    return self.hasStory && [self isCurrentStoryLoad:self.storyLoadGeneration] &&
+        [loadID isEqualToString:[NSString stringWithFormat:@"%lu", (unsigned long)self.storyLoadGeneration]];
 }
 
 - (void)webViewNotifyLoaded {
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] notify page=%p hash=%@ gen=%lu ready=%lu has=%d current=%d", self, self.activeStoryId, (unsigned long)self.storyLoadGeneration, (unsigned long)self.readyStoryLoadGeneration, self.hasStory, [self isCurrentStoryLoad:self.storyLoadGeneration]);
+    if (!self.hasStory || ![self isCurrentStoryLoad:self.storyLoadGeneration] ||
+        self.readyStoryLoadGeneration == self.storyLoadGeneration) return;
+    self.readyStoryLoadGeneration = self.storyLoadGeneration;
+    // StoryDetailObjCViewController.m also sizes ready content before slow subresources trigger didFinishNavigation.
+    self.lastWidthClassKey = nil;
+    [self revealCurrentStory];
+    [self changeWebViewWidth];
     [self scrollToLastPosition:YES];
+    [self applyClassifierHighlights];
+    if ([self isKindOfClass:StoryDetailViewController.class]) {
+        // Listen/ListenStoryBridge.swift maps the story's paragraphs for follow-along when it's being read aloud.
+        [(StoryDetailViewController *)self listenStoryDidLoad];
+    }
+    [self finishPreparingStoryPresentation];
+}
+
+- (void)prepareCurrentStoryForPresentation {
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] current page=%p hash=%@ gen=%lu ready=%lu has=%d hidden=%d current=%d", self, self.activeStoryId, (unsigned long)self.storyLoadGeneration, (unsigned long)self.readyStoryLoadGeneration, self.hasStory, self.webView.hidden, [self isCurrentStoryLoad:self.storyLoadGeneration]);
+    self.preparingStoryPresentation = YES;
+    self.readyForPresentation = NO;
+    self.presentationLayoutGeneration++;
+    self.checkingPresentationLayout = NO;
+    if (self.readyStoryLoadGeneration == self.storyLoadGeneration && self.hasStory) {
+        [self revealCurrentStory];
+        [self changeWebViewWidth];
+        [self finishPreparingStoryPresentation];
+    }
+}
+
+- (void)beginStoryPresentationFade {
+    // StoryDetailObjCViewController.m keeps the complete HTML header and body invisible until their shared paint gate.
+    self.fadesPreparedStory = YES;
+    [self.webView.layer removeAllAnimations];
+    self.webView.alpha = 0;
+    self.webView.accessibilityElementsHidden = YES;
+}
+
+- (void)cancelStoryPresentationFade {
+    if (!self.fadesPreparedStory) return;
+    self.webView.hidden = YES;
+    [self invalidateStoryLoad];
+    [self cancelStoryPresentationFadePreservingStory];
+}
+
+- (void)cancelStoryPresentationFadePreservingStory {
+    // StoryDetailObjCViewController.m cancels only the entrance animation for a page swipe; its pending document still becomes readable.
+    self.fadesPreparedStory = NO;
+    [self.webView.layer removeAllAnimations];
+    self.webView.alpha = 1;
+    self.webView.accessibilityElementsHidden = NO;
+}
+
+- (void)finishStoryPresentation {
+    self.preparingStoryPresentation = NO;
+    if (!self.fadesPreparedStory || !self.readyForPresentation) return;
+    self.fadesPreparedStory = NO;
+    self.webView.accessibilityElementsHidden = NO;
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] fadePreparedStory hash=%@ page=%p gen=%lu", self.activeStoryId, self, (unsigned long)self.storyLoadGeneration);
+    // StoryDetailObjCViewController.m reveals only the finished document; native reader controls are already usable.
+    [UIView animateWithDuration:UIAccessibilityIsReduceMotionEnabled() ? 0 : .14
+                          delay:0 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{ self.webView.alpha = 1; } completion:nil];
+}
+
+- (void)finishPreparingStoryPresentation {
+    NSUInteger generation = self.storyLoadGeneration;
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] finish page=%p prepare=%d ready=%d checking=%d has=%d hidden=%d restoring=%d gen=%lu readygen=%lu current=%d", self, self.preparingStoryPresentation, self.readyForPresentation, self.checkingPresentationLayout, self.hasStory, self.webView.hidden, self.awaitingStoryScrollRestoration, (unsigned long)generation, (unsigned long)self.readyStoryLoadGeneration, [self isCurrentStoryLoad:generation]);
+    if (!self.preparingStoryPresentation || self.readyForPresentation || self.checkingPresentationLayout ||
+        !self.hasStory || self.webView.hidden || self.awaitingStoryScrollRestoration ||
+        self.readyStoryLoadGeneration != generation || ![self isCurrentStoryLoad:generation]) return;
+
+    [self.view layoutIfNeeded];
+    [self.webView layoutIfNeeded];
+    [self changeWebViewWidth];
+    CGSize size = self.webView.bounds.size;
+    UIEdgeInsets inset = self.webView.scrollView.adjustedContentInset;
+    CGPoint offset = self.webView.scrollView.contentOffset;
+    WKWebView *preparingWebView = self.webView;
+    NSUInteger layoutGeneration = self.presentationLayoutGeneration;
+    self.checkingPresentationLayout = YES;
+    __weak typeof(self) weakSelf = self;
+    // StoryDetailObjCViewController.m waits for rendering opportunities after the final native viewport and reading offset.
+    [preparingWebView callAsyncJavaScript:@"await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame); return document.querySelector('#NB-story') !== null;"
+                               arguments:nil inFrame:nil inContentWorld:WKContentWorld.pageWorld
+                       completionHandler:^(id result, NSError *error) {
+        if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] layoutFinished page=%p gen=%lu current=%d layoutGen=%lu/%lu result=%@ error=%@", weakSelf, (unsigned long)generation, [weakSelf isCurrentStoryLoad:generation], (unsigned long)layoutGeneration, (unsigned long)weakSelf.presentationLayoutGeneration, result, error);
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.webView != preparingWebView || ![strongSelf isCurrentStoryLoad:generation] ||
+            layoutGeneration != strongSelf.presentationLayoutGeneration) return;
+        strongSelf.checkingPresentationLayout = NO;
+        if (!strongSelf.preparingStoryPresentation) return;
+        if (error || ![result boolValue]) {
+            [strongSelf.appDelegate.storyPagesViewController storyDetailCouldNotPrepareForPresentation:(StoryDetailViewController *)strongSelf];
+            return;
+        }
+        if (!CGSizeEqualToSize(size, preparingWebView.bounds.size) ||
+            !UIEdgeInsetsEqualToEdgeInsets(inset, preparingWebView.scrollView.adjustedContentInset) ||
+            !CGPointEqualToPoint(offset, preparingWebView.scrollView.contentOffset)) {
+            [strongSelf finishPreparingStoryPresentation];
+            return;
+        }
+        strongSelf.readyForPresentation = YES;
+        [strongSelf.appDelegate.storyPagesViewController storyDetailReadyForPresentation:(StoryDetailViewController *)strongSelf];
+    }];
+}
+
+- (void)applyClassifierHighlights {
+    NSString *feedId = [NSString stringWithFormat:@"%@", [self.activeStory objectForKey:@"story_feed_id"]];
+    NSDictionary *feedClassifiers = [appDelegate.storiesCollection.activeClassifiers objectForKey:feedId];
+    NSDictionary *texts = [feedClassifiers objectForKey:@"texts"];
+    NSDictionary *textRegex = [feedClassifiers objectForKey:@"text_regex"];
+    if (!texts && !textRegex) return;
+
+    NSMutableDictionary *classifiers = [NSMutableDictionary dictionary];
+    if (texts) [classifiers setObject:texts forKey:@"texts"];
+    if (textRegex) [classifiers setObject:textRegex forKey:@"text_regex"];
+
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:classifiers options:0 error:nil];
+    NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    NSString *js = [NSString stringWithFormat:@"applyClassifierHighlights(%@)", jsonString];
+    [self.webView evaluateJavaScript:js completionHandler:nil];
 }
 
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
+    if (webView != self.webView) return;
+    if (ReaderPerformance.recordsUITestPresentation) NSLog(@"[ReaderPresentation] webProcessTerminated page=%p hash=%@ preparing=%d has=%d gen=%lu readygen=%lu", self, self.activeStoryId, self.preparingStoryPresentation, self.hasStory, (unsigned long)self.storyLoadGeneration, (unsigned long)self.readyStoryLoadGeneration);
     NSLog(@"Web content process did terminate: %@", webView);  // log
     
+    self.preparedWebViewFonts = NO;
+    self.failedWebViewFontPreparation = NO;
+    [self clearWebView];
     [self drawStory];
 }
 
@@ -2120,15 +3438,41 @@
     [self.webView evaluateJavaScript:jsString completionHandler:nil];
 }
 
+// StoryDetailObjCViewController.m applies an account language change to stories that are already open with the
+// same attributes drawStory writes, without reloading them.
+- (void)updateStoryDirection {
+    BOOL rightToLeft = NBLocalization.isRightToLeft;
+    NSString *jsString = [NSString stringWithFormat:@
+                          "(function(rightToLeft, language) {"
+                          "  var html = document.documentElement;"
+                          "  if (rightToLeft) { html.setAttribute('dir', 'rtl'); html.setAttribute('lang', language); }"
+                          "  else { html.removeAttribute('dir'); html.removeAttribute('lang'); }"
+                          "  var content = document.querySelectorAll('#NB-story, .NB-story-title, .NB-cluster-detail-title-text, .NB-story-comment-content, .NB-story-comment-reply-content');"
+                          "  for (var i = 0; i < content.length; i++) {"
+                          "    if (rightToLeft) { content[i].setAttribute('dir', 'auto'); } else { content[i].removeAttribute('dir'); }"
+                          "  }"
+                          "})(%@, %@);",
+                          rightToLeft ? @"true" : @"false",
+                          [self javaScriptStringFromString:NBLocalization.resolvedLanguage]];
+    [self.webView evaluateJavaScript:jsString completionHandler:nil];
+}
+
 - (void)updateStoryTheme {
-    self.view.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x111111);
+    self.view.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x000000);
 
-    NSString *jsString = [NSString stringWithFormat:@"document.getElementById('NB-theme-style').href='storyDetailView%@.css';",
-                          [ThemeManager themeManager].themeCSSSuffix];
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *themeSuffix = [ThemeManager themeManager].themeCSSSuffix;
+    NSString *themeCSSPath = [bundle pathForResource:[NSString stringWithFormat:@"storyDetailView%@", themeSuffix] ofType:@"css"];
+    NSString *themeCSS = themeCSSPath ? [NSString stringWithContentsOfFile:themeCSSPath encoding:NSUTF8StringEncoding error:nil] : @"";
+    themeCSS = [self embedResourcesInCSS:themeCSS bundle:bundle];
+    NSString *escapedThemeCSS = [self javaScriptStringFromString:themeCSS];
 
+    NSString *jsString = [NSString stringWithFormat:@"var theme = document.getElementById('NB-theme-style'); if (theme) { theme.textContent = %@; }",
+                escapedThemeCSS];
     [self.webView evaluateJavaScript:jsString completionHandler:nil];
 
-    self.webView.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x111111);
+    self.webView.backgroundColor = UIColorFromLightSepiaMediumDarkRGB(NEWSBLUR_WHITE_COLOR, 0xF3E2CB, 0x222222, 0x000000);
+    [self updateFeedTitleGradientPosition];
     
     if ([ThemeManager themeManager].isDarkTheme) {
         self.webView.scrollView.indicatorStyle = UIScrollViewIndicatorStyleWhite;
@@ -2137,12 +3481,30 @@
     }
 }
 
+- (NSString *)javaScriptStringFromString:(NSString *)string {
+    if (!string) {
+        return @"\"\"";
+    }
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@[string] options:0 error:nil];
+    if (!data) {
+        return @"\"\"";
+    }
+
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (json.length < 2) {
+        return @"\"\"";
+    }
+
+    return [json substringWithRange:NSMakeRange(1, json.length - 2)];
+}
+
 - (BOOL)canHideNavigationBar {
-    if (!appDelegate.storyPagesViewController.allowFullscreen) {
-//        NSLog(@"canHideNavigationBar: no, toggle is off");  // log
+    StoryPagesObjCViewController *pagesVC = appDelegate.storyPagesViewController;
+    if (!pagesVC.useCustomToolbar && !pagesVC.allowFullscreen) {
         return NO;
     }
-    
+
     return YES;
 }
 
@@ -2157,7 +3519,7 @@
 #pragma mark Actions
 
 - (void)toggleLikeComment:(BOOL)likeComment {
-    [appDelegate.storyPagesViewController showShareHUD:@"Favoriting"];
+    [appDelegate.storyPagesViewController showShareHUD:[NBLocalization text:@"Favoriting"]];
     NSString *urlString;
     if (likeComment) {
         urlString = [NSString stringWithFormat:@"%@/social/like_comment",
@@ -2248,6 +3610,49 @@
     }
 }
 
+- (void)openShareDialog:(int)x yCoordinate:(int)y width:(int)width height:(int)height {
+    CGRect frame = CGRectZero;
+    if (!self.isPhoneOrCompact) {
+        // only adjust for the bar if user is scrolling
+        if (appDelegate.storiesCollection.isRiverView ||
+            appDelegate.storiesCollection.isSocialView ||
+            appDelegate.storiesCollection.isSavedView ||
+            appDelegate.storiesCollection.isWidgetView ||
+            appDelegate.storiesCollection.isReadView) {
+            if (self.webView.scrollView.contentOffset.y == -20) {
+                y = y + 20;
+            }
+        } else {
+            if (self.webView.scrollView.contentOffset.y == -9) {
+                y = y + 9;
+            }
+        }
+
+        frame = CGRectMake(x, y, width, height);
+    }
+
+    // Find the active comment (same logic as openShareDialog)
+    NSArray *friendComments = [self.activeStory objectForKey:@"friend_comments"];
+    NSString *currentUserId = [NSString stringWithFormat:@"%@", [appDelegate.dictSocialProfile objectForKey:@"user_id"]];
+    for (int i = 0; i < friendComments.count; i++) {
+        NSString *userId = [NSString stringWithFormat:@"%@",
+                            [[friendComments objectAtIndex:i] objectForKey:@"user_id"]];
+        if([userId isEqualToString:currentUserId]){
+            appDelegate.activeComment = [friendComments objectAtIndex:i];
+            break;
+        } else {
+            appDelegate.activeComment = nil;
+        }
+    }
+
+    NSString *type = (appDelegate.activeComment == nil) ? @"share" : @"edit-share";
+    [appDelegate showShareView:type
+                     setUserId:nil
+                   setUsername:nil
+                    setReplyId:nil
+                    sourceRect:[NSValue valueWithCGRect:frame]];
+}
+
 - (void)openTrainingDialog:(int)x yCoordinate:(int)y width:(int)width height:(int)height {
     CGRect frame = CGRectZero;
     if (!self.isPhoneOrCompact) {
@@ -2320,53 +3725,6 @@
     return [tagName isKindOfClass:[NSString class]] && [tagName isEqualToString:tagValue];
 }
 
-- (void)tapImage:(UIGestureRecognizer *)gestureRecognizer {
-    CGPoint pt = [self pointForGesture:gestureRecognizer];
-    if (pt.x == CGPointZero.x && pt.y == CGPointZero.y) return;
-//    NSLog(@"Tapped point: %@", NSStringFromCGPoint(pt));
-    [webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'tagName');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *tagName, NSError *error) {
-        if ([self isTag:tagName equalTo:@"IMG"]) {
-            [self showImageMenu:pt];
-            [gestureRecognizer setEnabled:NO];
-            [gestureRecognizer setEnabled:YES];
-        }
-    }];
-}
-
-- (void)showImageMenu:(CGPoint)pt {
-    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'title');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *title, NSError *error) {
-        [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'alt');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *alt, NSError *error) {
-            [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'src');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *src, NSError * error) {
-                NSString *alertTitle = title.length ? title : alt;
-                self->activeLongPressUrl = [NSURL URLWithString:src];
-                
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:alertTitle.length ? alertTitle : nil
-                                                                               message:nil
-                                                                        preferredStyle:UIAlertControllerStyleActionSheet];
-                [alert addAction:[UIAlertAction actionWithTitle:@"View and zoom" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self.appDelegate showOriginalStory:self->activeLongPressUrl];
-                }]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"Copy image" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self fetchImage:self->activeLongPressUrl copy:YES save:NO];
-                }]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"Save to camera roll" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self fetchImage:self->activeLongPressUrl copy:NO save:YES];
-                }]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-                    
-                }]];
-                
-                [alert setModalPresentationStyle:UIModalPresentationPopover];
-                
-                UIPopoverPresentationController *popover = [alert popoverPresentationController];
-                popover.sourceRect = CGRectMake(pt.x, pt.y, 1, 1);
-                popover.sourceView = self.appDelegate.storyPagesViewController.view;
-                [self presentViewController:alert animated:YES completion:nil];
-            }];
-        }];
-    }];
-}
-
 - (void)showLinkContextMenu:(CGPoint)pt {
     [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'href');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *href, NSError *error) {
         [self.webView evaluateJavaScript:[NSString stringWithFormat:@"linkAt(%li, %li, 'innerText');", (long)pt.x,(long)pt.y] completionHandler:^(NSString *title, NSError *error) {
@@ -2411,37 +3769,39 @@
     return pt;
 }
 
-- (void)fetchImage:(NSURL *)url copy:(BOOL)copy save:(BOOL)save {
-    [MBProgressHUD hideHUDForView:self.webView animated:YES];
-    [appDelegate.storyPagesViewController showShareHUD:copy ?
-                                               @"Copying..." : @"Saving..."];
+- (void)previewImage:(NSURL *)url {
+    [self hideHUDAnimated:YES];
+    [appDelegate.storyPagesViewController showShareHUD:[NBLocalization text:@"Previewing..."]];
     
     AFHTTPSessionManager *manager = [AFHTTPSessionManager manager];
     [manager setResponseSerializer:[AFImageResponseSerializer serializer]];
     [manager GET:url.absoluteString parameters:nil progress:nil success:^(NSURLSessionDataTask * _Nonnull task, id  _Nullable responseObject) {
         UIImage *image = responseObject;
-        if (copy) {
-            [UIPasteboard generalPasteboard].image = image;
-            [self flashCheckmarkHud:@"copied"];
-        } else if (save) {
-            [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-                PHAssetChangeRequest *changeRequest = [PHAssetChangeRequest creationRequestForAssetFromImage:image];
-                changeRequest.creationDate = [NSDate date];
-            } completionHandler:^(BOOL success, NSError * _Nullable error) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (success) {
-                        [self flashCheckmarkHud:@"saved"];
-                    } else {
-                        [MBProgressHUD hideHUDForView:self.webView animated:NO];
-                        [self informError:error];
-                    }
-                });
-            }];
+        
+        if (self != self.appDelegate.storyPagesViewController.currentPage) {
+            [self hideHUDAnimated:YES];
+            return;
+        }
+        
+        PreviewViewController *previewViewController = [PreviewViewController new];
+        
+        if ([previewViewController saveImage:image withFilename:url.URLByDeletingPathExtension.lastPathComponent]) {
+            [self hideHUDAnimated:YES];
+            [self presentViewController:previewViewController animated:YES completion:nil];
+        } else {
+            [self hideHUDAnimated:YES];
+            [self informError:@"Could not preview image"];
         }
     } failure:^(NSURLSessionDataTask * _Nullable task, NSError * _Nonnull error) {
-        [MBProgressHUD hideHUDForView:self.webView animated:YES];
+        [self hideHUDAnimated:YES];
         [self informError:@"Could not fetch image"];
     }];
+}
+
+- (void)hideHUDAnimated:(BOOL)animated {
+    [MBProgressHUD hideHUDForView:self.webView animated:animated];
+    [MBProgressHUD hideHUDForView:self.appDelegate.storyPagesViewController.view animated:animated];
+    [MBProgressHUD hideHUDForView:self.appDelegate.storyPagesViewController.currentPage.view animated:animated];
 }
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
@@ -2456,7 +3816,7 @@
 # pragma mark Subscribing to blurblog
 
 - (void)subscribeToBlurblog {
-    [appDelegate.storyPagesViewController showShareHUD:@"Following"];
+    [appDelegate.storyPagesViewController showShareHUD:[NBLocalization text:@"Following" context:@"in progress"]];
     NSString *urlString = [NSString stringWithFormat:@"%@/social/follow",
                      self.appDelegate.url];
     NSMutableDictionary *params = [NSMutableDictionary dictionary];
@@ -2478,7 +3838,7 @@
     self.storyHUD.customView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"37x-Checkmark.png"]];
     self.storyHUD.mode = MBProgressHUDModeCustomView;
     self.storyHUD.removeFromSuperViewOnHide = YES;  
-    self.storyHUD.labelText = @"Followed";
+    self.storyHUD.labelText = [NBLocalization text:@"Followed"];
     [self.storyHUD hide:YES afterDelay:1];
     appDelegate.storyPagesViewController.navigationItem.leftBarButtonItem = nil;
     [appDelegate reloadFeedsView:NO];
@@ -2532,29 +3892,29 @@
     self.storyHUD.removeFromSuperViewOnHide = YES;
     
     if ([messageType isEqualToString:@"reply"]) {
-        self.storyHUD.labelText = @"Replied";
+        self.storyHUD.labelText = [NBLocalization text:@"Replied"];
     } else if ([messageType isEqualToString:@"edit-reply"]) {
-        self.storyHUD.labelText = @"Edited Reply";
+        self.storyHUD.labelText = [NBLocalization text:@"Edited Reply"];
     } else if ([messageType isEqualToString:@"edit-share"]) {
-        self.storyHUD.labelText = @"Edited Comment";
+        self.storyHUD.labelText = [NBLocalization text:@"Edited Comment"];
     } else if ([messageType isEqualToString:@"share"]) {
-        self.storyHUD.labelText = @"Shared";
+        self.storyHUD.labelText = [NBLocalization text:@"Shared"];
     } else if ([messageType isEqualToString:@"like-comment"]) {
-        self.storyHUD.labelText = @"Favorited";
+        self.storyHUD.labelText = [NBLocalization text:@"Favorited"];
     } else if ([messageType isEqualToString:@"unlike-comment"]) {
-        self.storyHUD.labelText = @"Unfavorited";
+        self.storyHUD.labelText = [NBLocalization text:@"Unfavorited"];
     } else if ([messageType isEqualToString:@"saved"]) {
-        self.storyHUD.labelText = @"Saved";
+        self.storyHUD.labelText = [NBLocalization text:@"Saved"];
     } else if ([messageType isEqualToString:@"unsaved"]) {
-        self.storyHUD.labelText = @"No longer saved";
+        self.storyHUD.labelText = [NBLocalization text:@"No longer saved"];
     } else if ([messageType isEqualToString:@"unread"]) {
-        self.storyHUD.labelText = @"Unread";
+        self.storyHUD.labelText = [NBLocalization text:@"Unread"];
     } else if ([messageType isEqualToString:@"added"]) {
-        self.storyHUD.labelText = @"Added";
+        self.storyHUD.labelText = [NBLocalization text:@"Added"];
     } else if ([messageType isEqualToString:@"copied"]) {
-        self.storyHUD.labelText = @"Copied";
+        self.storyHUD.labelText = [NBLocalization text:@"Copied"];
     } else if ([messageType isEqualToString:@"saved"]) {
-        self.storyHUD.labelText = @"Saved";
+        self.storyHUD.labelText = [NBLocalization text:@"Saved"];
     }
     [self.storyHUD hide:YES afterDelay:1];
 }
@@ -2571,20 +3931,41 @@
 }
 
 - (void)tryScrollingDown:(BOOL)down {
+    StoryPagesViewController *pages = appDelegate.storyPagesViewController;
+    if (!self.hasStory || self.pageIndex < 0 || !webView || webView.loading ||
+        (pages.currentPage && pages.currentPage != self)) return;
+
     UIScrollView *scrollView = webView.scrollView;
     CGPoint contentOffset = scrollView.contentOffset;
-    CGFloat frameHeight = scrollView.frame.size.height;
-    CGFloat scrollHeight = frameHeight - 45; // ~height of source bar and buttons
-    if (down) {
-        CGSize contentSize = scrollView.contentSize;
-        if (contentOffset.y + frameHeight == contentSize.height)
-            return;
-        contentOffset.y = MIN(contentOffset.y + scrollHeight, contentSize.height - frameHeight);
-    } else {
-        if (contentOffset.y <= 0)
-            return;
-        contentOffset.y = MAX(contentOffset.y - scrollHeight, 0);
+    UIEdgeInsets insets = scrollView.adjustedContentInset;
+    CGFloat viewportHeight = scrollView.bounds.size.height - insets.top - insets.bottom;
+    CGFloat contentHeight = scrollView.contentSize.height;
+    if (!isfinite(viewportHeight) || viewportHeight <= 0 ||
+        !isfinite(contentHeight) || contentHeight <= 0 || !isfinite(contentOffset.y)) return;
+
+    CGFloat top = -insets.top;
+    CGFloat bottom = MAX(top, contentHeight - scrollView.bounds.size.height + insets.bottom);
+    // StoryDetailObjCViewController.m checks the starting position so the final screen remains readable before advancing.
+    CGFloat boundaryTolerance = 0.5;
+    if (down && contentOffset.y >= bottom - boundaryTolerance) {
+        [pages doNextUnreadStory:nil];
+        return;
+    } else if (!down && contentOffset.y <= top + boundaryTolerance) {
+        [pages changeToPreviousPage:nil];
+        return;
     }
+
+    id preference = [[NSUserDefaults standardUserDefaults] objectForKey:@"space_scroll_spacing"];
+    double percentage = [preference respondsToSelector:@selector(doubleValue)] ? [preference doubleValue] : 40;
+    if (!isfinite(percentage) || percentage < 10 || percentage > 100) percentage = 40;
+    CGFloat scrollHeight = viewportHeight * percentage / 100.0;
+    contentOffset.y = MIN(bottom, MAX(top, contentOffset.y + (down ? scrollHeight : -scrollHeight)));
+    if (CGPointEqualToPoint(contentOffset, scrollView.contentOffset)) return;
+    // StoryDetailObjCViewController.m treats keyboard paging as user activity, including while a saved-position query is pending.
+    self.storyScrollActivityGeneration++;
+    self.awaitingStoryScrollRestoration = NO;
+    hasScrolled = YES;
+    if (contentOffset.y > top) self.hasScrolledAwayFromTop = YES;
     [scrollView setContentOffset:contentOffset animated:YES];
 }
 
@@ -2603,6 +3984,7 @@
 }
 
 - (void)changeWebViewWidth {
+    if ([appDelegate.storyPagesViewController hasHiddenReaderAncestor]) return;
     // Don't do this in the background, to avoid scrolling to the top unnecessarily
     if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
         return;
@@ -2610,14 +3992,15 @@
     
 //    NSLog(@"changeWebViewWidth: %@ / %@ / %@", NSStringFromCGSize(self.view.bounds.size), NSStringFromCGSize(webView.scrollView.bounds.size), NSStringFromCGSize(webView.scrollView.contentSize));
 
-    NSInteger contentWidth = CGRectGetWidth(webView.scrollView.bounds);
+    NSInteger contentWidth = [self storyContentWidth];
     NSString *contentWidthClass;
+    NSString *baseWidthClass;
 
 #if TARGET_OS_MACCATALYST
     // CATALYST: probably will want to add custom CSS for Macs.
     contentWidthClass = @"NB-mac NB-ipad-pro-12-wide";
 #else
-    UIInterfaceOrientation orientation = self.view.window.windowScene.interfaceOrientation;
+    UIInterfaceOrientation orientation = (self.view.window ?: self.webView.window).windowScene.interfaceOrientation;
     
     if (UIInterfaceOrientationIsLandscape(orientation) && !self.isPhoneOrCompact) {
         if (iPadPro12) {
@@ -2642,8 +4025,13 @@
     }
 #endif
     
-    contentWidthClass = [NSString stringWithFormat:@"%@ NB-width-%d",
-                         contentWidthClass, (int)floorf(CGRectGetWidth(webView.scrollView.bounds))];
+    // StoryDetailObjCViewController.m includes toolbar placement in the width cache so folding also updates footer spacing.
+    if (appDelegate.storyPagesViewController.usesVerticalReaderToolbar) {
+        contentWidthClass = [contentWidthClass stringByAppendingString:@" NB-vertical-reader-toolbar"];
+    }
+    baseWidthClass = contentWidthClass;
+    contentWidthClass = [NSString stringWithFormat:@"%@ NB-width-%ld",
+                         contentWidthClass, (long)contentWidth];
     
     NSString *alternateViewClass = @"";
     if (!self.isPhoneOrCompact) {
@@ -2654,19 +4042,30 @@
         }
     }
     
-    NSLog(@"📚 changeWebViewWidth: content width class: %@", contentWidthClass);  // log
-    
     NSString *riverClass = (appDelegate.storiesCollection.isRiverView ||
                             appDelegate.storiesCollection.isSocialView ||
                             appDelegate.storiesCollection.isSavedView ||
                             appDelegate.storiesCollection.isWidgetView ||
                             appDelegate.storiesCollection.isReadView) ?
                             @"NB-river" : @"NB-non-river";
-    
+
+    NSString *widthClassKey = [NSString stringWithFormat:@"%@|%@|%@|%ld",
+                               baseWidthClass,
+                               alternateViewClass,
+                               riverClass,
+                               (long)contentWidth];
+    if ([widthClassKey isEqualToString:self.lastWidthClassKey]) {
+        return;
+    }
+    self.lastWidthClassKey = widthClassKey;
+
     NSString *jsString = [[NSString alloc] initWithFormat:
-                          @"$('body').attr('class', '%@ %@ %@');"
-                          "document.getElementById(\"viewport\").setAttribute(\"content\", \"width=%li;initial-scale=1; minimum-scale=1.0; maximum-scale=1.0; user-scalable=0;\");",
-                          contentWidthClass,
+                          @"var w = %li;"
+                          "if (document.body) { document.body.className = '%@ %@ %@ NB-width-' + w; }"
+                          "var viewport = document.getElementById('viewport');"
+                          "if (viewport) { viewport.setAttribute('content', 'width=%li, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no'); }",
+                          (long)contentWidth,
+                          baseWidthClass,
                           alternateViewClass,
                           riverClass,
                           (long)contentWidth];
@@ -2676,22 +4075,34 @@
 - (void)refreshHeader {
     NSString *headerString = [[[self getHeader] stringByReplacingOccurrencesOfString:@"\'" withString:@"\\'"]
                               stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
-    NSString *jsString = [NSString stringWithFormat:@"document.getElementById('NB-header-container').innerHTML = '%@';",
+    NSString *jsString = [NSString stringWithFormat:@"var el = document.getElementById('NB-header-container'); if (el) { el.innerHTML = '%@'; }",
                           headerString];
     
     [self.webView evaluateJavaScript:jsString completionHandler:^(id result, NSError *error) {
-        [self.webView evaluateJavaScript:@"attachFastClick();" completionHandler:nil];
+        [self refreshClusterStories];
+    }];
+}
+
+- (void)refreshClusterStories {
+    NSString *clusterStoriesString = [[[self clusterStoriesHTML] stringByReplacingOccurrencesOfString:@"\'" withString:@"\\'"]
+                                      stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    NSString *jsString = [NSString stringWithFormat:@"var el = document.getElementById('NB-cluster-stories-container'); if (el) { el.innerHTML = '%@'; }",
+                          clusterStoriesString];
+
+    [self.webView evaluateJavaScript:jsString completionHandler:^(id result, NSError *error) {
+        [self.webView evaluateJavaScript:@"if (typeof attachFastClick === 'function') { attachFastClick(); }" completionHandler:nil];
+        [self applyClassifierHighlights];
     }];
 }
 
 - (void)refreshSideOptions {
     NSString *sideOptionsString = [[[self getSideOptions] stringByReplacingOccurrencesOfString:@"\'" withString:@"\\'"]
                               stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
-    NSString *jsString = [NSString stringWithFormat:@"document.getElementById('NB-sideoptions-container').innerHTML = '%@';",
+    NSString *jsString = [NSString stringWithFormat:@"var el = document.getElementById('NB-sideoptions-container'); if (el) { el.innerHTML = '%@'; }",
                           sideOptionsString];
     
     [self.webView evaluateJavaScript:jsString completionHandler:^(id result, NSError *error) {
-        [self.webView evaluateJavaScript:@"attachFastClick();" completionHandler:nil];
+        [self.webView evaluateJavaScript:@"if (typeof attachFastClick === 'function') { attachFastClick(); }" completionHandler:nil];
     }];
 }
 
@@ -2699,6 +4110,13 @@
 #pragma mark Text view
 
 - (void)showTextOrStoryView {
+    if ([self.activeStory[@"is_daily_briefing_summary"] boolValue]) {
+        if (self.inTextView) {
+            [self showStoryView];
+        }
+        return;
+    }
+
     NSString *feedIdStr = [NSString stringWithFormat:@"%@",
                            [self.activeStory objectForKey:@"story_feed_id"]];
     if ([appDelegate isFeedInTextView:feedIdStr]) {
@@ -2713,6 +4131,11 @@
 }
 
 - (void)toggleTextView:(id)sender {
+    if ([self.activeStory[@"is_daily_briefing_summary"] boolValue]) {
+        [self showStoryView];
+        return;
+    }
+
     if (self.inTextView)
         [self showStoryView];
     else
@@ -2728,6 +4151,10 @@
 
 - (void)fetchTextView {
     if (!self.activeStoryId || !self.activeStory) return;
+    if ([self.activeStory[@"is_daily_briefing_summary"] boolValue]) {
+        [self showStoryView];
+        return;
+    }
     self.inTextView = YES;
 //    NSLog(@"Fetching Text: %@", [self.activeStory objectForKey:@"story_title"]);
     if (self.activeStory == appDelegate.storyPagesViewController.currentPage.activeStory) {

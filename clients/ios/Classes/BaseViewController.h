@@ -12,11 +12,16 @@
 @property (nonatomic, readonly) BOOL isPhone;
 @property (nonatomic, readonly) BOOL isMac;
 @property (nonatomic, readonly) BOOL isVision;
+@property (nonatomic, readonly) BOOL isOS26OrLater;
 @property (nonatomic, readonly) BOOL isPortrait;
 @property (nonatomic, readonly) BOOL isCompactWidth;
 @property (nonatomic, readonly) BOOL isGrid;
+@property (nonatomic, readonly) BOOL isGridView;
+@property (nonatomic, readonly) BOOL isDashboard;
+@property (nonatomic, readonly) BOOL fromDashboardStory;
 @property (nonatomic, readonly) BOOL isFeedShown;
 @property (nonatomic, readonly) BOOL isStoryShown;
+- (BOOL)readerKeyboardContextAvailable;
 
 - (void)informError:(id)error;
 - (void)informError:(id)error statusCode:(NSInteger)statusCode;
@@ -57,6 +62,8 @@
 
 - (IBAction)chooseColumns:(id)sender;
 - (IBAction)chooseLayout:(id)sender;
+- (IBAction)chooseIntelligence:(id)sender;
+- (IBAction)chooseDashboard:(id)sender;
 - (IBAction)chooseTitle:(id)sender;
 - (IBAction)choosePreview:(id)sender;
 - (IBAction)chooseGridColumns:(id)sender;
@@ -64,11 +71,16 @@
 - (IBAction)chooseFontSize:(id)sender;
 - (IBAction)chooseSpacing:(id)sender;
 - (IBAction)chooseTheme:(id)sender;
+- (IBAction)toggleFeeds:(id)sender;
+- (IBAction)toggleTemporaryFullScreen:(id)sender;
+- (IBAction)hideStoryTitlesSidebar:(id)sender;
+- (IBAction)showStoryTitlesSidebar:(id)sender;
 
 - (IBAction)moveSite:(id)sender;
 - (IBAction)openRenameSite:(id)sender;
 - (IBAction)muteSite:(id)sender;
 - (IBAction)deleteSite:(id)sender;
+- (IBAction)chooseMarkRead:(id)sender;
 - (IBAction)openTrainSite:(id)sender;
 - (IBAction)openNotifications:(id)sender;
 - (IBAction)openStatistics:(id)sender;
@@ -80,16 +92,20 @@
 - (IBAction)previousSite:(id)sender;
 - (IBAction)nextFolder:(id)sender;
 - (IBAction)previousFolder:(id)sender;
+- (IBAction)openDashboard:(id)sender;
 - (IBAction)openAllStories:(id)sender;
 
 - (IBAction)showSendTo:(id)sender;
 - (IBAction)showTrain:(id)sender;
 - (IBAction)showShare:(id)sender;
+- (IBAction)toggleListen:(id)sender;
+- (IBAction)toggleListenPlayback:(id)sender;
+- (IBAction)toggleListenQueue:(id)sender;
 - (IBAction)nextUnreadStory:(id)sender;
 - (IBAction)nextStory:(id)sender;
 - (IBAction)previousStory:(id)sender;
 - (IBAction)toggleTextStory:(id)sender;
 - (IBAction)openInBrowser:(id)sender;
+- (IBAction)showKeyboardShortcuts:(id)sender;
 
 @end
-

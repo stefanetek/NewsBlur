@@ -1,0 +1,484 @@
+"""Briefing tasks: generate and deliver personalized email briefings on schedule."""
+
+import datetime
+
+from django.contrib.auth.models import User
+from django.db.models import Q
+
+from newsblur_web.celeryapp import app
+from utils import log as logging
+
+
+@app.task(name="generate-briefings", time_limit=600)
+def GenerateBriefings():
+    """
+    Periodic task that runs every minute.
+    Finds users who need a briefing generated and dispatches per-user tasks.
+    """
+    import pytz
+    import redis
+    from django.conf import settings
+
+    from apps.briefing.models import MBriefing, MBriefingPreferences
+    from apps.profile.models import Profile
+
+    # tasks.py: Distributed lock — multiple celery beat schedulers (one per htask-work
+    # server) fire this task concurrently. Only one instance should run per 1-min cycle.
+    # TTL of 50 seconds (just under the 1-min schedule) ensures the lock persists for
+    # the entire interval. We intentionally do NOT delete the lock on completion — the
+    # task finishes in ~0.1s, and deleting would let later beat tasks acquire the lock.
+    r = redis.Redis(connection_pool=settings.REDIS_PUBSUB_POOL)
+    lock_key = "briefing:generate_all_lock"
+    if not r.set(lock_key, "1", nx=True, ex=50):
+        logging.debug(" ---> GenerateBriefings: another instance is running, skipping")
+        return
+
+    DAY_NAME_TO_WEEKDAY = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    # tasks.py: Fixed delivery times for each slot (user's local timezone)
+    SLOT_TIMES = {"morning": (8, 30), "afternoon": (12, 30), "evening": (17, 0)}
+    DEFAULT_SLOT = "morning"
+
+    now = datetime.datetime.utcnow()
+
+    eligible_profiles = Profile.objects.filter(
+        Q(is_archive=True) | Q(is_pro=True),
+    ).select_related("user")
+
+    dispatched = 0
+    skipped = 0
+
+    for profile in eligible_profiles:
+        user = profile.user
+
+        prefs = MBriefingPreferences.get_or_create(user.pk)
+        if not prefs.enabled:
+            skipped += 1
+            continue
+
+        try:
+            tz = pytz.timezone(str(profile.timezone))
+        except Exception:
+            tz = pytz.utc
+        local_now = datetime.datetime.now(tz)
+
+        # tasks.py: Compute generation_time (UTC, naive) — 5 min before preferred delivery.
+        # Parse preferred_time "HH:MM" to determine slot, default to morning (8:30 AM).
+        TIME_TO_SLOT = {"08:30": "morning", "12:30": "afternoon", "13:00": "afternoon", "17:00": "evening"}
+        slot = TIME_TO_SLOT.get(prefs.preferred_time, DEFAULT_SLOT)
+        # tasks.py: For twice_daily, preferred_time stores the second slot.
+        # If it resolves to "morning" (legacy bug), default to "afternoon" instead.
+        if prefs.frequency == "twice_daily" and slot == "morning":
+            slot = "afternoon"
+        hour, minute = SLOT_TIMES[slot]
+        local_target = tz.localize(datetime.datetime.combine(local_now.date(), datetime.time(hour, minute)))
+        generation_time = (
+            (local_target - datetime.timedelta(minutes=5)).astimezone(pytz.utc).replace(tzinfo=None)
+        )
+
+        # tasks.py: For twice_daily, preferred_time is the second slot (afternoon or evening).
+        # The morning slot always fires at 8 AM local. Check both windows independently
+        # so the morning run isn't blocked by a later preferred_time.
+        if prefs.frequency == "twice_daily":
+            morning_hour, morning_minute = SLOT_TIMES["morning"]
+            morning_local = tz.localize(
+                datetime.datetime.combine(local_now.date(), datetime.time(morning_hour, morning_minute))
+            )
+            morning_gen_utc = (
+                (morning_local - datetime.timedelta(minutes=5)).astimezone(pytz.utc).replace(tzinfo=None)
+            )
+            is_morning_window = now >= morning_gen_utc and local_now.hour < 15
+            is_second_window = now >= generation_time
+            if not is_morning_window and not is_second_window:
+                skipped += 1
+                continue
+        elif prefs.frequency == "thrice_daily":
+            # tasks.py: For thrice_daily, check three independent windows:
+            # morning (8 AM), afternoon (12:30 PM), evening (5 PM).
+            def _slot_gen_utc(slot_name):
+                h, m = SLOT_TIMES[slot_name]
+                local_t = tz.localize(datetime.datetime.combine(local_now.date(), datetime.time(h, m)))
+                return (local_t - datetime.timedelta(minutes=5)).astimezone(pytz.utc).replace(tzinfo=None)
+
+            local_12_30pm = tz.localize(datetime.datetime.combine(local_now.date(), datetime.time(12, 30)))
+            local_5pm = tz.localize(datetime.datetime.combine(local_now.date(), datetime.time(17, 0)))
+            is_morning_window = now >= _slot_gen_utc("morning") and local_now < local_12_30pm
+            is_afternoon_window = now >= _slot_gen_utc("afternoon") and local_now < local_5pm
+            is_evening_window = now >= _slot_gen_utc("evening")
+            if not is_morning_window and not is_afternoon_window and not is_evening_window:
+                skipped += 1
+                continue
+        else:
+            if now < generation_time:
+                skipped += 1
+                continue
+
+        # tasks.py: Use MBriefing.slot_exists() as an idempotency guard instead of
+        # time-range queries. The unique sparse index on (user_id, slot, local_date)
+        # prevents duplicate generation regardless of timing edge cases.
+        local_date_str = local_now.strftime("%Y-%m-%d")
+        slots_to_dispatch = []
+
+        if prefs.frequency == "thrice_daily":
+            if is_morning_window and not MBriefing.slot_exists(user.pk, "morning", local_date_str):
+                slots_to_dispatch.append("morning")
+            if is_afternoon_window and not MBriefing.slot_exists(user.pk, "afternoon", local_date_str):
+                slots_to_dispatch.append("afternoon")
+            if is_evening_window and not MBriefing.slot_exists(user.pk, "evening", local_date_str):
+                slots_to_dispatch.append("evening")
+        elif prefs.frequency == "twice_daily":
+            if is_morning_window and not MBriefing.slot_exists(user.pk, "morning", local_date_str):
+                slots_to_dispatch.append("morning")
+            if is_second_window and not MBriefing.slot_exists(user.pk, slot, local_date_str):
+                slots_to_dispatch.append(slot)
+        elif prefs.frequency == "weekly":
+            preferred_weekday = DAY_NAME_TO_WEEKDAY.get(prefs.preferred_day, 6)
+            if local_now.weekday() != preferred_weekday:
+                skipped += 1
+                continue
+            if not MBriefing.slot_exists(user.pk, slot, local_date_str):
+                slots_to_dispatch.append(slot)
+        else:
+            # daily
+            if not MBriefing.slot_exists(user.pk, slot, local_date_str):
+                slots_to_dispatch.append(slot)
+
+        if not slots_to_dispatch:
+            skipped += 1
+            continue
+
+        for target_slot in slots_to_dispatch:
+            GenerateUserBriefing.delay(user.pk, slot=target_slot, local_date=local_date_str)
+            dispatched += 1
+
+    logging.debug(
+        " ---> GenerateBriefings: dispatched %s, skipped %s of %s eligible users"
+        % (dispatched, skipped, eligible_profiles.count())
+    )
+
+
+@app.task(name="generate-user-briefing", time_limit=120, soft_time_limit=110)
+def GenerateUserBriefing(user_id, on_demand=False, slot=None, local_date=None):
+    """
+    Generate a single user's daily briefing.
+
+    1. Ensure briefing feed exists
+    2. Select stories via scoring algorithm
+    3. Generate summary
+    4. Create MStory for summary in the briefing feed
+    5. Create MBriefing record linking summary + curated stories
+
+    When on_demand=True, publishes progress events via Redis pubsub for
+    real-time WebSocket updates to the client.
+    """
+    import json
+
+    import redis
+    from django.conf import settings
+
+    from apps.briefing.models import (
+        DEFAULT_SECTIONS,
+        MBriefing,
+        MBriefingPreferences,
+        create_briefing_story,
+        ensure_briefing_feed,
+    )
+    from apps.briefing.scoring import (
+        select_briefing_stories,
+        select_global_section_stories,
+    )
+    from apps.briefing.summary import (
+        embed_briefing_icons,
+        enforce_exclusive_sections,
+        extract_section_story_hashes,
+        extract_section_summaries,
+        filter_disabled_sections,
+        generate_briefing_summary,
+        inject_widely_covered_clusters,
+        rebuild_summary_from_sections,
+    )
+
+    # tasks.py: Per-user distributed lock prevents duplicate generation from
+    # concurrent task dispatches (race conditions, retries, multiple beat schedulers).
+    # For scheduled generation, the lock persists via TTL (not deleted on completion)
+    # so that duplicate dispatches arriving after the first completes are still blocked.
+    # For on_demand (user-initiated regeneration), we delete the lock on completion
+    # so the user can regenerate again immediately.
+    r = redis.Redis(connection_pool=settings.REDIS_PUBSUB_POOL)
+    lock_key = "briefing:generate_user:%s" % user_id
+    lock_ttl = 120 if on_demand else 840
+    if not r.set(lock_key, "1", nx=True, ex=lock_ttl):
+        logging.debug(" ---> GenerateUserBriefing: already running for user %s, skipping" % user_id)
+        return
+
+    try:
+        user = User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        logging.error(" ---> GenerateUserBriefing: user %s not found" % user_id)
+        return
+
+    # tasks.py: Double-check idempotency guard inside the worker. Even though the
+    # scheduler checked MBriefing.slot_exists(), another worker may have completed
+    # the same slot between dispatch and execution.
+    if slot and local_date and not on_demand:
+        if MBriefing.slot_exists(user_id, slot, local_date):
+            logging.debug(
+                " ---> GenerateUserBriefing: slot %s on %s already generated for user %s, skipping"
+                % (slot, local_date, user_id)
+            )
+            return
+
+    def publish(event_type, extra=None):
+        if not on_demand:
+            return
+        try:
+            r2 = redis.Redis(connection_pool=settings.REDIS_PUBSUB_POOL)
+            payload = {"type": event_type}
+            if extra:
+                payload.update(extra)
+            r2.publish(user.username, "briefing:%s" % json.dumps(payload))
+        except Exception as e:
+            logging.error(" ---> GenerateUserBriefing: publish error: %s" % e)
+
+    publish("start")
+
+    prefs = MBriefingPreferences.get_or_create(user_id)
+    section_order = prefs.section_order  # May be None (default order)
+    # tasks.py: Merge saved section prefs over defaults so sections added after the
+    # user last saved (e.g. the global rivers) take their default-enabled state.
+    # Matches the frontend popover, which treats keys missing from saved prefs as enabled.
+    merged_sections = dict(DEFAULT_SECTIONS, **(prefs.sections or {}))
+    now = datetime.datetime.utcnow()
+
+    if prefs.frequency == "weekly":
+        period_start = now - datetime.timedelta(days=7)
+    elif prefs.frequency == "thrice_daily":
+        period_start = now - datetime.timedelta(hours=8)
+    elif prefs.frequency == "twice_daily":
+        period_start = now - datetime.timedelta(hours=12)
+    else:
+        period_start = now - datetime.timedelta(days=1)
+
+    feed = ensure_briefing_feed(user)
+
+    # tasks.py: Collect story hashes from any briefings generated within the current
+    # lookback period so the same story never appears in consecutive briefings
+    # (e.g. morning + afternoon for twice_daily users).
+    exclude_hashes = set()
+    recent_briefings = MBriefing.objects(user_id=user_id, briefing_date__gte=period_start)
+    for b in recent_briefings:
+        exclude_hashes.update(b.curated_story_hashes or [])
+
+    publish("progress", {"step": "scoring", "message": "Selecting your top stories..."})
+    scored_stories = select_briefing_stories(
+        user_id,
+        period_start,
+        now,
+        max_stories=prefs.story_count or 5,
+        story_sources=prefs.story_sources or "all",
+        read_filter=prefs.read_filter or "unread",
+        include_read=prefs.include_read,
+        custom_section_prompts=prefs.custom_section_prompts,
+        active_sections=merged_sections,
+        exclude_hashes=exclude_hashes,
+        section_order=section_order,
+    )
+
+    # tasks.py: Lower minimum threshold for twice/thrice_daily since shorter windows may have fewer stories
+    min_stories = 1 if prefs.frequency in ("twice_daily", "thrice_daily") else 3
+    if len(scored_stories) < min_stories:
+        logging.debug(
+            " ---> GenerateUserBriefing: only %s stories for user %s, skipping (need %s)"
+            % (len(scored_stories), user_id, min_stories)
+        )
+        publish(
+            "error",
+            {
+                "error": "Not enough stories to generate a briefing (found %s, need %s)."
+                % (len(scored_stories), min_stories)
+            },
+        )
+        return
+
+    # tasks.py: Append stories from the site-wide curated rivers (Widely Read, Long
+    # Reads, Good Reads, Global Shared Stories). These are additive on top of the
+    # personal story_count budget and are excluded from the min_stories check above
+    # so a briefing still requires stories from the user's own feeds.
+    publish("progress", {"step": "global", "message": "Adding stories from across NewsBlur..."})
+    global_stories = select_global_section_stories(
+        user_id,
+        active_sections=merged_sections,
+        exclude_hashes=exclude_hashes | {s["story_hash"] for s in scored_stories},
+        section_order=section_order,
+    )
+    if global_stories:
+        scored_stories = scored_stories + global_stories
+
+    # tasks.py: Disable custom sections that have no matching stories so the LLM
+    # doesn't force-fit unrelated stories to a custom prompt (e.g. "Trump news" in a gaming folder).
+    matched_custom_sections = set()
+    for s in scored_stories:
+        cat = s.get("category", "")
+        if cat.startswith("custom_"):
+            matched_custom_sections.add(cat)
+
+    filtered_sections = dict(merged_sections)
+    if prefs.custom_section_prompts:
+        for i, prompt in enumerate(prefs.custom_section_prompts):
+            custom_key = "custom_%d" % (i + 1)
+            if custom_key not in matched_custom_sections:
+                filtered_sections[custom_key] = False
+
+    publish("progress", {"step": "summary", "message": "Writing your briefing summary..."})
+    import time
+
+    t_summary_start = time.monotonic()
+    summary_html, summary_meta = generate_briefing_summary(
+        user_id,
+        scored_stories,
+        now,
+        summary_length=prefs.summary_length or "medium",
+        summary_style=prefs.summary_style or "bullets",
+        sections=filtered_sections,
+        custom_section_prompts=prefs.custom_section_prompts,
+        model=prefs.briefing_model,
+        section_order=section_order,
+    )
+    t_summary_elapsed = time.monotonic() - t_summary_start
+
+    if not summary_html:
+        logging.error(" ---> GenerateUserBriefing: summary generation failed for user %s" % user_id)
+        publish("error", {"error": "Summary generation failed. Please try again."})
+        return
+
+    # tasks.py: Strip sections from output that the user has disabled. The LLM may
+    # occasionally create sections it wasn't instructed to because it sees category
+    # annotations in the story data.
+    active_sections = filtered_sections
+    if active_sections:
+        summary_html = filter_disabled_sections(summary_html, active_sections, section_order)
+
+    # tasks.py: Inject cluster member story lists into the widely_covered section
+    # before embedding icons, so cluster member stories get favicons too.
+    summary_html, cluster_extras = inject_widely_covered_clusters(summary_html, scored_stories, user.pk)
+
+    # tasks.py: Embed feed favicons and section icons directly in the HTML so they
+    # appear in email notifications and don't pop in on the web.
+    summary_html = embed_briefing_icons(summary_html, scored_stories + cluster_extras)
+
+    curated_hashes = [s["story_hash"] for s in scored_stories]
+    curated_sections = {}
+    for s in scored_stories:
+        curated_sections.setdefault(s.get("category", "top_stories"), []).append(s["story_hash"])
+
+    # tasks.py: Filter curated_sections to remove disabled section keys, remapping their
+    # stories to top_stories so the sidebar doesn't show pills for disabled categories.
+    if active_sections:
+        allowed_curated = {k for k, v in active_sections.items() if v}
+        allowed_curated.add("top_stories")
+        filtered_curated = {}
+        for key, hashes in curated_sections.items():
+            if key in allowed_curated:
+                filtered_curated.setdefault(key, []).extend(hashes)
+            else:
+                filtered_curated.setdefault("top_stories", []).extend(hashes)
+        curated_sections = filtered_curated
+
+    section_summaries = extract_section_summaries(summary_html)
+    # tasks.py: Filter section_summaries to remove disabled sections
+    if active_sections:
+        allowed = {k for k, v in active_sections.items() if v}
+        allowed.add("top_stories")
+        section_summaries = {k: v for k, v in section_summaries.items() if k in allowed}
+
+    # tasks.py: Enforce exclusive section ownership — each story hash in exactly one section.
+    section_summaries = enforce_exclusive_sections(section_summaries, section_order)
+    summary_html = rebuild_summary_from_sections(section_summaries, section_order)
+
+    # tasks.py: Merge story hashes referenced in the AI summary into curated_sections.
+    summary_hashes = extract_section_story_hashes(section_summaries)
+    curated_hash_set = set(curated_hashes)
+    for key, hashes in summary_hashes.items():
+        if key not in curated_sections:
+            curated_sections[key] = [h for h in hashes if h in curated_hash_set]
+
+    # tasks.py: Deduplicate curated_sections so no story hash appears in multiple sections.
+    # Iterate in section_order so higher-priority sections win.
+    from apps.briefing.models import DEFAULT_SECTION_ORDER
+
+    dedup_order = section_order if section_order else DEFAULT_SECTION_ORDER
+    seen = set()
+    processed_keys = set()
+    for key in dedup_order:
+        if key in curated_sections:
+            curated_sections[key] = [h for h in curated_sections[key] if h not in seen]
+            seen.update(curated_sections[key])
+            processed_keys.add(key)
+            if not curated_sections[key]:
+                del curated_sections[key]
+    for key in list(curated_sections.keys()):
+        if key not in processed_keys:
+            curated_sections[key] = [h for h in curated_sections[key] if h not in seen]
+            seen.update(curated_sections[key])
+            if not curated_sections[key]:
+                del curated_sections[key]
+
+    # tasks.py: Append debug footer with model and generation stats
+    if summary_meta:
+        num_candidates = len(scored_stories)
+        footer_parts = [
+            summary_meta.get("display_name", "Unknown model"),
+            "%s stories" % num_candidates,
+            "{:,} in / {:,} out tokens".format(
+                summary_meta.get("input_tokens", 0), summary_meta.get("output_tokens", 0)
+            ),
+            "%.1fs" % t_summary_elapsed,
+        ]
+        summary_html += (
+            '\n<p class="NB-briefing-debug" style="margin-top:2em;font-style:italic;'
+            'color:#999;font-size:12px;">%s</p>' % " · ".join(footer_parts)
+        )
+
+    # tasks.py: Reorder curated_hashes to match the editorial order from the AI summary.
+    # This ensures the sidebar story list matches the summary content order. Stories
+    # not mentioned in the summary (e.g. only in categorical sections) go at the end.
+    import re as re_mod
+
+    summary_order = re_mod.findall(r'data-story-hash="([^"]+)"', summary_html)
+    seen = set()
+    ordered_hashes = []
+    for h in summary_order:
+        if h in curated_hash_set and h not in seen:
+            ordered_hashes.append(h)
+            seen.add(h)
+    for h in curated_hashes:
+        if h not in seen:
+            ordered_hashes.append(h)
+            seen.add(h)
+    curated_hashes = ordered_hashes
+
+    briefing, story = create_briefing_story(
+        feed,
+        user,
+        summary_html,
+        now,
+        curated_hashes,
+        on_demand=on_demand,
+        curated_sections=curated_sections,
+        section_summaries=section_summaries,
+        frequency=prefs.frequency,
+        period_start=period_start,
+        slot=slot,
+        local_date_str=local_date,
+    )
+
+    model_name = (summary_meta or {}).get("display_name", "unknown")
+    logging.user(
+        user,
+        "~FCGenerated ~SB%s~SN briefing with ~SB%s~SN stories (~SB%s~SN, ~SB%.1fs~SN, hash %s)"
+        % (prefs.frequency, len(curated_hashes), model_name, t_summary_elapsed, story.story_hash),
+    )
+
+    publish("complete")
+
+    if on_demand:
+        r.delete(lock_key)

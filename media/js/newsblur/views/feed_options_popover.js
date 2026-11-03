@@ -25,6 +25,7 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
         "click .NB-filter-popover-filter-icon": "open_site_settings",
         "click .NB-filter-popover-stats-icon": "open_site_statistics",
         "click .NB-filter-popover-notifications-icon": "open_notifications",
+        "click .NB-filter-popover-auto-mark-read-icon": "open_auto_mark_read",
         "click .NB-filter-popover-dashboard-add-module-left": "add_dashboard_module_left",
         "click .NB-filter-popover-dashboard-add-module-right": "add_dashboard_module_right",
         "click .NB-filter-popover-dashboard-remove-module": "remove_dashboard_module",
@@ -32,7 +33,13 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
         "input .NB-date-input": "debounced_change_date_range",
         "blur .NB-date-input": "on_date_input_blur",
         "click .NB-clear-date-button": "clear_date_range",
-        "click .NB-date-filter-duration": "change_date_filter_duration"
+        "click .NB-date-filter-duration": "change_date_filter_duration",
+        "click .NB-auto-mark-read-option": "change_auto_mark_read_setting",
+        "input .NB-auto-mark-read-slider": "on_auto_mark_read_slider_input",
+        "click .NB-auto-mark-read-upgrade-notice": "open_premium_modal",
+        "click .NB-date-filter-upgrade-notice": "open_premium_modal",
+        "click .NB-clustering-upgrade-notice": "open_premium_modal",
+        "click .NB-clustering-option": "change_clustering_setting"
     },
 
     initialize: function (options) {
@@ -95,34 +102,34 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
                         feed_id: this.options.feed_id,
                         selected_folder_title: this.options.feed_id,
                         include_folders: true,
-                        toplevel: "All Site Stories",
+                        toplevel: gettext("All Site Stories"),
                         include_special_folders: true
                     })
                 ]),
                 $.make('div', { className: 'NB-filter-popover-manage-dashboard-modules' }, [
                     $.make('div', { className: 'NB-filter-popover-manage-button NB-filter-popover-dashboard-add-module-left' }, [
                         $.make('div', { className: 'NB-icon' }),
-                        $.make('div', { className: 'NB-text' }, "Add story list")
+                        $.make('div', { className: 'NB-text' }, gettext("Add story list"))
                     ]),
                     $.make('div', { className: 'NB-filter-popover-manage-button NB-filter-popover-dashboard-add-module-right' }, [
                         $.make('div', { className: 'NB-icon' }),
-                        $.make('div', { className: 'NB-text' }, "Add story list")
+                        $.make('div', { className: 'NB-text' }, gettext("Add story list"))
                     ])
                 ]),
                 $.make('div', { className: 'NB-filter-popover-manage-dashboard-modules' }, [
                     $.make('div', { className: 'NB-filter-popover-manage-button NB-filter-popover-dashboard-remove-module' }, [
                         $.make('div', { className: 'NB-icon' }),
-                        $.make('div', { className: 'NB-text' }, "Remove this list")
+                        $.make('div', { className: 'NB-text' }, gettext("Remove this list"))
                     ]),
                 ])
             ])),
             $.make('div', { className: 'NB-popover-section' }, [
                 (is_feed && $.make('div', { className: 'NB-section-icon NB-filter-popover-filter-icon' })),
-                $.make('div', { className: 'NB-popover-section-title' }, 'Filter stories'),
+                $.make('div', { className: 'NB-popover-section-title' }, gettext('Filter stories')),
                 (this.options.on_dashboard && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-dashboardcount' }, [
                     $.make('div', { className: 'NB-icon' }),
                     $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-dashboardcount' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-dashboardcount-5  NB-active', role: "button" }, '5 stories'),
+                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-dashboardcount-5  NB-active', role: "button" }, interpolate(ngettext("%(count)s story", "%(count)s stories", 5), {count: 5}, true)),
                         $.make('li', { className: 'NB-view-setting-option NB-view-setting-dashboardcount-10', role: "button" }, '10'),
                         $.make('li', { className: 'NB-view-setting-option NB-view-setting-dashboardcount-15', role: "button" }, '15'),
                         $.make('li', { className: 'NB-view-setting-option NB-view-setting-dashboardcount-20', role: "button" }, '20'),
@@ -131,36 +138,41 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
                 (this.options.show_readfilter && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-readfilter' }, [
                     $.make('div', { className: 'NB-icon' }),
                     $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-readfilter' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-readfilter-all  NB-active', role: "button" }, 'All stories'),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-readfilter-unread', role: "button" }, 'Unread only')
+                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-readfilter-all  NB-active', role: "button" }, gettext('All stories')),
+                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-readfilter-unread', role: "button" }, gettext('Unread only'))
                     ])
                 ])),
                 (this.options.show_order && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-order' }, [
                     $.make('div', { className: 'NB-icon' }),
                     $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-order' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-order-newest NB-active', role: "button" }, 'Newest first'),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-order-oldest', role: "button" }, 'Oldest')
+                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-order-newest NB-active', role: "button" }, gettext('Newest first')),
+                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-order-oldest', role: "button" }, gettext('Oldest'))
                     ])
                 ])),
-                (this.options.show_infrequent && $.make('div', { className: 'NB-popover-section-title' }, 'Infrequent stories per month')),
+                (this.options.show_infrequent && $.make('div', { className: 'NB-popover-section-title' }, gettext('Infrequent stories per month'))),
                 (this.options.show_infrequent && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-infrequent' }, [
                     $.make('div', { className: 'NB-icon' }),
                     $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-infrequent' }, [
                         $.make('li', { className: 'NB-view-setting-option NB-view-setting-infrequent-5', role: "button" }, '5'),
                         $.make('li', { className: 'NB-view-setting-option NB-view-setting-infrequent-15', role: "button" }, '15'),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-infrequent-30 NB-active', role: "button" }, '< 30 stories/month'),
+                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-infrequent-30 NB-active', role: "button" }, gettext('< 30 stories/month')),
                         $.make('li', { className: 'NB-view-setting-option NB-view-setting-infrequent-60', role: "button" }, '60'),
                         $.make('li', { className: 'NB-view-setting-option NB-view-setting-infrequent-90', role: "button" }, '90')
                     ])
                 ])),
-                $.make('div', { className: 'NB-popover-section-title' }, 'Filter by date range'),
+                $.make('div', { className: 'NB-date-filter-title-row' }, [
+                    $.make('div', { className: 'NB-popover-section-title' }, gettext('Filter by date range')),
+                    (!NEWSBLUR.Globals.is_archive && $.make('a', { className: 'NB-date-filter-upgrade-notice NB-premium-link', href: '#' }, [
+                        $.make('span', { className: 'NB-archive-badge' }, gettext('Premium Archive'))
+                    ]))
+                ]),
                 $.make('div', { className: 'NB-date-filter-container' }, [
                     $.make('div', { className: 'NB-date-filter-column' }, [
-                        $.make('div', { className: 'NB-date-filter-label' }, 'Newer:'),
+                        $.make('div', { className: 'NB-date-filter-label' }, gettext('Newer:')),
                         $.make('input', {
                             type: 'date',
                             className: 'NB-date-input NB-date-start',
-                            placeholder: 'YYYY-MM-DD',
+                            placeholder: gettext('YYYY-MM-DD'),
                             autocomplete: 'off'
                         }),
                         $.make('ul', { className: 'segmented-control NB-menu-manage-date-filter-start' }, [
@@ -171,11 +183,11 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
                         ])
                     ]),
                     $.make('div', { className: 'NB-date-filter-column' }, [
-                        $.make('div', { className: 'NB-date-filter-label' }, 'Older:'),
+                        $.make('div', { className: 'NB-date-filter-label' }, gettext('Older:')),
                         $.make('input', {
                             type: 'date',
                             className: 'NB-date-input NB-date-end',
-                            placeholder: 'YYYY-MM-DD',
+                            placeholder: gettext('YYYY-MM-DD'),
                             autocomplete: 'off'
                         }),
                         $.make('ul', { className: 'segmented-control NB-menu-manage-date-filter-end' }, [
@@ -188,112 +200,187 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
                     $.make('div', { className: 'NB-clear-date-button' })
                 ])
             ]),
-            $.make('div', { className: 'NB-popover-section' }, [
-                $.make('div', { className: 'NB-popover-section-title' }, 'Story title styling'),
-                (this.options.show_markscroll && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-markscroll' }, [
-                    $.make('div', { className: 'NB-icon' }),
-                    $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-markscroll' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-markscroll-read NB-active', role: "button" }, 'Read on scroll'),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-markscroll-unread', role: "button" }, 'Leave unread')
-                    ])
-                ])),
-                (this.options.show_density && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-density' }, [
-                    $.make('div', { className: 'NB-icon' }),
-                    $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-density' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-density-compact NB-active', role: "button" }, 'Compact'),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-density-comfortable', role: "button" }, 'Comfortable')
-                    ])
-                ])),
-                (this.options.show_contentpreview && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-contentpreview' }, [
-                    $.make('div', { className: 'NB-icon' }),
-                    $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-contentpreview' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-title', role: "button" }, 'Title only'),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-small', role: "button" }, $.make('div', { className: 'NB-icon' })),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-medium', role: "button" }, $.make('div', { className: 'NB-icon' })),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-large', role: "button" }, $.make('div', { className: 'NB-icon' })),
-                    ])
-                ])),
-                (this.options.show_imagepreview && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-imagepreview' }, [
-                    $.make('div', { className: 'NB-icon' }),
-                    $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-imagepreview' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-none', role: "button" }, 'No image'),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-small-left', role: "button" }, [
-                            $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_small_left.png' })
-                        ]),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-large-left', role: "button" }, [
-                            $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_large_left.png' })
-                        ]),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-large-right', role: "button" }, [
-                            $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_large_right.png' })
-                        ]),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-small-right', role: "button" }, [
-                            $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_small_right.png' })
-                        ])
-                    ])
-                ])),
-                $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-feed-font' }, [
-                    $.make('div', { className: 'NB-icon' }),
-                    $.make('ul', { className: 'segmented-control NB-options-feed-font' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-feed-font-whitney NB-theme-feed-font-whitney', role: "button" }, [
-                            $.make('div', { className: 'NB-icon' }),
-                            'Whitney'
-                        ]),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-feed-font-lucida NB-theme-feed-font-lucida', role: "button" }, [
-                            $.make('div', { className: 'NB-icon' }),
-                            'Lucida'
-                        ]),
-                        $.make('li', { className: 'NB-view-setting-option NB-view-setting-feed-font-gotham NB-theme-feed-font-gotham', role: "button" }, [
-                            $.make('div', { className: 'NB-icon' }),
-                            'Gotham'
-                        ])
-                    ])
-                ]),
-                $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-feed-size' }, [
-                    $.make('div', { className: 'NB-icon' }),
-                    $.make('ul', { className: 'segmented-control NB-options-feed-size' }, [
-                        $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-xs', role: "button" }, 'XS'),
-                        $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-s', role: "button" }, 'S'),
-                        $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-m NB-active', role: "button" }, 'M'),
-                        $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-l', role: "button" }, 'L'),
-                        $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-xl', role: "button" }, 'XL')
-                    ])
-                ])
-            ]),
             (is_feed && $.make('div', { className: 'NB-popover-section' }, [
                 $.make('div', { className: 'NB-section-icon NB-filter-popover-stats-icon' }),
-                $.make('div', { className: 'NB-popover-section-title' }, 'Site Stats'),
+                $.make('div', { className: 'NB-popover-section-title' }, gettext('Site stats')),
                 $.make('div', { className: 'NB-feedbar-options-stat NB-stat-subscribers' }, [
                     $.make('div', { className: 'NB-icon' }),
-                    $.make('div', { className: 'NB-stat' }, Inflector.pluralize('subscriber', feed.get('num_subscribers'), true))
+                    $.make('div', { className: 'NB-stat' }, interpolate(ngettext("%(count)s subscriber", "%(count)s subscribers", feed.get('num_subscribers')), {count: Inflector.commas(feed.get('num_subscribers'))}, true))
                 ]),
                 (feed.get('is_push') && $.make('div', { className: 'NB-feedbar-options-stat NB-stat-realtime' }, [
                     $.make('div', { className: 'NB-icon' }),
-                    $.make('div', { className: 'NB-stat' }, "Stories arrive in real-time")
+                    $.make('div', { className: 'NB-stat' }, gettext("Stories arrive in real-time"))
                 ])),
                 (feed.get('average_stories_per_month') && $.make('div', { className: 'NB-feedbar-options-stat NB-stat-average' }, [
                     $.make('div', { className: 'NB-icon' }),
-                    $.make('div', { className: 'NB-stat' }, Inflector.pluralize("story", feed.get('average_stories_per_month'), true) + " per month")
+                    $.make('div', { className: 'NB-stat' }, interpolate(ngettext("%(count)s story per month", "%(count)s stories per month", feed.get('average_stories_per_month')), {count: Inflector.commas(feed.get('average_stories_per_month'))}, true))
                 ])),
                 (feed.get('archive_count') && $.make('div', { className: 'NB-feedbar-options-stat NB-stat-archive-count' }, [
                     $.make('div', { className: 'NB-icon' }),
-                    $.make('div', { className: 'NB-stat' }, Inflector.pluralize("story", feed.get('archive_count'), true) + " in archive")
+                    $.make('div', { className: 'NB-stat' }, interpolate(ngettext("%(count)s story in archive", "%(count)s stories in archive", feed.get('archive_count')), {count: Inflector.commas(feed.get('archive_count'))}, true))
                 ])),
                 (feed.get('updated') && $.make('div', { className: 'NB-feedbar-options-stat NB-stat-updated' }, [
                     $.make('div', { className: 'NB-icon' }),
-                    $.make('div', { className: 'NB-stat' }, "Updated " + feed.get('updated') + ' ago')
+                    $.make('div', { className: 'NB-stat' }, interpolate(gettext("Updated %(value_1)s ago"), {value_1: feed.get('updated')}, true))
                 ])),
                 (feed.get('min_to_decay') && $.make('div', { className: 'NB-feedbar-options-stat NB-stat-decay' }, [
                     $.make('div', { className: 'NB-icon' }),
-                    $.make('div', { className: 'NB-stat' }, "Fetched every " + NEWSBLUR.utils.calculate_update_interval(feed.get('min_to_decay')))
+                    $.make('div', { className: 'NB-stat' }, interpolate(gettext("Fetched every %(value_1)s"), {value_1: NEWSBLUR.utils.calculate_update_interval(feed.get('min_to_decay'))}, true))
                 ]))
             ])),
             (is_feed && $.make('div', { className: 'NB-popover-section' }, [
                 $.make('div', { className: 'NB-section-icon NB-filter-popover-notifications-icon' }),
-                $.make('div', { className: 'NB-popover-section-title' }, 'Notifications'),
+                $.make('div', { className: 'NB-popover-section-title' }, gettext('Notifications')),
                 $.make('div', { className: 'NB-feedbar-options-notifications' }, [
                     new NEWSBLUR.Views.FeedNotificationView({ model: feed, popover: true }).render().$el
                 ])
-            ]))
+            ])),
+            ((is_feed || is_river) && $.make('div', { className: 'NB-popover-section NB-popover-section-auto-mark-read' }, [
+                $.make('div', { className: 'NB-auto-mark-read-title-row' }, [
+                    $.make('div', { className: 'NB-popover-section-title' }, gettext('Auto mark as read')),
+                    (!NEWSBLUR.Globals.is_archive && $.make('a', { className: 'NB-auto-mark-read-upgrade-notice NB-premium-link', href: '#' }, [
+                        $.make('span', { className: 'NB-archive-badge' }, gettext('Premium Archive'))
+                    ])),
+                    $.make('div', { className: 'NB-filter-popover-auto-mark-read-icon' })
+                ]),
+                $.make('ul', { className: 'segmented-control NB-menu-manage-auto-mark-read' }, [
+                    $.make('li', { className: 'NB-auto-mark-read-option NB-auto-mark-read-default', 'data-value': 'default', role: 'button' }, gettext('Default')),
+                    $.make('li', { className: 'NB-auto-mark-read-option NB-auto-mark-read-days', 'data-value': 'days', role: 'button' }, gettext('Days')),
+                    $.make('li', { className: 'NB-auto-mark-read-option NB-auto-mark-read-never', 'data-value': 'never', role: 'button' }, gettext('Never'))
+                ]),
+                $.make('div', { className: 'NB-auto-mark-read-slider-container' }, [
+                    $.make('input', {
+                        type: 'range',
+                        className: 'NB-auto-mark-read-slider',
+                        min: '1',
+                        max: '400',
+                        value: '14'
+                    }),
+                    $.make('div', { className: 'NB-auto-mark-read-slider-value' })
+                ])
+            ])),
+            $.make('div', { className: 'NB-popover-section-global' }, [
+                $.make('div', { className: 'NB-popover-section-global-label' }, gettext('Global settings')),
+                $.make('div', { className: 'NB-popover-section' }, [
+                    $.make('div', { className: 'NB-popover-section-title' }, gettext('Story title styling')),
+                    (this.options.show_markscroll && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-markscroll' }, [
+                        $.make('div', { className: 'NB-icon' }),
+                        $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-markscroll' }, [
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-markscroll-read NB-active', role: "button" }, gettext('Read on scroll')),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-markscroll-unread', role: "button" }, gettext('Leave unread'))
+                        ])
+                    ])),
+                    (this.options.show_density && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-density' }, [
+                        $.make('div', { className: 'NB-icon' }),
+                        $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-density' }, [
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-density-compact NB-active', role: "button" }, gettext('Compact')),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-density-comfortable', role: "button" }, gettext('Comfortable'))
+                        ])
+                    ])),
+                    (this.options.show_contentpreview && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-contentpreview' }, [
+                        $.make('div', { className: 'NB-icon' }),
+                        $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-contentpreview' }, [
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-title', role: "button" }, gettext('Title only')),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-small', role: "button" }, $.make('div', { className: 'NB-icon' })),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-medium', role: "button" }, $.make('div', { className: 'NB-icon' })),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-contentpreview-large', role: "button" }, $.make('div', { className: 'NB-icon' })),
+                        ])
+                    ])),
+                    (this.options.show_imagepreview && $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-imagepreview' }, [
+                        $.make('div', { className: 'NB-icon' }),
+                        $.make('ul', { className: 'segmented-control NB-menu-manage-view-setting-imagepreview' }, [
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-none', role: "button" }, gettext('No image')),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-small-left', role: "button" }, [
+                                $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_small_left.png' })
+                            ]),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-large-left', role: "button" }, [
+                                $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_large_left.png' })
+                            ]),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-large-right', role: "button" }, [
+                                $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_large_right.png' })
+                            ]),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-imagepreview-small-right', role: "button" }, [
+                                $.make('img', { className: 'NB-icon', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/reader/image_preview_small_right.png' })
+                            ])
+                        ])
+                    ])),
+                    $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-feed-font' }, [
+                        $.make('div', { className: 'NB-icon' }),
+                        $.make('ul', { className: 'segmented-control NB-options-feed-font' }, [
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-feed-font-whitney NB-theme-feed-font-whitney', role: "button" }, [
+                                $.make('div', { className: 'NB-icon' }),
+                                'Whitney'
+                            ]),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-feed-font-lucida NB-theme-feed-font-lucida', role: "button" }, [
+                                $.make('div', { className: 'NB-icon' }),
+                                'Lucida'
+                            ]),
+                            $.make('li', { className: 'NB-view-setting-option NB-view-setting-feed-font-gotham NB-theme-feed-font-gotham', role: "button" }, [
+                                $.make('div', { className: 'NB-icon' }),
+                                'Gotham'
+                            ])
+                        ])
+                    ]),
+                    $.make('div', { className: 'NB-popover-icon-control NB-popover-icon-control-feed-size' }, [
+                        $.make('div', { className: 'NB-icon' }),
+                        $.make('ul', { className: 'segmented-control NB-options-feed-size' }, [
+                            $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-xs', role: "button" }, 'XS'),
+                            $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-s', role: "button" }, 'S'),
+                            $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-m NB-active', role: "button" }, 'M'),
+                            $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-l', role: "button" }, 'L'),
+                            $.make('li', { className: 'NB-view-setting-option NB-options-feed-size-xl', role: "button" }, 'XL')
+                        ])
+                    ])
+                ]),
+                ((is_feed || is_river) && $.make('div', { className: 'NB-popover-section NB-popover-section-clustering' }, [
+                    $.make('div', { className: 'NB-clustering-title-row' }, [
+                        $.make('div', { className: 'NB-popover-section-title' }, gettext('Story clustering'))
+                    ]),
+                    $.make('ul', { className: 'segmented-control NB-menu-manage-clustering-enabled' }, [
+                        $.make('li', { className: 'NB-clustering-option NB-clustering-enabled-on', 'data-setting': 'story_clustering', 'data-value': 'true', role: 'button' }, gettext('Cluster related stories')),
+                        $.make('li', { className: 'NB-clustering-option NB-clustering-enabled-off', 'data-setting': 'story_clustering', 'data-value': 'false', role: 'button' }, gettext('Keep stories separate'))
+                    ]),
+                    $.make('div', { className: 'NB-clustering-mode-section' }, [
+                        $.make('div', { className: 'NB-clustering-read-label' }, gettext('Group stories that share:')),
+                        $.make('ul', { className: 'segmented-control NB-menu-manage-clustering-mode' }, [
+                            $.make('li', { className: 'NB-clustering-option NB-clustering-mode-title', 'data-setting': 'cluster_mode', 'data-value': 'title', role: 'button' }, [
+                                $.make('span', { className: 'NB-clustering-mode-label' }, gettext('Title only')),
+                                $.make('span', { className: 'NB-cluster-tier-title NB-clustering-mode-pill' }, [
+                                    $.make('span', { className: 'NB-cluster-tier-badge' }, gettext('Match'))
+                                ])
+                            ]),
+                            $.make('li', { className: 'NB-clustering-option NB-clustering-mode-related', 'data-setting': 'cluster_mode', 'data-value': 'related', role: 'button' }, [
+                                $.make('span', { className: 'NB-cluster-tier-title NB-clustering-mode-pill' }, [
+                                    $.make('span', { className: 'NB-cluster-tier-badge' }, gettext('Match'))
+                                ]),
+                                $.make('span', { className: 'NB-clustering-mode-plus' }, '+'),
+                                $.make('span', { className: 'NB-cluster-tier-related NB-clustering-mode-pill' }, [
+                                    $.make('span', { className: 'NB-cluster-tier-badge' }, gettext('Related'))
+                                ])
+                            ])
+                        ])
+                    ]),
+                    $.make('div', { className: 'NB-clustering-preview-section' }, [
+                        $.make('div', { className: 'NB-clustering-read-label' }, gettext('Cluster preview:')),
+                        $.make('ul', { className: 'segmented-control NB-menu-manage-clustering-preview' }, [
+                            $.make('li', { className: 'NB-clustering-option NB-clustering-preview-single', 'data-setting': 'cluster_preview_style', 'data-value': 'single_line', role: 'button' }, gettext('Single line')),
+                            $.make('li', { className: 'NB-clustering-option NB-clustering-preview-expanded', 'data-setting': 'cluster_preview_style', 'data-value': 'expanded', role: 'button' }, gettext('Expanded'))
+                        ])
+                    ]),
+                    $.make('div', { className: 'NB-clustering-read-section' }, [
+                        $.make('div', { className: 'NB-clustering-read-label' }, [
+                            gettext('When reading a clustered story:'),
+                            (!NEWSBLUR.Globals.is_archive && $.make('a', { href: '#', className: 'NB-clustering-upgrade-notice NB-premium-link' }, [
+                                $.make('span', { className: 'NB-archive-badge' }, gettext('Premium Archive'))
+                            ]))
+                        ]),
+                        $.make('ul', { className: 'segmented-control NB-menu-manage-clustering-read' }, [
+                            $.make('li', { className: 'NB-clustering-option NB-clustering-read-on', 'data-setting': 'cluster_mark_read', 'data-value': 'true', role: 'button' }, gettext('Mark all as read')),
+                            $.make('li', { className: 'NB-clustering-option NB-clustering-read-off', 'data-setting': 'cluster_mark_read', 'data-value': 'false', role: 'button' }, gettext('Keep others unread'))
+                        ])
+                    ])
+                ]))
+            ])
         ]));
 
         return this;
@@ -346,7 +433,10 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
 
     show_correct_feed_view_options_in_menu: function () {
         var order = NEWSBLUR.assets.view_setting(this.options.feed_id, 'order');
-        var read_filter = NEWSBLUR.assets.view_setting(this.options.feed_id, 'read_filter');
+        var read_filter = NEWSBLUR.classifier_filter_utils.read_filter_for_matching_view(
+            NEWSBLUR.assets.view_setting(this.options.feed_id, 'read_filter'),
+            NEWSBLUR.reader.flags['classifier_filter']
+        );
         var dashboard_count = parseInt(NEWSBLUR.assets.view_setting(this.options.feed_id, 'dashboard_count'), 10);
         var mark_scroll = NEWSBLUR.assets.preference('mark_read_on_scroll_titles');
         var density = NEWSBLUR.assets.preference('density');
@@ -380,17 +470,19 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
 
         $oldest.toggleClass('NB-active', order == 'oldest');
         $newest.toggleClass('NB-active', order != 'oldest');
-        $oldest.text('Oldest' + (order == 'oldest' ? ' first' : ''));
-        $newest.text('Newest' + (order != 'oldest' ? ' first' : ''));
+        $oldest.text(order == 'oldest' ? gettext('Oldest first') : gettext('Oldest'));
+        $newest.text(order != 'oldest' ? gettext('Newest first') : gettext('Newest'));
         $unread.toggleClass('NB-active', read_filter == 'unread');
         $count5.toggleClass('NB-active', dashboard_count == 5);
         $count10.toggleClass('NB-active', dashboard_count == 10);
         $count15.toggleClass('NB-active', dashboard_count == 15);
         $count20.toggleClass('NB-active', dashboard_count == 20);
-        $count5.text('5' + (dashboard_count == 5 ? ' stories' : ''));
-        $count10.text('10' + (dashboard_count == 10 ? ' stories' : ''));
-        $count15.text('15' + (dashboard_count == 15 ? ' stories' : ''));
-        $count20.text('20' + (dashboard_count == 20 ? ' stories' : ''));
+        _.each({5: $count5, 10: $count10, 15: $count15, 20: $count20}, function ($count, count) {
+            count = parseInt(count, 10);
+            $count.text(dashboard_count == count ?
+                interpolate(ngettext("%(count)s story", "%(count)s stories", count), {count: count}, true) :
+                String(count));
+        });
         $all.toggleClass('NB-active', read_filter != 'unread');
         $mark_unread.toggleClass('NB-active', !mark_scroll);
         $mark_read.toggleClass('NB-active', mark_scroll);
@@ -415,7 +507,7 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
             var freq = frequencies[f];
             var $infrequent = this.$('.NB-view-setting-infrequent-' + freq);
             $infrequent.toggleClass('NB-active', infrequent == freq);
-            $infrequent.text(infrequent == freq ? '< ' + freq + '/month' : freq);
+            $infrequent.text(infrequent == freq ? interpolate(gettext("< %(value_1)s/month"), {value_1: freq}, true) : freq);
         }
 
         if (this.options.on_dashboard) {
@@ -425,8 +517,128 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
             NEWSBLUR.app.story_titles_header.$(".NB-feedbar-options").addClass('NB-active');
         }
 
+        // Update clustering UI
+        this.update_clustering_ui();
+
         // Update date filter UI based on actual input values
         this.update_date_ui();
+
+        // Update auto-mark-read UI
+        this.update_auto_mark_read_ui();
+    },
+
+    update_auto_mark_read_ui: function () {
+        var is_river = _.string.contains(this.options.feed_id, 'river:');
+        var folder_title = is_river ? this.options.feed_id.replace('river:', '') : null;
+        var feed = is_river ? null : NEWSBLUR.assets.get_feed(this.options.feed_id);
+
+        if (!feed && !is_river) return;
+
+        var $default = this.$('.NB-auto-mark-read-default');
+        var $never = this.$('.NB-auto-mark-read-never');
+        var $days = this.$('.NB-auto-mark-read-days');
+        var $slider = this.$('.NB-auto-mark-read-slider');
+        var $slider_value = this.$('.NB-auto-mark-read-slider-value');
+
+        // Calculate the default/inherited value
+        var site_wide_days = NEWSBLUR.Preferences.days_of_unread || 14;
+        var default_days = site_wide_days;
+        var default_source = gettext('site-wide');
+
+        if (!is_river && feed) {
+            var folders = NEWSBLUR.assets.get_feed_folders(feed.id);
+            var feed_folder_title = folders && folders.length > 0 ? folders[0] : null;
+            var folder_setting = feed_folder_title ? NEWSBLUR.assets.get_folder_auto_mark_read(feed_folder_title) : null;
+
+            if (folder_setting !== null && folder_setting !== undefined) {
+                default_days = folder_setting;
+                default_source = feed_folder_title;
+            }
+        }
+
+        // For non-archive users, just show Default as active
+        if (!NEWSBLUR.Globals.is_archive) {
+            $default.addClass('NB-active');
+            $never.removeClass('NB-active');
+            $days.removeClass('NB-active');
+            var display_days = default_days === 0 ? 400 : default_days;
+            $slider.val(display_days);
+            this.update_slider_status_text($slider_value, 'default', default_days, default_source);
+            this.update_slider_gradient($slider, display_days);
+            return;
+        }
+
+        // Get current setting
+        var auto_mark_days;
+        if (is_river) {
+            auto_mark_days = NEWSBLUR.assets.get_folder_auto_mark_read(folder_title);
+        } else {
+            auto_mark_days = feed.get('auto_mark_read_days');
+        }
+
+        // Clear all active states
+        $default.removeClass('NB-active');
+        $never.removeClass('NB-active');
+        $days.removeClass('NB-active');
+
+        var slider_value;
+        var mode;
+
+        if (auto_mark_days === null || auto_mark_days === undefined) {
+            // Default mode - show inherited value on slider
+            $default.addClass('NB-active');
+            mode = 'default';
+            slider_value = default_days === 0 ? 400 : default_days;
+        } else if (auto_mark_days === 0) {
+            // Never mode - slider at max
+            $never.addClass('NB-active');
+            mode = 'never';
+            slider_value = 400;
+        } else {
+            // Days mode - show actual days
+            $days.addClass('NB-active');
+            mode = 'days';
+            slider_value = auto_mark_days;
+        }
+
+        $slider.val(slider_value);
+        this.update_slider_status_text($slider_value, mode, mode === 'days' ? auto_mark_days : default_days, default_source);
+        this.update_slider_gradient($slider, slider_value);
+    },
+
+    update_slider_status_text: function ($element, mode, days, source) {
+        var html = '';
+        // feed_options_popover.js: source may be a folder title, so escape it before .html()
+        source = _.escape(source);
+        if (mode === 'default') {
+            if (days === 0) {
+                html = interpolate(gettext("Using default: <b>never</b> (from %(source)s)"), {source: source}, true);
+            } else {
+                html = interpolate(ngettext("Using default: <b>%(days)s day</b> (from %(source)s)", "Using default: <b>%(days)s days</b> (from %(source)s)", days), {days: days, source: source}, true);
+            }
+        } else if (mode === 'never') {
+            html = gettext('Stories will <b>never</b> be marked as read');
+        } else {
+            html = interpolate(ngettext("Stories marked as read at <b>%(days)s day</b>", "Stories marked as read at <b>%(days)s days</b>", days), {days: days}, true);
+        }
+        $element.html(html);
+    },
+
+    update_slider_gradient: function ($slider, value) {
+        var min = parseInt($slider.attr('min'), 10) || 1;
+        var max = parseInt($slider.attr('max'), 10) || 400;
+        var percent = ((value - min) / (max - min)) * 100;
+
+        // Create gradient: blue for filled, light gray for unfilled, darker gray for "never" zone (366-400)
+        var never_zone_start = ((365 - min) / (max - min)) * 100;
+
+        if (value > 365) {
+            // In never zone - all blue up to never zone, then purple for never
+            $slider.css('background', 'linear-gradient(to right, #4a90d9 0%, #4a90d9 ' + never_zone_start + '%, #8b5cf6 ' + never_zone_start + '%, #8b5cf6 100%)');
+        } else {
+            // Normal days - blue up to value, gray for rest, purple for never zone
+            $slider.css('background', 'linear-gradient(to right, #4a90d9 0%, #4a90d9 ' + percent + '%, #e0e0e0 ' + percent + '%, #e0e0e0 ' + never_zone_start + '%, #d4d0e8 ' + never_zone_start + '%, #d4d0e8 100%)');
+        }
     },
 
 
@@ -601,6 +813,291 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
         }, this));
     },
 
+    open_auto_mark_read: function () {
+        var is_river = _.string.contains(this.options.feed_id, 'river:');
+        var folder_title = is_river ? this.options.feed_id.replace('river:', '') : null;
+
+        this.close(_.bind(function () {
+            if (is_river) {
+                NEWSBLUR.reader.open_feed_exception_modal(folder_title, {
+                    folder_title: folder_title,
+                    scroll_to_auto_mark_read: true
+                });
+            } else {
+                NEWSBLUR.reader.open_feed_exception_modal(this.options.feed_id, { scroll_to_auto_mark_read: true });
+            }
+        }, this));
+    },
+
+    open_premium_modal: function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        // feed_options_popover.js: Highlight the archive feature line that matches
+        // the upgrade notice that was clicked (auto-read, date filter, or clustering).
+        var $notice = $(e.currentTarget);
+        var highlight_feature = null;
+        if ($notice.hasClass('NB-auto-mark-read-upgrade-notice')) {
+            highlight_feature = 'auto-mark-read';
+        } else if ($notice.hasClass('NB-date-filter-upgrade-notice')) {
+            highlight_feature = 'date-filter';
+        } else if ($notice.hasClass('NB-clustering-upgrade-notice')) {
+            highlight_feature = 'clustering';
+        }
+        this.close(_.bind(function () {
+            NEWSBLUR.reader.open_premium_upgrade_modal({ highlight_feature: highlight_feature });
+        }, this));
+    },
+
+    change_auto_mark_read_setting: function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        var $target = $(e.currentTarget);
+        var value = $target.data('value');
+        var $slider = this.$('.NB-auto-mark-read-slider');
+        var $slider_value = this.$('.NB-auto-mark-read-slider-value');
+
+        // Calculate default values for slider positioning
+        var site_wide_days = NEWSBLUR.Preferences.days_of_unread || 14;
+        var default_days = site_wide_days;
+        var default_source = gettext('site-wide');
+
+        var is_river = _.string.contains(this.options.feed_id, 'river:');
+        var folder_title = is_river ? this.options.feed_id.replace('river:', '') : null;
+        var feed = is_river ? null : NEWSBLUR.assets.get_feed(this.options.feed_id);
+
+        if (!is_river && feed) {
+            var folders = NEWSBLUR.assets.get_feed_folders(feed.id);
+            var feed_folder_title = folders && folders.length > 0 ? folders[0] : null;
+            var folder_setting = feed_folder_title ? NEWSBLUR.assets.get_folder_auto_mark_read(feed_folder_title) : null;
+            if (folder_setting !== null && folder_setting !== undefined) {
+                default_days = folder_setting;
+                default_source = feed_folder_title;
+            }
+        }
+
+        if (!NEWSBLUR.Globals.is_archive) {
+            // Snap back to default and flash the upgrade notice
+            if (value !== 'default') {
+                this.$('.NB-auto-mark-read-option').removeClass('NB-active');
+                this.$('.NB-auto-mark-read-default').addClass('NB-active');
+                this.flash_upgrade_notice();
+            }
+            return;
+        }
+
+        if (!feed && !is_river) return;
+
+        // Update UI immediately
+        this.$('.NB-auto-mark-read-option').removeClass('NB-active');
+        $target.addClass('NB-active');
+
+        var days = null;
+        var slider_value;
+
+        if (value === 'default') {
+            days = null;
+            slider_value = default_days === 0 ? 400 : default_days;
+            this.update_slider_status_text($slider_value, 'default', default_days, default_source);
+        } else if (value === 'never') {
+            days = 0;
+            slider_value = 400;
+            this.update_slider_status_text($slider_value, 'never', 0, default_source);
+        } else if (value === 'days') {
+            var current_slider = parseInt($slider.val(), 10);
+            // If slider is in never zone, default to 30 days
+            days = current_slider > 365 ? 30 : current_slider;
+            slider_value = days;
+            this.update_slider_status_text($slider_value, 'days', days, default_source);
+        }
+
+        $slider.val(slider_value);
+        this.update_slider_gradient($slider, slider_value);
+
+        if (is_river) {
+            this.save_folder_auto_mark_read(folder_title, days);
+        } else {
+            this.save_auto_mark_read(feed, days);
+        }
+    },
+
+    on_auto_mark_read_slider_input: function (e) {
+        var $slider = $(e.currentTarget);
+        var slider_val = parseInt($slider.val(), 10);
+        var $slider_value = this.$('.NB-auto-mark-read-slider-value');
+
+        // Determine if we're in the "never" zone (366+)
+        var is_never = slider_val > 365;
+        var days = is_never ? 0 : slider_val;
+
+        // Update gradient
+        this.update_slider_gradient($slider, slider_val);
+
+        // Calculate default source for status text
+        var site_wide_days = NEWSBLUR.Preferences.days_of_unread || 14;
+        var default_source = gettext('site-wide');
+
+        if (!NEWSBLUR.Globals.is_archive) {
+            // Let them see the slider move but snap back after a moment
+            if (this._slider_snap_timer) {
+                clearTimeout(this._slider_snap_timer);
+            }
+            this._slider_snap_timer = setTimeout(_.bind(function () {
+                var default_days = site_wide_days;
+                var snap_val = default_days === 0 ? 400 : default_days;
+                $slider.val(snap_val);
+                this.update_slider_status_text($slider_value, 'default', default_days, default_source);
+                this.update_slider_gradient($slider, snap_val);
+                this.$('.NB-auto-mark-read-option').removeClass('NB-active');
+                this.$('.NB-auto-mark-read-default').addClass('NB-active');
+                this.flash_upgrade_notice();
+            }, this), 150);
+            // Still update text while dragging
+            if (is_never) {
+                this.update_slider_status_text($slider_value, 'never', 0, default_source);
+            } else {
+                this.update_slider_status_text($slider_value, 'days', slider_val, default_source);
+            }
+            return;
+        }
+
+        var is_river = _.string.contains(this.options.feed_id, 'river:');
+        var folder_title = is_river ? this.options.feed_id.replace('river:', '') : null;
+        var feed = is_river ? null : NEWSBLUR.assets.get_feed(this.options.feed_id);
+
+        // Auto-select appropriate option based on slider position
+        this.$('.NB-auto-mark-read-option').removeClass('NB-active');
+        if (is_never) {
+            this.$('.NB-auto-mark-read-never').addClass('NB-active');
+            this.update_slider_status_text($slider_value, 'never', 0, default_source);
+        } else {
+            this.$('.NB-auto-mark-read-days').addClass('NB-active');
+            this.update_slider_status_text($slider_value, 'days', slider_val, default_source);
+        }
+
+        // Debounce the save
+        if (this._auto_mark_read_timer) {
+            clearTimeout(this._auto_mark_read_timer);
+        }
+        this._auto_mark_read_timer = setTimeout(_.bind(function () {
+            if (is_river) {
+                this.save_folder_auto_mark_read(folder_title, days);
+            } else {
+                this.save_auto_mark_read(feed, days);
+            }
+        }, this), 300);
+    },
+
+    update_clustering_ui: function () {
+        var clustering_enabled = NEWSBLUR.assets.preference('story_clustering');
+        var cluster_mark_read = NEWSBLUR.assets.preference('cluster_mark_read');
+        var cluster_preview_style = NEWSBLUR.assets.preference('cluster_preview_style') || 'single_line';
+        // feed_options_popover.js: Default to "related" (title + related) to
+        // preserve the behavior existing users saw before the toggle landed.
+        var cluster_mode = NEWSBLUR.assets.preference('cluster_mode') || 'related';
+
+        // Default to true for all users
+        if (clustering_enabled === undefined || clustering_enabled === null) {
+            clustering_enabled = true;
+        }
+        if (cluster_mark_read === undefined || cluster_mark_read === null || !NEWSBLUR.Globals.is_archive) {
+            cluster_mark_read = false;
+        }
+
+        this.$('.NB-clustering-enabled-on').toggleClass('NB-active', !!clustering_enabled);
+        this.$('.NB-clustering-enabled-off').toggleClass('NB-active', !clustering_enabled);
+        this.$('.NB-clustering-mode-title').toggleClass('NB-active', cluster_mode === 'title');
+        this.$('.NB-clustering-mode-related').toggleClass('NB-active', cluster_mode !== 'title');
+        this.$('.NB-clustering-preview-single').toggleClass('NB-active', cluster_preview_style === 'single_line');
+        this.$('.NB-clustering-preview-expanded').toggleClass('NB-active', cluster_preview_style === 'expanded');
+        this.$('.NB-clustering-read-on').toggleClass('NB-active', !!cluster_mark_read);
+        this.$('.NB-clustering-read-off').toggleClass('NB-active', !cluster_mark_read);
+
+        // Fade the mode, preview and mark-read sections when clustering is disabled
+        this.$('.NB-clustering-mode-section').toggleClass('NB-disabled', !clustering_enabled);
+        this.$('.NB-clustering-preview-section').toggleClass('NB-disabled', !clustering_enabled);
+        this.$('.NB-clustering-read-section').toggleClass('NB-disabled', !clustering_enabled);
+    },
+
+    change_clustering_setting: function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        var $target = $(e.currentTarget);
+        var setting = $target.data('setting');
+        var value = $target.data('value');
+
+        if (!NEWSBLUR.Globals.is_archive && setting === 'cluster_mark_read') {
+            this.flash_clustering_upgrade_notice();
+            return;
+        }
+
+        // cluster_preview_style and cluster_mode use string values, others use booleans
+        if (setting === 'cluster_preview_style' || setting === 'cluster_mode') {
+            NEWSBLUR.assets.preference(setting, value);
+        } else {
+            var bool_value = value === 'true' || value === true;
+            NEWSBLUR.assets.preference(setting, bool_value);
+        }
+
+        // Update UI
+        this.update_clustering_ui();
+
+        // Reload feed to apply clustering, preview style, or mode changes
+        if (setting === 'story_clustering' || setting === 'cluster_preview_style' || setting === 'cluster_mode') {
+            this.reload_feed();
+        }
+    },
+
+    flash_clustering_upgrade_notice: function () {
+        var $notice = this.$('.NB-clustering-upgrade-notice');
+        $notice.addClass('NB-flash');
+        setTimeout(function () {
+            $notice.removeClass('NB-flash');
+        }, 600);
+    },
+
+    flash_upgrade_notice: function () {
+        var $notice = this.$('.NB-auto-mark-read-upgrade-notice');
+        $notice.addClass('NB-flash');
+        setTimeout(function () {
+            $notice.removeClass('NB-flash');
+        }, 600);
+    },
+
+    flash_date_filter_upgrade_notice: function () {
+        var $notice = this.$('.NB-date-filter-upgrade-notice');
+        $notice.addClass('NB-flash');
+        setTimeout(function () {
+            $notice.removeClass('NB-flash');
+        }, 600);
+    },
+
+    save_auto_mark_read: function (feed, days) {
+        NEWSBLUR.assets.save_feed_auto_mark_read(feed.id, days, function () {
+            feed.set('auto_mark_read_days', days);
+            // Refresh feed to recalculate unread counts, then reload feed after refresh completes
+            NEWSBLUR.reader.force_feeds_refresh(function () {
+                NEWSBLUR.reader.reload_feed();
+            }, false, feed.id);
+        });
+    },
+
+    save_folder_auto_mark_read: function (folder_title, days) {
+        NEWSBLUR.assets.save_folder_auto_mark_read(folder_title, days, function () {
+            // Refresh all feeds in the folder to update unread counts, then reload
+            var folder = NEWSBLUR.assets.get_folder(folder_title);
+            if (folder) {
+                var feed_ids = folder.feed_ids_in_folder();
+                NEWSBLUR.reader.force_feeds_refresh(function () {
+                    NEWSBLUR.reader.reload_feed();
+                }, false, feed_ids);
+            } else {
+                NEWSBLUR.reader.reload_feed();
+            }
+        });
+    },
+
     add_dashboard_module: function (side) {
         var count = NEWSBLUR.assets.dashboard_rivers.side(side).length;
         var folder_names = NEWSBLUR.assets.folders.child_folder_names();
@@ -671,6 +1168,13 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
     },
 
     change_date_range: function () {
+        if (!NEWSBLUR.Globals.is_archive) {
+            this.$('.NB-date-start').val('');
+            this.$('.NB-date-end').val('');
+            this.flash_date_filter_upgrade_notice();
+            return;
+        }
+
         var start_date = this.$('.NB-date-start').val();
         var end_date = this.$('.NB-date-end').val();
 
@@ -701,6 +1205,11 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
     },
 
     clear_date_range: function () {
+        if (!NEWSBLUR.Globals.is_archive) {
+            this.flash_date_filter_upgrade_notice();
+            return;
+        }
+
         this.$('.NB-date-start').val('');
         this.$('.NB-date-end').val('');
 
@@ -719,6 +1228,13 @@ NEWSBLUR.FeedOptionsPopover = NEWSBLUR.ReaderPopover.extend({
     change_date_filter_duration: function (e) {
         e.preventDefault();
         e.stopPropagation();
+
+        if (!NEWSBLUR.Globals.is_archive) {
+            this.$('.NB-date-start').val('');
+            this.$('.NB-date-end').val('');
+            this.flash_date_filter_upgrade_notice();
+            return;
+        }
 
         var $target = $(e.currentTarget);
         var options = {};

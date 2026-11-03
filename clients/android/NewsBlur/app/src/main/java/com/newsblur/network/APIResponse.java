@@ -1,18 +1,15 @@
 package com.newsblur.network;
 
-import java.io.IOException;
-import java.net.HttpURLConnection;
-
 import android.text.TextUtils;
 import android.util.Log;
 
 import com.google.gson.Gson;
-
 import com.newsblur.di.ApiOkHttpClient;
-import com.newsblur.network.domain.LoginResponse;
 import com.newsblur.network.domain.NewsBlurResponse;
-import com.newsblur.network.domain.RegisterResponse;
 import com.newsblur.util.AppConstants;
+
+import java.io.IOException;
+import java.net.HttpURLConnection;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -25,36 +22,36 @@ import okhttp3.Response;
  * response can be read.
  */
 public class APIResponse {
-	
+
     private boolean isError;
-    private int responseCode;
-	private String cookie;
+    private String cookie;
     private String responseBody;
     public long connectTime;
     public long readTime;
 
-    /**
-     * Construct an online response.  Will test the response for errors and extract all the
-     * info we might need.
-     */
-    public APIResponse(@ApiOkHttpClient OkHttpClient httpClient, Request request) {
-        this(httpClient, request, HttpURLConnection.HTTP_OK);
+    // APIResponse.java also accepts responses from NetworkClientImpl.kt's cancellable request path.
+    public APIResponse(Response response, long connectTime) throws IOException {
+        this.connectTime = connectTime;
+        this.isError = response.code() != HttpURLConnection.HTTP_OK;
+        if (this.isError) return;
+        this.cookie = response.header("Set-Cookie");
+        long started = System.currentTimeMillis();
+        this.responseBody = response.body().string();
+        this.readTime = System.currentTimeMillis() - started;
     }
 
     /**
      * Construct an online response.  Will test the response for errors and extract all the
      * info we might need.
      */
-    public APIResponse(@ApiOkHttpClient OkHttpClient httpClient, Request request, int expectedReturnCode) {
-
-        try {
-            long startTime = System.currentTimeMillis();
-            Response response = httpClient.newCall(request).execute();
+    public APIResponse(@ApiOkHttpClient OkHttpClient httpClient, Request request) {
+        long startTime = System.currentTimeMillis();
+        try (Response response = httpClient.newCall(request).execute()) {
             connectTime = System.currentTimeMillis() - startTime;
-            this.responseCode = response.code();
+            int responseCode = response.code();
 
-            if (responseCode != expectedReturnCode) {
-                com.newsblur.util.Log.e(this.getClass().getName(), "API returned error code " + response.code() + " calling " + request.url().toString() + " - expected " + expectedReturnCode);
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                com.newsblur.util.Log.e(this.getClass().getName(), "API returned error code " + response.code() + " calling " + request.url() + " - expected " + HttpURLConnection.HTTP_OK);
                 this.isError = true;
                 return;
             }
@@ -66,7 +63,7 @@ public class APIResponse {
                 this.responseBody = response.body().string();
                 readTime = System.currentTimeMillis() - startTime;
             } catch (Exception e) {
-                com.newsblur.util.Log.e(this.getClass().getName(), e.getClass().getName() + " (" + e.getMessage() + ") reading " + request.url().toString(), e);
+                com.newsblur.util.Log.e(this.getClass().getName(), e.getClass().getName() + " (" + e.getMessage() + ") reading " + request.url(), e);
                 this.isError = true;
                 return;
             }
@@ -83,11 +80,27 @@ public class APIResponse {
                 }
             }
 
-            com.newsblur.util.Log.d(this.getClass().getName(), String.format("called %s in %dms and %dms to read %dB", request.url().toString(), connectTime, readTime, responseBody.length()));
+            com.newsblur.util.Log.d(this.getClass().getName(), String.format("called %s in %dms and %dms to read %dB", request.url(), connectTime, readTime, responseBody.length()));
 
         } catch (IOException ioe) {
-            com.newsblur.util.Log.e(this.getClass().getName(), "Error (" + ioe.getMessage() + ") calling " + request.url().toString(), ioe);
+            com.newsblur.util.Log.e(this.getClass().getName(), "Error (" + ioe.getMessage() + ") calling " + request.url(), ioe);
             this.isError = true;
+        } catch (Exception e) {
+            // OkHttp's Kotlin code can surface a raw InterruptedException (or a runtime
+            // CancellationException) when the caller thread is torn down mid-request, which
+            // happens when the widget's RemoteViewsFactory is destroyed while fetching stories.
+            // Treat it as a soft error instead of letting it crash the widget binder thread.
+            // See Play crash id 402bcc2d9ef25f7b1879e8be72c02323.
+            if (e instanceof InterruptedException || e.getCause() instanceof InterruptedException) {
+                com.newsblur.util.Log.w(this.getClass().getName(), "API call interrupted for " + request.url());
+                Thread.currentThread().interrupt();
+                this.isError = true;
+            } else if (e instanceof RuntimeException) {
+                throw (RuntimeException) e;
+            } else {
+                com.newsblur.util.Log.e(this.getClass().getName(), "Unexpected error (" + e.getMessage() + ") calling " + request.url(), e);
+                this.isError = true;
+            }
         }
     }
 
@@ -126,36 +139,6 @@ public class APIResponse {
             // to the NewsBlurResponse parent class
             T response = gson.fromJson(this.responseBody, classOfT);
             response.readTime = readTime;
-            return response;
-        }
-    }
-
-    /**
-     * Special binder for LoginResponses, since they can't inherit from NewsBlurResponse due to
-     * the design of the API fields.
-     */ 
-    public LoginResponse getLoginResponse(Gson gson) {
-        if (this.isError) {
-            LoginResponse response = new LoginResponse();
-            response.isProtocolError = true;
-            return response;
-        } else {
-            LoginResponse response = gson.fromJson(this.responseBody, LoginResponse.class);
-            return response;
-        }
-    }
-
-    /**
-     * Special binder for RegisterResponses, since they can't inherit from NewsBlurResponse due to
-     * the design of the API fields.
-     */ 
-    public RegisterResponse getRegisterResponse(Gson gson) {
-        if (this.isError) {
-            RegisterResponse response = new RegisterResponse();
-            response.isProtocolError = true;
-            return response;
-        } else {
-            RegisterResponse response = gson.fromJson(this.responseBody, RegisterResponse.class);
             return response;
         }
     }

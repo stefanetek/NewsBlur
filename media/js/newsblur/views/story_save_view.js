@@ -30,20 +30,20 @@ NEWSBLUR.Views.StorySaveView = Backbone.View.extend({
         <div class="NB-sideoption-save">\
             <% if (story_tags.length) { %>\
                 <div class="NB-sideoption-save-populate">\
-                    Add <%= Inflector.pluralize("story tag", story_tags.length, true) %>\
+                    <%- interpolate(ngettext("Add %(count)s story tag", "Add %(count)s story tags", story_tags.length), {count: Inflector.commas(story_tags.length)}, true) %>\
                 </div>\
             <% } %>\
             <div class="NB-sideoption-save-icon"></div>\
             <div class="NB-sideoption-save-title">\
-                Tags:\
+                <%- gettext("Tags:") %>\
             </div>\
             <ul class="NB-sideoption-save-tag">\
                 <% _.each(tags, function(tag) { %>\
                     <li><%= tag %></li>\
                 <% }) %>\
             </ul>\
-            <div class="NB-sideoption-save-message">Saved</div>\
-            <div class="NB-sideoption-save-title">Private notes:</div>\
+            <div class="NB-sideoption-save-message"><%- gettext("Saved") %></div>\
+            <div class="NB-sideoption-save-title"><%- gettext("Private notes:") %></div>\
             <textarea class="NB-sideoption-save-notes"><%= story.get("user_notes") %></textarea>\
         </div>\
     </div>\
@@ -185,6 +185,9 @@ NEWSBLUR.Views.StorySaveView = Backbone.View.extend({
                     $sideoption.removeClass('NB-active');
                     $save_wrapper.removeClass('NB-active');
                 }
+                if (this.sideoptions_view && this.sideoptions_view.story_view) {
+                    this.sideoptions_view.story_view.update_sideoptions_sticky_state();
+                }
             }, this)
         });
 
@@ -193,7 +196,23 @@ NEWSBLUR.Views.StorySaveView = Backbone.View.extend({
         var comments_height = $story_comments.height();
         var left_height = content_height + comments_height;
         var original_height = $story_content.data('original_height') || content_height;
-        if (!NEWSBLUR.reader.flags.narrow_content &&
+        // See story_share_view.js for why we bail out in sticky mode: the parent
+        // .NB-story-content-container handles min-height via
+        // update_sideoptions_sticky_state, and growing $story_content here
+        // creates a feedback loop with $sideoption_container.height().
+        var is_sticky_sideoptions = this.sideoptions_view &&
+            this.sideoptions_view.story_view &&
+            this.sideoptions_view.story_view.$el.hasClass('NB-story-sideoptions-sticky');
+
+        if (is_sticky_sideoptions) {
+            if ($story_content.data('original_height')) {
+                $story_content.css({ 'height': '', 'min-height': '' });
+                $story_content.removeData('original_height');
+            }
+            if (this.sideoptions_view.share_view.is_open && !options.from_share_view) {
+                this.sideoptions_view.share_view.resize({ from_save_view: true });
+            }
+        } else if (!NEWSBLUR.reader.flags.narrow_content &&
             !options.close && !options.force && new_sideoptions_height >= original_height) {
             // Sideoptions too big, embiggen left side
             console.log(["Sideoption too big, embiggening", content_height, sideoptions_height, new_sideoptions_height]);

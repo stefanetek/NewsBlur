@@ -19,6 +19,8 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
             this.options.infrequent = NEWSBLUR.assets.preference('infrequent_stories_per_month');
         } else if (this.model.get('river_id') == "river:global") {
             this.options.global_feed = true;
+        } else if (_.string.startsWith(this.model.get('river_id'), 'trending:')) {
+            this.options.trending_type = this.model.get('river_id').replace('trending:', '');
         }
 
         NEWSBLUR.assets.feeds.unbind(null, null, this);
@@ -54,7 +56,7 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
                 </div>\
                 <div class="NB-module-river-settings NB-javascript"></div>\
                 <div class="NB-module-river-title">\
-                    <div class="NB-module-river-favicon"><img src="<%= favicon_url %>"></div>\
+                    <div class="NB-module-river-favicon"><%= favicon_html %></div>\
                     <div class="NB-module-river-title-text"><%= river_title %></div>\
                 </div>\
             </h5>\
@@ -66,7 +68,7 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
             </div>\
         </div>\
         ', {
-            favicon_url: this.model.favicon_url(),
+            favicon_html: $.favicon_html(this.model.get('river_id')),
             river_title: NEWSBLUR.reader.feed_title(this.model.get('river_id')),
             river_order: this.model.get('river_order'),
             river_side: this.model.get('river_side'),
@@ -112,15 +114,22 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
     },
 
     options_template: function () {
+        var feed_id = this.model.get('river_id');
+        var read_filter = NEWSBLUR.assets.view_setting(feed_id, "read_filter");
+        var order = NEWSBLUR.assets.view_setting(feed_id, "order");
+        // dashboard_river_view.js maps view setting identifiers to display labels; the identifiers stay untranslated.
+        var read_filter_labels = { all: gettext("All"), unread: gettext("Unread") };
+        var order_labels = { newest: gettext("Newest"), oldest: gettext("Oldest") };
         var $options = $(_.template('<div class="NB-feedbar-options-container">\
             <span class="NB-feedbar-options" role="button">\
                 <div class="NB-icon"></div>\
-                <%= NEWSBLUR.assets.view_setting(feed_id, "read_filter") %>\
+                <%- read_filter_label %>\
                 &middot;\
-                <%= NEWSBLUR.assets.view_setting(feed_id, "order") %>\
+                <%- order_label %>\
             </span>\
         </div>', {
-            feed_id: this.model.get('river_id')
+            read_filter_label: read_filter_labels[read_filter] || read_filter,
+            order_label: order_labels[order] || order
         }));
 
         this.$(".NB-module-river-settings").html($options);
@@ -156,6 +165,11 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
         if (!feeds || !feeds.length) {
             feeds = active_folder.feed_ids_in_folder();
         }
+        // Exclude briefing feeds from river views
+        feeds = _.reject(feeds, function (feed_id) {
+            var feed = NEWSBLUR.assets.get_feed(feed_id);
+            return feed && feed.get('is_daily_briefing');
+        });
         // console.log(['River feeds', river_id, feeds.length, feeds]);
         return feeds;
     },
@@ -235,6 +249,7 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
         options = _.extend({
             global_feed: this.options.global_feed,
             infrequent: this.options.infrequent,
+            trending_type: this.options.trending_type,
             query: this.options.query,
         }, options || {});
         if (options.feed_selector) return;
@@ -243,6 +258,7 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
         if (!feeds.length) return;
         if (!this.$stories.length) return;
         if (this.model.get('river_id') == "river:global") feeds = [];
+        if (_.string.startsWith(this.model.get('river_id'), 'trending:')) feeds = [];
 
         // console.log(['dashboard river load_stories', this.model.get('river_id'), this.page, feeds, options, this.$stories.length]);
         this.page = 1;
@@ -359,6 +375,10 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
             NEWSBLUR.reader.open_river_blurblogs_stories(_.extend({
                 global: true
             }, options));
+        } else if (_.string.startsWith(river_id, 'trending:')) {
+            NEWSBLUR.reader.open_trending_stories(_.extend({
+                trending_type: river_id.replace('trending:', '')
+            }, options));
         } else if (_.string.startsWith(river_id, 'river:')) {
             var folder = NEWSBLUR.assets.get_folder(river_id.replace('river:', ''));
             if (folder) {
@@ -416,6 +436,11 @@ NEWSBLUR.Views.DashboardRiver = Backbone.View.extend({
         var feed = NEWSBLUR.assets.get_feed(feed_id);
         if (!feed) {
             console.log(["Can't fetch dashboard story, no feed", feed_id]);
+            return;
+        }
+
+        // Exclude briefing feed stories from all dashboard rivers
+        if (feed.get('is_daily_briefing')) {
             return;
         }
 

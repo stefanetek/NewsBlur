@@ -1,0 +1,1884 @@
+//
+//  NewsBlurUITestHarness.swift
+//  NewsBlur
+//
+//  Created by Codex on 2026-04-05.
+//  Copyright © 2026 NewsBlur. All rights reserved.
+//
+
+import Foundation
+import ObjectiveC
+import UIKit
+
+@available(iOS 16.0, *)
+@MainActor
+final class NewsBlurUITestHarness {
+    private enum LaunchArgument {
+        static let enabled = "-newsblur-ui-testing"
+        static let screen = "-newsblur-ui-test-screen"
+        static let storyTitlesStyle = "-newsblur-ui-test-story-titles-style"
+    }
+
+    private enum ReaderScenario {
+        case list
+        case goodReadsList
+        case techFolder
+        case cultureFolder
+        case swiftFeed
+        case swiftStoryOne
+        case swiftClusterFeed
+        case swiftClusterStoryOne
+        case cookingSaved
+    }
+
+    private static var didPrepareLaunchEnvironment = false
+    private static var didScheduleScenario = false
+    private static var didLoadFeedFixture = false
+    private static var didRequestFixtureFeedSidebar = false
+    private static var didIsolateReaderStorage = false
+    private static var didFinishReaderFeedLoad = false
+    private static var didDismissMarketingFullscreenOverlay = false
+    private static var readerFeedLoadObserver: NSObjectProtocol?
+
+    static func prepareLaunchEnvironmentIfNeeded(appDelegate: NewsBlurAppDelegate) {
+        guard isEnabled, !didPrepareLaunchEnvironment else { return }
+
+        didPrepareLaunchEnvironment = true
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "-newsblur-ui-test-theme"), index + 1 < arguments.count {
+            let theme = arguments[index + 1]
+            if ["light", "sepia", "medium", "dark"].contains(theme) {
+                var domain = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+                domain["theme_style"] = ["medium", "dark"].contains(theme) ? "dark" : "light"
+                domain["theme_light"] = theme
+                domain["theme_dark"] = theme
+                UserDefaults.standard.setVolatileDomain(domain, forName: UserDefaults.argumentDomain)
+            }
+        }
+        UIView.setAnimationsEnabled(ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-animations"))
+
+        if arguments.contains("-newsblur-ui-test-default-story-menu") {
+            // ReaderUITests.swift verifies the real registered default instead of forcing Show actions.
+            UserDefaults.standard.removeObject(forKey: "long_press_story_title")
+        }
+
+        if ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-reset-gestures") {
+            // NewsBlurUITestHarness.swift starts interactive preference tests without pinning controls in the argument domain.
+            UserDefaults.standard.setValuesForKeys([
+                "enable_feed_swipes": true, "enable_story_swipes": true,
+                "feed_title_swipe_left": "read", "feed_title_swipe_right": "notifications",
+                "story_title_swipe_left": "read", "story_title_swipe_right": "back",
+                "long_press_story_title": "open_send_to"
+            ])
+        }
+
+        if let requestedStoryTitlesStyle {
+            UserDefaults.standard.set(requestedStoryTitlesStyle, forKey: DetailViewController.Key.style)
+        } else {
+            UserDefaults.standard.removeObject(forKey: DetailViewController.Key.style)
+        }
+
+        switch requestedScreen {
+        case "add-site", "discover-sites", "onboarding", "onboarding-account", "account-deletion", "account-deletion-confirm", "account-deletion-notice":
+            installReaderFixtureNetwork(on: appDelegate)
+            ReaderUITestFixtures.prepareAppState(for: appDelegate)
+            appDelegate.replaceUnreadCounts(forTesting: ReaderUITestFixtures.unreadCountRows())
+        case "preferences":
+            installReaderFixtureNetwork(on: appDelegate)
+            ReaderUITestFixtures.prepareAppState(for: appDelegate)
+            appDelegate.replaceUnreadCounts(forTesting: ReaderUITestFixtures.unreadCountRows())
+        case let screen? where readerScenario(for: screen) != nil:
+            installReaderFixtureNetwork(on: appDelegate)
+            ReaderUITestFixtures.prepareAppState(for: appDelegate)
+            appDelegate.replaceUnreadCounts(forTesting: ReaderUITestFixtures.unreadCountRows())
+        default:
+            break
+        }
+    }
+
+    static func configureIfNeeded(appDelegate: NewsBlurAppDelegate) {
+        guard isEnabled, !didScheduleScenario else { return }
+
+        UIView.setAnimationsEnabled(ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-animations"))
+        // NewsBlurUITestHarness.swift can grow an iPadOS windowed app toward the screen size, so screenshots taken
+        // without taps capture wide layouts such as LanguageChooserView.swift's side-by-side columns.
+        if ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-fill-window") {
+            for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+                scene.sizeRestrictions?.minimumSize = scene.screen.bounds.size
+            }
+        }
+        // NewsBlurUITestHarness.swift also supports reopening onboarding from the reader's settings menu.
+        let onboardingConfiguration = URLSessionConfiguration.ephemeral
+        onboardingConfiguration.protocolClasses = [DiscoverSitesUITestURLProtocol.self]
+        OnboardingAPI.session = URLSession(configuration: onboardingConfiguration)
+        DiscoverFeedsViewController.viewModelFactory = { feedId, feedIds in
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [DiscoverSitesUITestURLProtocol.self]
+            let session = URLSession(configuration: configuration)
+            if let feedIds {
+                return DiscoverFeedsViewModel(feedIds: feedIds, session: session,
+                                              baseURL: ReaderUITestFixtures.baseURL.absoluteString)
+            }
+            return DiscoverFeedsViewModel(feedId: feedId ?? ReaderUITestFixtures.swiftFeedId,
+                                          session: session, baseURL: ReaderUITestFixtures.baseURL.absoluteString)
+        }
+        DiscoverFeedsViewController.cardActionsFactory = {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [DiscoverSitesUITestURLProtocol.self]
+            return DiscoverSitesViewModel(appEnvironment: AddSiteUITestEnvironment(),
+                                          session: URLSession(configuration: configuration))
+        }
+
+        switch requestedScreen {
+        case "onboarding", "onboarding-account", "account-deletion", "account-deletion-confirm", "account-deletion-notice":
+            didScheduleScenario = true
+            configureOnboarding(on: appDelegate, remainingRetries: 100)
+        case "discover-sites":
+            didScheduleScenario = true
+            DiscoverSitesViewController.viewModelFactory = {
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [DiscoverSitesUITestURLProtocol.self]
+                return DiscoverSitesViewModel(appEnvironment: AddSiteUITestEnvironment(),
+                                              session: URLSession(configuration: configuration))
+            }
+            configureDiscoverSites(on: appDelegate, remainingRetries: 100)
+        case "add-site":
+            didScheduleScenario = true
+            AddSiteSheetViewController.viewModelFactory = { makeAddSiteViewModel() }
+            DiscoverSitesViewController.viewModelFactory = {
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [DiscoverSitesUITestURLProtocol.self]
+                return DiscoverSitesViewModel(appEnvironment: AddSiteUITestEnvironment(),
+                                              session: URLSession(configuration: configuration))
+            }
+            configureAddSite(on: appDelegate, remainingRetries: 100)
+        case "preferences":
+            didScheduleScenario = true
+            configurePreferences(on: appDelegate, remainingRetries: 20)
+        case let screen? where readerScenario(for: screen) != nil:
+            didScheduleScenario = true
+            configureReader(
+                on: appDelegate,
+                scenario: readerScenario(for: screen) ?? .list,
+                remainingRetries: 200
+            )
+        default:
+            break
+        }
+    }
+
+    private static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains(LaunchArgument.enabled)
+    }
+
+    private static func configureOnboarding(on appDelegate: NewsBlurAppDelegate, remainingRetries: Int) {
+        guard remainingRetries > 0 else { return }
+        if requestedScreen == "account-deletion" || requestedScreen == "account-deletion-confirm" {
+            // NewsBlurUITestHarness.swift establishes the fixture account before deletion captures its authentication generation.
+            loadFixtureFeedList(on: appDelegate)
+            guard didFinishReaderFeedLoad else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    configureOnboarding(on: appDelegate, remainingRetries: remainingRetries - 1)
+                }
+                return
+            }
+            appDelegate.feedsViewController.loadWorkItem?.cancel()
+        }
+        guard let root = appDelegate.window?.rootViewController, root.viewIfLoaded?.window != nil else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                configureOnboarding(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+        let show = {
+            if requestedScreen == "account-deletion-notice" {
+                let controller = OnboardingAccountViewController()
+                controller.modalPresentationStyle = .fullScreen
+                controller.showAppleRevocationNoticeWhenVisible()
+                root.present(controller, animated: false)
+                return
+            }
+            if requestedScreen == "account-deletion" || requestedScreen == "account-deletion-confirm" {
+                let controller = AccountDeletionController()
+                controller.modalPresentationStyle = .formSheet
+                controller.preferredContentSize = CGSize(width: 520, height: 560)
+                controller.isModalInPresentation = true
+                controller.loadViewIfNeeded()
+                // NewsBlurUITestHarness.swift previews confirmation without contacting a real identity provider or deleting an account.
+                if requestedScreen == "account-deletion-confirm" {
+                    controller.model.authentication.onReauthenticated?("fixture-delete-token")
+                }
+                root.present(controller, animated: false)
+                return
+            }
+            let controller: UIViewController = requestedScreen == "onboarding-account"
+                ? OnboardingAccountViewController() : UINavigationController(rootViewController: OnboardingViewController())
+            controller.modalPresentationStyle = .fullScreen
+            root.present(controller, animated: false)
+        }
+        if root.presentedViewController != nil { root.dismiss(animated: false, completion: show) }
+        else { show() }
+    }
+
+    private static var requestedScreen: String? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: LaunchArgument.screen) else { return nil }
+
+        let valueIndex = arguments.index(after: index)
+        guard valueIndex < arguments.endIndex else { return nil }
+
+        return arguments[valueIndex]
+    }
+
+    private static var requestedStoryTitlesStyle: String? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: LaunchArgument.storyTitlesStyle) else { return nil }
+
+        let valueIndex = arguments.index(after: index)
+        guard valueIndex < arguments.endIndex else { return nil }
+
+        return arguments[valueIndex]
+    }
+
+    private static func prepareFixtureFeedSidebar(on appDelegate: NewsBlurAppDelegate) {
+        guard !didRequestFixtureFeedSidebar,
+              let navigation = appDelegate.feedsNavigationController,
+              navigation.viewIfLoaded?.window == nil,
+              appDelegate.detailViewController.viewIfLoaded?.window != nil else { return }
+        // NewsBlurUITestHarness.swift must reveal the iPad primary before awaiting its window or presenting Add Site from it.
+        didRequestFixtureFeedSidebar = true
+        appDelegate.showFeedsList(animated: false)
+    }
+
+    private static func presentAddSite(on appDelegate: NewsBlurAppDelegate, remainingRetries: Int) {
+        guard remainingRetries > 0 else { return }
+        guard let feedsNavigationController = appDelegate.feedsNavigationController else { return }
+        guard feedsNavigationController.viewIfLoaded?.window != nil else {
+            retryPresentingAddSite(on: appDelegate, remainingRetries: remainingRetries)
+            return
+        }
+        guard feedsNavigationController.presentedViewController == nil else {
+            retryPresentingAddSite(on: appDelegate, remainingRetries: remainingRetries)
+            return
+        }
+
+        let addSiteViewController = AddSiteSheetViewController()
+        addSiteViewController.shouldReloadFeedsOnSuccess = false
+
+        let navigationController = UINavigationController(rootViewController: addSiteViewController)
+        navigationController.modalPresentationStyle = .pageSheet
+        navigationController.navigationBar.isHidden = true
+
+        if let sheet = navigationController.sheetPresentationController {
+            addSiteViewController.setSheetController(sheet)
+        }
+
+        feedsNavigationController.present(navigationController, animated: false)
+    }
+
+    private static func configureDiscoverSites(on appDelegate: NewsBlurAppDelegate, remainingRetries: Int) {
+        guard remainingRetries > 0 else { return }
+        // DetailViewController.swift hosts Discovery even when the iPad feed sidebar is hidden.
+        guard let navigation = appDelegate.feedsNavigationController,
+              navigation.viewIfLoaded?.window != nil || appDelegate.detailViewController.viewIfLoaded?.window != nil else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                configureDiscoverSites(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+        if let presented = navigation.presentedViewController {
+            presented.dismiss(animated: false) {
+                configureDiscoverSites(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+        loadFixtureFeedList(on: appDelegate)
+        guard didFinishReaderFeedLoad else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                configureDiscoverSites(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+        // FeedsViewController.swift schedules startup navigation after publishing the feed list.
+        appDelegate.feedsViewController.loadWorkItem?.cancel()
+        appDelegate.openDiscoverSitesView()
+    }
+
+    private static func configureAddSite(on appDelegate: NewsBlurAppDelegate, remainingRetries: Int) {
+        guard remainingRetries > 0 else { return }
+        prepareFixtureFeedSidebar(on: appDelegate)
+        guard let feedsNavigationController = appDelegate.feedsNavigationController else { return }
+        guard feedsNavigationController.viewIfLoaded?.window != nil else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                configureAddSite(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+
+        if let presentedViewController = feedsNavigationController.presentedViewController {
+            presentedViewController.dismiss(animated: false) {
+                configureAddSite(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+
+        loadFixtureFeedList(on: appDelegate)
+        guard didFinishReaderFeedLoad else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                configureAddSite(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+        // NewsBlurUITestHarness.swift presents only after the fixture account and its folder choices are installed.
+        appDelegate.feedsViewController.loadWorkItem?.cancel()
+        presentAddSite(on: appDelegate, remainingRetries: remainingRetries)
+    }
+
+    private static func retryPresentingAddSite(on appDelegate: NewsBlurAppDelegate, remainingRetries: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            presentAddSite(on: appDelegate, remainingRetries: remainingRetries - 1)
+        }
+    }
+
+    private static func configurePreferences(on appDelegate: NewsBlurAppDelegate, remainingRetries: Int) {
+        guard remainingRetries > 0 else { return }
+        guard let feedsNavigationController = appDelegate.feedsNavigationController else { return }
+        guard feedsNavigationController.viewIfLoaded?.window != nil else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                configurePreferences(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+
+        if let presentedViewController = feedsNavigationController.presentedViewController {
+            presentedViewController.dismiss(animated: false) {
+                configurePreferences(on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+
+        loadFixtureFeedList(on: appDelegate)
+        DispatchQueue.main.async {
+            appDelegate.showPreferences()
+        }
+    }
+
+    private static func configureReader(
+        on appDelegate: NewsBlurAppDelegate,
+        scenario: ReaderScenario,
+        remainingRetries: Int
+    ) {
+        precondition(remainingRetries > 0, "NewsBlurUITestHarness.swift timed out waiting for the fixture feed list")
+        prepareFixtureFeedSidebar(on: appDelegate)
+        guard let feedsNavigationController = appDelegate.feedsNavigationController else { return }
+        // NewsBlurUITestHarness.swift can select a reader fixture while the iPad feed sidebar is hidden.
+        guard feedsNavigationController.viewIfLoaded?.window != nil ||
+              appDelegate.detailViewController.viewIfLoaded?.window != nil else {
+            retryConfiguringReader(on: appDelegate, scenario: scenario, remainingRetries: remainingRetries)
+            return
+        }
+
+        if let presentedViewController = feedsNavigationController.presentedViewController {
+            presentedViewController.dismiss(animated: false) {
+                configureReader(on: appDelegate, scenario: scenario, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+
+        loadFixtureFeedList(on: appDelegate)
+        guard didFinishReaderFeedLoad else {
+            retryConfiguringReader(on: appDelegate, scenario: scenario, remainingRetries: remainingRetries)
+            return
+        }
+        // FeedsViewController.swift schedules startup navigation after publishing the feed list.
+        appDelegate.feedsViewController.loadWorkItem?.cancel()
+        applyReaderScenario(scenario, on: appDelegate, remainingRetries: remainingRetries)
+        if ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-sync-status") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                appDelegate.feedsViewController.syncNotifier.showWithStyle(.syncing, title: "Syncing stories...")
+            }
+        }
+    }
+
+    private static func retryConfiguringReader(
+        on appDelegate: NewsBlurAppDelegate,
+        scenario: ReaderScenario,
+        remainingRetries: Int
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            configureReader(on: appDelegate, scenario: scenario, remainingRetries: remainingRetries - 1)
+        }
+    }
+
+    private static func loadFixtureFeedList(on appDelegate: NewsBlurAppDelegate) {
+        guard !didLoadFeedFixture else { return }
+        guard let feedsViewController = appDelegate.feedsViewController else { return }
+        didLoadFeedFixture = true
+
+        feedsViewController.loadViewIfNeeded()
+        appDelegate.feedsNavigationController.loadViewIfNeeded()
+        appDelegate.feedsNavigationController.view.layoutIfNeeded()
+        // NewsBlurAppDelegate.m already starts the initial feed request in prepareViewControllers.
+    }
+
+    private static func installReaderFixtureNetwork(on appDelegate: NewsBlurAppDelegate) {
+        if !didIsolateReaderStorage {
+            didIsolateReaderStorage = true
+            // NewsBlurUITestHarness.swift keeps offline retries and cached stories local to this launch.
+            var schemaVersion = 0
+            appDelegate.database.inDatabase { database in
+                schemaVersion = appDelegate.databaseSchemaVersion(database)
+            }
+            let database = FMDatabaseQueue(path: ":memory:")!
+            database.inDatabase { connection in
+                guard let connection else { preconditionFailure("Unable to open the fixture database") }
+                // NewsBlurUITestHarness.swift creates current tables without running disk-image migrations.
+                _ = connection.executeUpdate("PRAGMA user_version = \(schemaVersion)", withArgumentsIn: [])
+                appDelegate.setupDatabase(connection, force: false)
+            }
+            appDelegate.database = database
+            appDelegate.activeUsername = ReaderUITestFixtures.username
+            appDelegate.hasQueuedReadStories = false
+            appDelegate.hasQueuedSavedStories = false
+            readerFeedLoadObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("FinishedLoadingFeedsNotification"), object: nil, queue: .main
+            ) { _ in
+                MainActor.assumeIsolated {
+                    guard appDelegate.activeUsername == ReaderUITestFixtures.username,
+                          !appDelegate.feedsViewController.isOffline,
+                          appDelegate.dictFeeds?[ReaderUITestFixtures.swiftFeedId] != nil else { return }
+                    didFinishReaderFeedLoad = true
+                    // NewsBlurUITestHarness.swift reserves initial navigation for its requested scenario.
+                    appDelegate.feedsViewController.loadWorkItem?.cancel()
+                }
+            }
+        }
+        ReaderUITestURLProtocol.installIfNeeded()
+        CookingMarketingFixtures.installDefaultSessionProtocolIfNeeded()
+        appDelegate.setCustomDomainForTesting(ReaderUITestFixtures.baseURL.absoluteString)
+        appDelegate.setNetworkProtocolClassesForTesting([ReaderUITestURLProtocol.self])
+        appDelegate.resetNetworkManagerForTesting()
+    }
+
+    private static func applyReaderScenario(
+        _ scenario: ReaderScenario,
+        on appDelegate: NewsBlurAppDelegate,
+        remainingRetries: Int
+    ) {
+        guard remainingRetries > 0 else { return }
+        guard appDelegate.dictFeeds != nil else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                applyReaderScenario(scenario, on: appDelegate, remainingRetries: remainingRetries - 1)
+            }
+            return
+        }
+
+        if ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-share-focus") ||
+            ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-focused-pagination") {
+            appDelegate.selectedIntelligence = 1
+            appDelegate.feedsViewController.intelligenceControl.selectedSegmentIndex = 2
+        }
+        switch scenario {
+        case .list:
+            return
+        case .goodReadsList:
+            UserDefaults.standard.set(true, forKey: "show_good_reads")
+            appDelegate.feedsViewController.reloadFeedTitlesTable()
+            appDelegate.feedsViewController.view.layoutIfNeeded()
+        case .techFolder:
+            appDelegate.feedsViewController.selectFolder(CookingMarketingFixtures.enabled ? "Cooking" : "Tech")
+        case .cultureFolder:
+            appDelegate.feedsViewController.selectFolder("Culture")
+        case .swiftFeed:
+            appDelegate.feedsViewController.selectFeed(ReaderUITestFixtures.swiftFeedId, inFolder: CookingMarketingFixtures.enabled ? "Cooking" : "Tech ▸ Swift")
+        case .swiftStoryOne:
+            appDelegate.loadFeed(ReaderUITestFixtures.swiftFeedId, withStory: CookingMarketingFixtures.enabled ? "cooking-pasta-1" : "ui-story-swift-1", animated: false)
+#if DEBUG && targetEnvironment(simulator)
+            if CookingMarketingFixtures.enabled && ProcessInfo.processInfo.arguments.contains("-newsblur-marketing-fullscreen") {
+                prepareMarketingFullscreenReader(on: appDelegate, deadline: ProcessInfo.processInfo.systemUptime + 60)
+            }
+#endif
+        case .cookingSaved:
+            appDelegate.loadStarredDetailView(withStory: nil, showFindingStory: false)
+        case .swiftClusterFeed:
+            appDelegate.loadFeed(ReaderUITestFixtures.swiftClusterFeedId, withStory: nil, animated: false)
+        case .swiftClusterStoryOne:
+            appDelegate.loadFeed(
+                ReaderUITestFixtures.swiftClusterFeedId,
+                withStory: ReaderUITestFixtures.swiftClusterPrimaryStoryHash,
+                animated: false
+            )
+        }
+    }
+
+#if DEBUG && targetEnvironment(simulator)
+    private static func prepareMarketingFullscreenReader(on appDelegate: NewsBlurAppDelegate, deadline: TimeInterval) {
+        guard CookingMarketingFixtures.enabled, !didDismissMarketingFullscreenOverlay else { return }
+        let page = appDelegate.storyPagesViewController?.currentPage
+        let detail = appDelegate.detailViewController
+        // NewsBlurUITestHarness.swift waits for the requested native article's paint gate before using the real sidebar action.
+        if appDelegate.activeStory?["story_hash"] as? String == "cooking-pasta-1",
+           page?.activeStoryId == "cooking-pasta-1", page?.readyForPresentation == true,
+           page?.viewIfLoaded?.window != nil, detail?.isDuoFullscreenReader == true {
+            didDismissMarketingFullscreenOverlay = true
+            detail?.dismissFullscreenSidebarOverlayAfterStorySelection()
+            detail?.view.layoutIfNeeded()
+            NSLog("[NewsBlurMarketing] Fullscreen article ready; fixture sidebar dismissed once")
+            return
+        }
+        precondition(ProcessInfo.processInfo.systemUptime < deadline,
+                     "NewsBlurUITestHarness.swift timed out waiting for the requested fullscreen marketing article")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            prepareMarketingFullscreenReader(on: appDelegate, deadline: deadline)
+        }
+    }
+#endif
+
+    private static func readerScenario(for screen: String) -> ReaderScenario? {
+        switch screen {
+        case "reader":
+            return .list
+        case "reader-good-reads":
+            return .goodReadsList
+        case "reader-folder-tech":
+            return .techFolder
+        case "reader-folder-culture":
+            return .cultureFolder
+        case "reader-feed-swift":
+            return .swiftFeed
+        case "reader-story-swift-1":
+            return .swiftStoryOne
+        case "reader-feed-swift-cluster":
+            return .swiftClusterFeed
+        case "reader-story-swift-cluster-1":
+            return .swiftClusterStoryOne
+        case "cooking-saved" where CookingMarketingFixtures.enabled:
+            return .cookingSaved
+        default:
+            return nil
+        }
+    }
+
+    private static func makeAddSiteViewModel() -> AddSiteViewModel {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AddSiteUITestURLProtocol.self]
+
+        return AddSiteViewModel(
+            appEnvironment: AddSiteUITestEnvironment(),
+            session: URLSession(configuration: configuration)
+        )
+    }
+}
+
+private enum ReaderUITestFixtures {
+    static let baseURL = URL(string: "https://ui-test.newsblur.example")!
+    // NewsBlurUITestHarness.swift gives StoryFirstPageCache a fresh account namespace on every launch.
+    static let username = CookingMarketingFixtures.enabled ? "Alex" : "ui-test-\(UUID().uuidString)"
+    private static let mutationPaths: Set<String> = [
+        "/reader/mark_story_hashes_as_read", "/reader/mark_story_as_unread",
+        "/reader/mark_story_as_starred", "/reader/mark_story_as_unstarred",
+        "/reader/mark_feed_stories_as_read", "/reader/mark_feed_as_read", "/reader/mark_all_as_read",
+    ]
+
+    static let techFeedId = "910001"
+    static let swiftFeedId = "910002"
+    static let cultureFeedId = "910003"
+    static let swiftClusterFeedId = "910004"
+    static let swiftClusterPrimaryStoryHash = "ui-story-swift-cluster-1"
+    static let swiftClusterMatchStoryHash = "ui-story-swift-cluster-match"
+    static let swiftClusterRelatedStoryHash = "ui-story-swift-cluster-related"
+    private static let bulkReadEnabled = ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-bulk-read")
+    private static let cachedImagePaging = ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-cached-image-paging")
+    private static let cachedPagingImageURLs = (0..<3).map { "https://ui-test.newsblur.example/paging-cache-\($0).jpg" }
+    private static let bulkReadLock = NSLock()
+    private static var bulkReadCutoff: Int?
+
+    private static func bulkStories(page: Int) -> [[String: Any]] {
+        bulkReadLock.lock()
+        let cutoff = bulkReadCutoff
+        bulkReadLock.unlock()
+        let start = max(0, page - 1) * 12
+        guard start < 70 else { return [] }
+        return (start..<min(start + 12, 70)).map { index in
+            let timestamp = 1_800_000_000 - index
+            var item = story(hash: "ui-bulk-\(index)", feedID: swiftFeedId,
+                             title: "Bulk story \(index + 1)", content: "<p>Mark older stories read fixture.</p>",
+                             date: "\(index + 1)m", timestamp: timestamp, author: "Reader Fixtures")
+            if cachedImagePaging, index >= 3, index.isMultiple(of: 3) {
+                item["story_content"] = "<p>Cached image paging fixture, story \(index + 1).</p>" +
+                    cachedPagingImageURLs.enumerated().map { "<p><img alt='Cached picture \($0.offset + 1)' src='\($0.element)'></p>" }.joined()
+            }
+            item["read_status"] = index == 0 || cutoff.map { timestamp <= $0 } == true ? 1 : 0
+            return item
+        }
+    }
+
+    private static var swiftUnreadCount: Int {
+        guard bulkReadEnabled else { return 4 }
+        bulkReadLock.lock()
+        defer { bulkReadLock.unlock() }
+        return (1..<70).filter { index in bulkReadCutoff.map { 1_800_000_000 - index > $0 } ?? true }.count
+    }
+
+    private static func markBulkRead(_ request: URLRequest) throws {
+        var data = request.httpBody ?? Data()
+        if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count <= 0 { break }
+                data.append(contentsOf: buffer.prefix(count))
+            }
+        }
+        let query = String(data: data, encoding: .utf8) ?? ""
+        let items = URLComponents(string: "https://fixture.example/?\(query)")?.queryItems ?? []
+        guard let cutoff = items.first(where: { $0.name == "cutoff_timestamp" })?.value.flatMap(Int.init),
+              items.first(where: { $0.name == "direction" })?.value == "older" else { throw URLError(.badURL) }
+        // NewsBlurUITestHarness.swift matches the server's inclusive older cutoff while leaving most stories unloaded.
+        bulkReadLock.lock()
+        bulkReadCutoff = cutoff
+        bulkReadLock.unlock()
+    }
+
+    @MainActor static func prepareAppState(for appDelegate: NewsBlurAppDelegate) {
+        let defaults = UserDefaults.standard
+
+        [
+            "folderCollapsed:everything",
+            "folderCollapsed:Tech",
+            "folderCollapsed:Tech ▸ Swift",
+            "folderCollapsed:Culture",
+        ].forEach { defaults.removeObject(forKey: $0) }
+
+        defaults.set("feeds", forKey: "app_opening")
+        defaults.set("title", forKey: "feed_list_sort_order")
+        defaults.set(false, forKey: "show_infrequent_site_stories")
+        defaults.set(false, forKey: "show_global_shared_stories")
+        defaults.set(false, forKey: "show_widely_read_stories")
+        defaults.set(false, forKey: "show_long_reads")
+        defaults.set(false, forKey: "show_good_reads")
+        defaults.set(true, forKey: "story_clustering")
+        defaults.set("related", forKey: "cluster_mode")
+
+        appDelegate.pendingFolder = nil
+        appDelegate.pendingDailyBriefingStoryHash = nil
+        appDelegate.tryFeedFeedId = nil
+        appDelegate.tryFeedStoryId = nil
+        appDelegate.tryFeedStoryTitle = nil
+        appDelegate.inFindingStoryMode = false
+        appDelegate.activeStory = nil
+        appDelegate.selectedIntelligence = 0
+        appDelegate.storiesCollection.reset()
+
+        cacheFixtureImages(on: appDelegate)
+        cachePagingImages(on: appDelegate)
+        if CookingMarketingFixtures.enabled {
+            CookingMarketingFixtures.prepareImages(on: appDelegate)
+        }
+    }
+
+    private static func cachePagingImages(on appDelegate: NewsBlurAppDelegate) {
+        guard cachedImagePaging else { return }
+        // NewsBlurUITestHarness.swift uses valid JPEGs with trailing padding to reproduce large offline cache entries deterministically.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 240), format: format).image { context in
+            UIColor.systemTeal.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 320, height: 240))
+            UIColor.systemOrange.setFill()
+            context.fill(CGRect(x: 30, y: 30, width: 260, height: 180))
+        }
+        guard var data = image.jpegData(compressionQuality: 0.9) else { return }
+        data.append(Data(repeating: 0x41, count: max(0, 1_048_576 - data.count)))
+        let directory = appDelegate.documentsURL.appendingPathComponent("story_images", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for (index, url) in cachedPagingImageURLs.enumerated() {
+                let file = directory.appendingPathComponent(Utilities.md5(url) + ".jpeg")
+                var imageData = data
+                imageData.append(UInt8(index))
+                try imageData.write(to: file, options: .atomic)
+            }
+        } catch {
+            preconditionFailure("NewsBlurUITestHarness.swift could not prepare cached paging images: \(error)")
+        }
+        // NewsBlurUITestHarness.swift inserts only into the isolated in-memory fixture database.
+        appDelegate.database.inDatabase { database in
+            for index in 3..<70 where index.isMultiple(of: 3) {
+                for url in cachedPagingImageURLs {
+                    _ = database?.executeUpdate("INSERT INTO cached_images (story_feed_id, story_hash, image_url, image_cached, failed) VALUES (?, ?, ?, 1, 0)",
+                                                withArgumentsIn: [swiftFeedId, "ui-bulk-\(index)", url])
+                }
+            }
+        }
+    }
+
+    static func unreadCountRows() -> [[String: Any]] {
+        if CookingMarketingFixtures.enabled { return CookingMarketingFixtures.unreadCountRows() }
+        return [
+            ["feed_id": techFeedId, "ps": 0, "nt": 2, "ng": 0],
+            ["feed_id": swiftFeedId, "ps": 0, "nt": swiftUnreadCount, "ng": 0],
+            ["feed_id": cultureFeedId, "ps": 0, "nt": 1, "ng": 0],
+            ["feed_id": swiftClusterFeedId, "ps": 0, "nt": 3, "ng": 0],
+        ]
+    }
+
+    static func feedListResponse() -> [String: Any] {
+        if CookingMarketingFixtures.enabled { return CookingMarketingFixtures.feedListResponse(username: username) }
+        let response: [String: Any] = [
+            "user": username,
+            "share_ext_token": "ui-test-token",
+            // NewsBlurUITestHarness.swift mirrors the canonical profile returned by /reader/feeds for sharing menus.
+            "social_profile": ["id": "social:1", "user_id": 1, "username": username, "shared_stories_count": 0],
+            "social_services": [:],
+            "user_profile": [
+                "is_premium": 1,
+                "is_archive": 1,
+                "is_pro": 0,
+                "premium_expire": NSNull(),
+                "preferences": [
+                    "story_clustering": true,
+                    "cluster_mode": "related",
+                ],
+            ],
+            "activities": [],
+            "dashboard_rivers": [],
+            "social_feeds": [],
+            "flat_folders_with_inactive": [
+                "Tech": [Int(techFeedId)!],
+                "Tech ▸ Swift": [Int(swiftFeedId)!, Int(swiftClusterFeedId)!],
+                "Culture": [Int(cultureFeedId)!],
+            ],
+            "inactive_feeds": [:],
+            "feeds": [
+                techFeedId: feed(
+                    id: techFeedId,
+                    title: "Arc News",
+                    unreadCount: 2,
+                    address: "https://ui-test.newsblur.example/arc.xml"
+                ),
+                swiftFeedId: feed(
+                    id: swiftFeedId,
+                    title: "Swift Weekly",
+                    unreadCount: swiftUnreadCount,
+                    address: "https://ui-test.newsblur.example/swift.xml"
+                ),
+                cultureFeedId: feed(
+                    id: cultureFeedId,
+                    title: "Design Notes",
+                    unreadCount: 1,
+                    address: "https://ui-test.newsblur.example/design.xml"
+                ),
+                swiftClusterFeedId: feed(
+                    id: swiftClusterFeedId,
+                    title: "Swift Weekly Clustered",
+                    unreadCount: 3,
+                    address: "https://ui-test.newsblur.example/swift-cluster.xml"
+                ),
+            ],
+            "folder_icons": [:],
+            "feed_icons": [:],
+            "saved_searches": [],
+            "starred_count": 0,
+            "starred_counts": [],
+        ]
+
+        return response
+    }
+
+    static func response(for request: URLRequest) throws -> (HTTPURLResponse, Data) {
+        if CookingMarketingFixtures.enabled { return try CookingMarketingFixtures.response(for: request, username: username) }
+        guard let url = request.url else {
+            throw URLError(.badURL)
+        }
+
+        if url.path == "/onboarding-preview.jpg", let imageURL = Bundle.main.url(forResource: "Lyric", withExtension: "jpg") {
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
+                                    headerFields: ["Content-Type": "image/jpeg"])!, try Data(contentsOf: imageURL))
+        }
+
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        let payload: [String: Any]
+
+        if request.httpMethod == "POST", url.path == "/social/share_story",
+           ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-share-focus") {
+            // NewsBlurUITestHarness.swift models the social endpoint's partial payload without publishing a share.
+            var sharedStory = swiftStoriesPageOne[0]
+            sharedStory.removeValue(forKey: "intelligence")
+            sharedStory.removeValue(forKey: "cluster_stories")
+            sharedStory["shared"] = true
+            sharedStory["shared_by_user"] = true
+            sharedStory["read_status"] = 1
+            payload = ["code": 1, "story": sharedStory, "user_profiles": []]
+        } else if request.httpMethod == "POST", mutationPaths.contains(url.path) {
+            if bulkReadEnabled && url.path == "/reader/mark_feed_as_read" { try markBulkRead(request) }
+            payload = ["code": 1]
+        } else if url.path == "/reader/feeds" {
+            if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-newsblur-ui-test-feed-delay"),
+               ProcessInfo.processInfo.arguments.indices.contains(index + 1),
+               let delay = Double(ProcessInfo.processInfo.arguments[index + 1]) {
+                Thread.sleep(forTimeInterval: min(max(delay, 0), 5))
+            }
+            payload = feedListResponse()
+        } else if url.path == "/reader/refresh_feeds" || url.path == "/reader/feed_unread_count" {
+            payload = refreshFeedsResponse()
+        } else if url.path == "/reader/logout" {
+            payload = [
+                "code": 1,
+            ]
+        } else if url.path == "/reader/favicons" {
+            payload = faviconsResponse(for: url)
+        } else if url.path.hasPrefix("/reader/trending_stories") {
+            payload = trendingStoriesResponse(for: url)
+        } else if url.path.hasPrefix("/reader/river_stories") {
+            payload = riverStoriesResponse(for: url)
+        } else if url.path == "/reader/refresh_feed/\(swiftFeedId)",
+                  ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-empty-try-feed") {
+            // NewsBlurUITestHarness.swift keeps the fetch banner observable before returning fetched stories.
+            Thread.sleep(forTimeInterval: 6)
+            var fetched = feedStoriesResponse(feedID: swiftFeedId, stories: swiftStoriesPageOne)
+            fetched["fetched_once"] = true
+            payload = fetched
+        } else if ["/reader/feed/\(swiftFeedId)", "/reader/feed/\(swiftFeedId)/"].contains(url.path),
+                  ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-empty-try-feed") {
+            var empty = feedStoriesResponse(feedID: swiftFeedId, stories: [])
+            empty["fetched_once"] = false
+            empty["not_yet_fetched"] = true
+            payload = empty
+        } else if url.path.hasPrefix("/reader/feed/") {
+            let requestedFeedID = feedID(from: url)
+            if bulkReadEnabled, requestedFeedID == swiftFeedId {
+                payload = feedStoriesResponse(feedID: swiftFeedId, stories: bulkStories(page: pageNumber(from: url)))
+            } else if pageNumber(from: url) == 1, requestedFeedID == swiftFeedId {
+                payload = feedStoriesResponse(feedID: swiftFeedId, stories: swiftStoriesPageOne)
+            } else if pageNumber(from: url) == 2, requestedFeedID == swiftFeedId {
+                payload = feedStoriesResponse(feedID: swiftFeedId, stories: swiftStoriesPageTwo)
+            } else if pageNumber(from: url) == 1, requestedFeedID == swiftClusterFeedId {
+                payload = feedStoriesResponse(feedID: swiftClusterFeedId, stories: swiftClusterStoriesPageOne)
+            } else if pageNumber(from: url) == 1, requestedFeedID == techFeedId {
+                payload = feedStoriesResponse(feedID: techFeedId, stories: techStoriesPageOne)
+            } else if pageNumber(from: url) == 1, requestedFeedID == cultureFeedId {
+                payload = feedStoriesResponse(feedID: cultureFeedId, stories: cultureStoriesPageOne)
+            } else {
+                payload = feedStoriesResponse(feedID: requestedFeedID, stories: [])
+            }
+        } else {
+            throw URLError(.unsupportedURL)
+        }
+
+        return (response, try JSONSerialization.data(withJSONObject: payload))
+    }
+
+    private static func refreshFeedsResponse() -> [String: Any] {
+        [
+            "feeds": [
+                techFeedId: unreadCount(ps: 0, nt: 2, ng: 0),
+                swiftFeedId: unreadCount(ps: 0, nt: swiftUnreadCount, ng: 0),
+                cultureFeedId: unreadCount(ps: 0, nt: 1, ng: 0),
+                swiftClusterFeedId: unreadCount(ps: 0, nt: 3, ng: 0),
+            ],
+            "social_feeds": [:],
+        ]
+    }
+
+    private static func riverStoriesResponse(for url: URL) -> [String: Any] {
+        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let requestedHashes = Set(queryItems.filter { $0.name == "h" }.compactMap(\.value))
+        if !requestedHashes.isEmpty {
+            let allStories = swiftStoriesPageOne + swiftStoriesPageTwo + techStoriesPageOne + cultureStoriesPageOne
+            let stories = allStories.filter { requestedHashes.contains($0["story_hash"] as? String ?? "") }
+            return feedStoriesResponse(feedID: "river", stories: stories)
+        }
+        if ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-focused-pagination") {
+            let page = pageNumber(from: url)
+            // NewsBlurUITestHarness.swift leaves one Focus match per page to exercise paging without scrolling.
+            let stories: [[String: Any]] = (1...3).contains(page) ? (0..<12).map { index in
+                var item = story(hash: "ui-focus-\(page)-\(index)", feedID: swiftFeedId,
+                                 title: "Focus page \(page) story \(index)", content: "<p>Pagination fixture.</p>",
+                                 date: "5m", timestamp: 1_700_001_000 - page * 12 - index,
+                                 author: "Reader Fixtures")
+                item["intelligence"] = ["feed": index == 0 ? 1 : 0, "title": 0, "author": 0, "tags": 0]
+                return item
+            } : []
+            return feedStoriesResponse(feedID: "river", stories: stories)
+        }
+        let activeFeeds = Set(URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .filter { $0.name == "f" }
+            .compactMap(\.value) ?? [])
+
+        let stories: [[String: Any]]
+        if activeFeeds.contains(techFeedId) || activeFeeds.contains(swiftFeedId) {
+            stories = [
+                swiftStoriesPageOne[0],
+                techStoriesPageOne[0],
+                swiftStoriesPageOne[1],
+                techStoriesPageOne[1],
+                swiftStoriesPageOne[2],
+            ]
+        } else if activeFeeds.contains(cultureFeedId) {
+            stories = cultureStoriesPageOne
+        } else {
+            stories = []
+        }
+
+        return [
+            "feed_id": "river",
+            "stories": stories,
+            "classifiers": [:],
+            "feed_tags": [],
+            "feed_authors": [],
+            "user_profiles": [],
+        ]
+    }
+
+    private static func trendingStoriesResponse(for url: URL) -> [String: Any] {
+        let trendingType = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "trending_type" })?
+            .value
+
+        return feedStoriesResponse(
+            feedID: "trending:good_reads",
+            stories: trendingType == "good_reads" ? [
+                story(
+                    hash: "ui-story-good-reads-1",
+                    feedID: techFeedId,
+                    title: "Good Reads Fixture Story",
+                    content: "<p>This deterministic story verifies the Good Reads trending river.</p>",
+                    date: "2m",
+                    timestamp: 1_700_001_250,
+                    author: "Reader Fixtures"
+                ),
+            ] : []
+        )
+    }
+
+    private static func faviconsResponse(for url: URL) -> [String: Any] {
+        let requestedFeedIds = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .filter { $0.name == "feed_ids" }
+            .compactMap(\.value)
+
+        let feedIds = requestedFeedIds?.isEmpty == false
+            ? requestedFeedIds ?? []
+            : [techFeedId, swiftFeedId, cultureFeedId, swiftClusterFeedId]
+
+        return Dictionary(uniqueKeysWithValues: feedIds.map { ($0, NSNull()) })
+    }
+
+    private static func feedStoriesResponse(feedID: String?, stories: [[String: Any]]) -> [String: Any] {
+        [
+            "feed_id": feedID ?? "",
+            "stories": stories,
+            "classifiers": [:],
+            "feed_tags": [],
+            "feed_authors": [],
+            "user_profiles": [],
+        ]
+    }
+
+    private static func pageNumber(from url: URL) -> Int {
+        let page = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "page" })?
+            .value
+        return Int(page ?? "1") ?? 1
+    }
+
+    private static func feedID(from url: URL) -> String? {
+        let components = url.pathComponents
+        guard let readerIndex = components.firstIndex(of: "feed"), readerIndex + 1 < components.count else {
+            return nil
+        }
+
+        return components[readerIndex + 1]
+    }
+
+    private static func feed(id: String, title: String, unreadCount: Int, address: String) -> [String: Any] {
+        [
+            "id": Int(id) ?? 0,
+            "feed_title": title,
+            "feed_address": address,
+            "feed_link": address.replacingOccurrences(of: ".xml", with: ""),
+            "active": true,
+            "feed_opens": unreadCount,
+            "ps": 0,
+            "nt": unreadCount,
+            "ng": 0,
+            "favicon_fade": "707070",
+            "favicon_color": "707070",
+        ]
+    }
+
+    private static func unreadCount(ps: Int, nt: Int, ng: Int) -> [String: Any] {
+        [
+            "ps": ps,
+            "nt": nt,
+            "ng": ng,
+        ]
+    }
+
+    private static func story(
+        hash: String,
+        feedID: String,
+        title: String,
+        content: String,
+        date: String,
+        timestamp: Int,
+        author: String,
+        clusterStories: [[String: Any]] = [],
+        clusterTier: String? = nil,
+        score: Int? = nil
+    ) -> [String: Any] {
+        // NewsBlurUITestHarness.swift holds only the fixture's DOM readiness signal while native reader navigation remains free.
+        let delayedReadiness = ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-delayed-story-ready")
+            ? "<script>window.sampleText=true;setTimeout(function(){window.sampleText=false;notifyLoaded();},4000);</script>"
+            : ""
+        var story: [String: Any] = [
+            "id": hash,
+            "story_hash": hash,
+            "story_feed_id": Int(feedID) ?? 0,
+            "story_title": title,
+            "story_content": delayedReadiness + (ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-images") ? imageViewerContent : "") + content,
+            "story_permalink": "https://ui-test.newsblur.example/story/\(hash)",
+            "story_authors": author,
+            "short_parsed_date": date,
+            "story_timestamp": timestamp,
+            "read_status": 0,
+            "starred": false,
+            "shared": false,
+            "sticky": false,
+            "comment_count": 0,
+            "public_comments": [],
+            "friend_comments": [],
+            "shared_by_public": [],
+            "shared_by_friends": [],
+            "image_urls": [],
+            "secure_image_thumbnails": [:],
+            "intelligence": [
+                "title": 0,
+                "title_regex": 0,
+                "author": 0,
+                "tags": 0,
+                "text": 0,
+                "text_regex": 0,
+                "url": 0,
+                "url_regex": 0,
+                "prompt": 0,
+                "feed": 0,
+            ],
+        ]
+
+        if ProcessInfo.processInfo.arguments.contains("-newsblur-ui-test-share-focus") {
+            story["intelligence"] = ["feed": 1, "title": 0, "author": 0, "tags": 0]
+        }
+        if !clusterStories.isEmpty {
+            story["cluster_stories"] = clusterStories
+        }
+        if let clusterTier {
+            story["cluster_tier"] = clusterTier
+        }
+        if let score {
+            story["score"] = score
+        }
+
+        return story
+    }
+
+    private static func longStoryContent(_ opening: String, paragraphs: Int) -> String {
+        let filler = (1...paragraphs).map { index in
+            """
+            <p>\(opening) Fixture paragraph \(index) keeps the story long enough for scroll-based reader controls, toolbar hiding, and traversal fade behavior to be exercised in UI tests.</p>
+            """
+        }
+
+        return filler.joined()
+    }
+
+    private static let techStoriesPageOne: [[String: Any]] = [
+        story(
+            hash: "ui-story-arc-1",
+            feedID: techFeedId,
+            title: "Arc News Launches a Reader Fixture",
+            content: "<p>This article verifies feed loading from a deterministic test fixture.</p>",
+            date: "10m",
+            timestamp: 1_700_001_010,
+            author: "Reader Fixtures"
+        ),
+        story(
+            hash: "ui-story-arc-2",
+            feedID: techFeedId,
+            title: "Sidebar Selection Still Works",
+            content: "<p>This story exists to keep the Tech folder populated with multiple rows.</p>",
+            date: "20m",
+            timestamp: 1_700_000_950,
+            author: "Regression Tests"
+        ),
+    ]
+
+    private static let swiftStoriesPageOne: [[String: Any]] = [
+        story(
+            hash: "ui-story-swift-1",
+            feedID: swiftFeedId,
+            title: "Swift Fixture Story One",
+            content: longStoryContent(
+                "The first Swift story should open in the detail reader.",
+                paragraphs: 60
+            ),
+            date: "5m",
+            timestamp: 1_700_001_050,
+            author: "Swift Weekly"
+        ),
+        story(
+            hash: "ui-story-swift-2",
+            feedID: swiftFeedId,
+            title: "Swift Fixture Story Two",
+            content: longStoryContent(
+                "The Next story control should move from story one to story two.",
+                paragraphs: 60
+            ),
+            date: "8m",
+            timestamp: 1_700_001_025,
+            author: "Swift Weekly"
+        ),
+        story(
+            hash: "ui-story-swift-3",
+            feedID: swiftFeedId,
+            title: "Swift Fixture Story Three",
+            content: "<p>The Previous story control should be able to navigate back to story two.</p>",
+            date: "12m",
+            timestamp: 1_700_000_980,
+            author: "Swift Weekly"
+        ),
+    ]
+
+    private static let swiftStoriesPageTwo: [[String: Any]] = [
+        story(
+            hash: "ui-story-swift-4",
+            feedID: swiftFeedId,
+            title: "Swift Fixture Story Four",
+            content: "<p>Reaching this story proves the reader fetched the next page of results.</p>",
+            date: "16m",
+            timestamp: 1_700_000_940,
+            author: "Swift Weekly"
+        ),
+    ]
+
+    private static let cultureStoriesPageOne: [[String: Any]] = [
+        story(
+            hash: "ui-story-culture-1",
+            feedID: cultureFeedId,
+            title: "Design Notes Keeps Another Folder Alive",
+            content: "<p>This story confirms a second folder can coexist in the sidebar fixtures.</p>",
+            date: "30m",
+            timestamp: 1_700_000_900,
+            author: "Design Notes"
+        ),
+    ]
+
+    private static let swiftClusterStoriesPageOne: [[String: Any]] = [
+        story(
+            hash: swiftClusterPrimaryStoryHash,
+            feedID: swiftClusterFeedId,
+            title: "Swift Cluster Fixture Headline",
+            content: "<p>This fixture keeps the article short so the bottom story clusters stay visible in a simulator screenshot.</p>",
+            date: "3m",
+            timestamp: 1_700_001_200,
+            author: "Swift Weekly",
+            clusterStories: [
+                story(
+                    hash: swiftClusterMatchStoryHash,
+                    feedID: techFeedId,
+                    title: "Swift Cluster Fixture Headline",
+                    content: "<p>A title match from another feed.</p>",
+                    date: "4m",
+                    timestamp: 1_700_001_180,
+                    author: "Arc News",
+                    clusterTier: "title",
+                    score: 1
+                ),
+                story(
+                    hash: swiftClusterRelatedStoryHash,
+                    feedID: cultureFeedId,
+                    title: "Swift Cluster Fixture Related Coverage",
+                    content: "<p>A related follow-up from a different feed.</p>",
+                    date: "6m",
+                    timestamp: 1_700_001_140,
+                    author: "Design Notes",
+                    clusterTier: "related",
+                    score: 0
+                ),
+            ]
+        ),
+        story(
+            hash: "ui-story-swift-cluster-2",
+            feedID: swiftClusterFeedId,
+            title: "Second Cluster Fixture Story",
+            content: "<p>A plain story to keep the feed layout realistic.</p>",
+            date: "9m",
+            timestamp: 1_700_001_100,
+            author: "Swift Weekly"
+        ),
+    ]
+
+    private static func cacheFixtureImages(on appDelegate: NewsBlurAppDelegate) {
+        let fixtureImages: [(String, UIColor, UIColor)] = [
+            (
+                swiftClusterMatchStoryHash,
+                UIColor(red: 0.42, green: 0.67, blue: 0.53, alpha: 1.0),
+                UIColor(red: 0.20, green: 0.30, blue: 0.24, alpha: 1.0)
+            ),
+            (
+                swiftClusterRelatedStoryHash,
+                UIColor(red: 0.87, green: 0.69, blue: 0.42, alpha: 1.0),
+                UIColor(red: 0.34, green: 0.23, blue: 0.13, alpha: 1.0)
+            ),
+        ]
+
+        for (hash, primary, secondary) in fixtureImages {
+            appDelegate.cacheStoryImage(fixtureImage(primary: primary, secondary: secondary), forStoryHash: hash)
+        }
+    }
+
+    private static var imageViewerContent: String {
+        // StoryImageViewerTests.swift and ReaderUITests.swift use local images without account mutations.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 1600, height: 1000), format: format).image { context in
+            UIColor(red: 0.08, green: 0.25, blue: 0.39, alpha: 1).setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 1600, height: 1000))
+            UIColor(red: 0.95, green: 0.64, blue: 0.26, alpha: 1).setFill()
+            context.cgContext.fillEllipse(in: CGRect(x: 1050, y: 100, width: 240, height: 240))
+            UIColor(red: 0.23, green: 0.65, blue: 0.63, alpha: 1).setFill()
+            let mountain = UIBezierPath()
+            mountain.move(to: CGPoint(x: 0, y: 1000))
+            mountain.addLine(to: CGPoint(x: 600, y: 300))
+            mountain.addLine(to: CGPoint(x: 1300, y: 1000))
+            mountain.close()
+            mountain.fill()
+            ("A closer look" as NSString).draw(at: CGPoint(x: 90, y: 100), withAttributes: [.font: UIFont.systemFont(ofSize: 75, weight: .bold), .foregroundColor: UIColor.white])
+        }
+        let data = image.pngData()!.base64EncodedString()
+        let small = UIGraphicsImageRenderer(size: CGSize(width: 120, height: 80), format: format).image { context in
+            UIColor.systemOrange.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 120, height: 80))
+        }.pngData()!.base64EncodedString()
+        return """
+        <p><a href="https://example.com/linked-story"><img alt="Image viewer landscape fixture" title="The mountain looks smaller from the summit. This is the hover text, not the image description." data-newsblur-original-src="https://example.com/landscape.png" src="data:image/png;base64,\(data)"></a></p>
+        <p><img alt="Small image fixture" width="120" height="80" src="data:image/png;base64,\(small)"></p>
+        """
+    }
+
+    private static func fixtureImage(primary: UIColor, secondary: UIColor) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 120, height: 120))
+        return renderer.image { context in
+            primary.setFill()
+            context.cgContext.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+
+            secondary.setFill()
+            context.cgContext.fill(CGRect(x: 0, y: 70, width: 120, height: 50))
+
+            UIColor(white: 1.0, alpha: 0.18).setFill()
+            context.cgContext.fillEllipse(in: CGRect(x: 16, y: 18, width: 56, height: 56))
+            context.cgContext.fill(CGRect(x: 16, y: 88, width: 88, height: 10))
+        }
+    }
+}
+
+// NewsBlurUITestHarness.swift loads this opt-in editorial dataset only in a Debug simulator.
+// MarketingCooking/README.md documents the fixture account and licensed photographs.
+private enum CookingMarketingFixtures {
+    static var enabled: Bool {
+#if DEBUG && targetEnvironment(simulator)
+        return ProcessInfo.processInfo.arguments.contains("-newsblur-marketing-cooking") &&
+            ProcessInfo.processInfo.arguments.contains("-newsblur-ui-testing")
+#else
+        return false
+#endif
+    }
+
+    @MainActor private static var didInstallDefaultSessionProtocol = false
+
+    @MainActor static func installDefaultSessionProtocolIfNeeded() {
+#if DEBUG && targetEnvironment(simulator)
+        guard enabled, !didInstallDefaultSessionProtocol else { return }
+        // OfflineSyncUnreads.m and FeedDetailObjCViewController.m create their own default sessions.
+        // URLProtocol.registerClass alone does not install the fixture protocol in those configurations.
+        guard let original = class_getClassMethod(URLSessionConfiguration.self,
+                                                  #selector(getter: URLSessionConfiguration.default)),
+              let replacement = class_getClassMethod(URLSessionConfiguration.self,
+                                                     #selector(URLSessionConfiguration.newsblurMarketingDefaultConfiguration)) else {
+            preconditionFailure("Unable to install the isolated cooking fixture network")
+        }
+        method_exchangeImplementations(original, replacement)
+        didInstallDefaultSessionProtocol = true
+#endif
+    }
+
+    private static let lock = NSRecursiveLock()
+    private static let directory: URL = {
+        let args = ProcessInfo.processInfo.arguments
+        if let index = args.firstIndex(of: "-newsblur-marketing-assets"), index + 1 < args.count {
+            return URL(fileURLWithPath: args[index + 1], isDirectory: true)
+        }
+        return Bundle.main.bundleURL.appendingPathComponent("MarketingCooking", isDirectory: true)
+    }()
+    private static let dataset: [String: Any] = {
+        do {
+            let data = try Data(contentsOf: directory.appendingPathComponent("cooking.json"))
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  json["feeds"] is [[String: Any]], json["stories"] is [[String: Any]] else {
+                preconditionFailure("MarketingCooking/cooking.json must contain feeds and stories")
+            }
+            return json
+        } catch {
+            preconditionFailure("Install MarketingCooking beside the simulator app before launching: \(error)")
+        }
+    }()
+    private static var feeds: [[String: Any]] { dataset["feeds"] as! [[String: Any]] }
+    private static var recipes: [[String: Any]] { dataset["stories"] as! [[String: Any]] }
+    private static var saved: Set<String> = Set(recipes.filter { $0["saved"] as? Bool == true }.compactMap { $0["id"] as? String })
+    private static var read: Set<String> = []
+    private static var training: [String: [String: [String: Int]]] = [:]
+    private static let epoch = Int(Date().timeIntervalSince1970)
+    private static let photoData: [String: Data] = {
+        var result: [String: Data] = [:]
+        for recipe in recipes {
+            guard let name = recipe["photo"] as? String, result[name] == nil else { continue }
+            do { result[name] = try Data(contentsOf: directory.appendingPathComponent("photos/\(name).jpg")) }
+            catch { preconditionFailure("Missing cooking photograph \(name): \(error)") }
+        }
+        return result
+    }()
+
+    @MainActor static func prepareImages(on appDelegate: NewsBlurAppDelegate) {
+        for recipe in recipes {
+            guard let hash = recipe["id"] as? String, let name = recipe["photo"] as? String,
+                  let data = photoData[name], let image = UIImage(data: data) else { continue }
+            appDelegate.cacheStoryImage(image, forStoryHash: hash)
+        }
+        for feed in feeds {
+            guard let id = feed["id"] as? String, let title = feed["title"] as? String,
+                  let hex = feed["color"] as? String, let rgb = UInt32(hex, radix: 16) else { continue }
+            let icon = UIGraphicsImageRenderer(size: CGSize(width: 48, height: 48)).image { context in
+                UIColor(red: CGFloat((rgb >> 16) & 255) / 255, green: CGFloat((rgb >> 8) & 255) / 255,
+                        blue: CGFloat(rgb & 255) / 255, alpha: 1).setFill()
+                context.fill(CGRect(x: 0, y: 0, width: 48, height: 48))
+                (String(title.prefix(1)) as NSString).draw(at: CGPoint(x: 12, y: 6), withAttributes: [
+                    .font: UIFont.systemFont(ofSize: 28, weight: .semibold), .foregroundColor: UIColor.white
+                ])
+            }
+            appDelegate.saveFavicon(icon, feedId: id)
+        }
+    }
+
+    static func unreadCountRows() -> [[String: Any]] {
+        lock.lock(); defer { lock.unlock() }
+        return feeds.map { feed in
+            let id = feed["id"] as! String
+            let count = recipes.filter { $0["feed_id"] as? String == id && !read.contains($0["id"] as! String) }.count
+            return ["feed_id": id, "ps": 0, "nt": count, "ng": 0]
+        }
+    }
+
+    static func feedListResponse(username: String) -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        let counts = unreadCountRows()
+        var feedMap: [String: Any] = [:]
+        for feed in feeds {
+            let id = feed["id"] as! String
+            let color = feed["color"] as! String
+            feedMap[id] = ["id": Int(id)!, "feed_title": feed["title"]!,
+                           "feed_address": "https://ui-test.newsblur.example/\(id).xml",
+                           "feed_link": "https://ui-test.newsblur.example/\(id)", "active": true,
+                           "feed_opens": 12, "ps": 0, "nt": counts.first { $0["feed_id"] as? String == id }?["nt"] ?? 0,
+                           "ng": 0, "favicon_color": color, "favicon_fade": color]
+        }
+        let args = ProcessInfo.processInfo.arguments
+        let languageIndex = args.firstIndex(of: "-newsblur_language")
+        let language = languageIndex.flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } ?? "en"
+        return [
+            "user": username, "share_ext_token": "cooking-demo-token",
+            "social_profile": ["id": "social:1", "user_id": 1, "username": username, "shared_stories_count": 0],
+            "social_services": [:], "activities": [], "dashboard_rivers": [], "social_feeds": [],
+            "user_profile": ["is_premium": 1, "is_archive": 1, "is_pro": 0, "premium_expire": NSNull(),
+                             "preferences": ["language": language, "story_clustering": false]],
+            "flat_folders_with_inactive": ["Cooking": feeds.map { Int($0["id"] as! String)! }],
+            "inactive_feeds": [:], "feeds": feedMap, "folder_icons": [:], "feed_icons": [:],
+            "saved_searches": [], "starred_count": saved.count, "starred_counts": []
+        ]
+    }
+
+    private static func story(_ recipe: [String: Any], index: Int) -> [String: Any] {
+        let id = recipe["id"] as! String
+        let feedID = recipe["feed_id"] as! String
+        let photo = recipe["photo"] as! String
+        let title = recipe["title"] as! String
+        let data = photoData[photo]!.base64EncodedString()
+        let paragraphs = recipe["paragraphs"] as! [String]
+        let html = "<p>\(paragraphs[0])</p><p><img src=\"data:image/jpeg;base64,\(data)\" alt=\"\(title)\" style=\"width:100%;height:auto;\"></p>" +
+            paragraphs.dropFirst().map { "<p>\($0)</p>" }.joined()
+        let imageURL = "https://ui-test.newsblur.example/cooking-photo/\(photo).jpg"
+        return [
+            "id": id, "story_hash": id, "story_feed_id": Int(feedID)!, "story_title": title,
+            "story_content": html, "story_permalink": "https://ui-test.newsblur.example/story/\(id)",
+            "story_authors": recipe["author"]!, "story_tags": recipe["tags"]!,
+            "short_parsed_date": "\((index + 1) * 7)m", "story_timestamp": epoch - (index + 1) * 420,
+            "read_status": read.contains(id) ? 1 : 0, "starred": saved.contains(id), "shared": false,
+            "sticky": false, "comment_count": 0, "public_comments": [], "friend_comments": [],
+            "shared_by_public": [], "shared_by_friends": [], "user_tags": [],
+            "image_urls": [imageURL], "secure_image_thumbnails": [imageURL: imageURL],
+            "intelligence": ["title": 0, "author": 0, "tags": 0, "feed": 0]
+        ]
+    }
+
+    private static func classifiers(for feedID: String) -> [String: [String: Int]] {
+        var result: [String: [String: Int]] = ["titles": [:], "authors": [:], "tags": [:], "feeds": [:],
+                                             "texts": [:], "urls": [:], "title_regex": [:], "author_regex": [:],
+                                             "text_regex": [:], "url_regex": [:]]
+        for (key, value) in training[feedID] ?? [:] { result[key] = value }
+        return result
+    }
+
+    private static func storiesResponse(_ selected: [[String: Any]], feedID: String?) -> [String: Any] {
+        let stories = selected.map { recipe in story(recipe, index: recipes.firstIndex { $0["id"] as? String == recipe["id"] as? String } ?? 0) }
+        let allClassifiers = Dictionary(uniqueKeysWithValues: feeds.map { ($0["id"] as! String, classifiers(for: $0["id"] as! String)) })
+        let responseClassifiers: Any
+        if let feedID { responseClassifiers = classifiers(for: feedID) }
+        else { responseClassifiers = allClassifiers }
+        return ["feed_id": feedID ?? "river", "stories": stories,
+                "classifiers": responseClassifiers,
+                "feed_tags": [["Weeknight", 6], ["Seasonal", 4], ["Baking", 3]],
+                "feed_authors": Array(Set(selected.compactMap { $0["author"] as? String })).sorted().map { [$0, 3] as [Any] },
+                "user_profiles": []]
+    }
+
+    private static func queryItems(for request: URLRequest) -> [URLQueryItem] {
+        var items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        var body = request.httpBody
+        if body == nil, let stream = request.httpBodyStream {
+            stream.open(); defer { stream.close() }
+            var collected = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count > 0 else { break }
+                collected.append(buffer, count: count)
+            }
+            body = collected
+        }
+        if let body, let text = String(data: body, encoding: .utf8) {
+            items += URLComponents(string: "https://fixture.example/?\(text.replacingOccurrences(of: "+", with: "%20"))")?.queryItems ?? []
+        }
+        return items
+    }
+
+    static func response(for request: URLRequest, username: String) throws -> (HTTPURLResponse, Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard let url = request.url, url.host == "ui-test.newsblur.example" else { throw URLError(.unsupportedURL) }
+        let items = queryItems(for: request)
+        func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
+        let path = url.path
+        if path.hasPrefix("/cooking-photo/") {
+            let name = url.deletingPathExtension().lastPathComponent
+            guard let data = photoData[name] else { throw URLError(.fileDoesNotExist) }
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "image/jpeg"])!, data)
+        }
+        let payload: [String: Any]
+        if path == "/rss_feeds/original_text" {
+            let recipe = recipes.first { $0["id"] as? String == (value("story_id") ?? value("story_hash")) } ?? recipes[0]
+            payload = ["original_text": story(recipe, index: 0)["story_content"]!, "code": 1]
+        } else if request.httpMethod == "POST" {
+            let hashes = items.filter { ["story_hash", "story_hashes", "story_hashes[]", "story_id"].contains($0.name) }.compactMap(\.value)
+            switch path {
+            case "/reader/mark_story_as_starred": saved.formUnion(hashes)
+            case "/reader/mark_story_as_unstarred": saved.subtract(hashes)
+            case "/reader/mark_story_hashes_as_read": read.formUnion(hashes)
+            case "/reader/mark_story_as_unread": read.subtract(hashes)
+            case "/reader/mark_feed_as_read", "/reader/mark_feed_stories_as_read":
+                read.formUnion(recipes.filter { $0["feed_id"] as? String == value("feed_id") }.compactMap { $0["id"] as? String })
+            case "/reader/mark_all_as_read": read.formUnion(recipes.compactMap { $0["id"] as? String })
+            case "/classifier/save":
+                let feedID = value("feed_id") ?? "910002"
+                var rules = training[feedID] ?? [:]
+                for item in items {
+                    guard let name = item.value else { continue }
+                    let prefixes = [("super_dislike_", -2), ("dislike_", -1), ("remove_like_", 0), ("remove_dislike_", 0), ("like_", 1)]
+                    guard let (prefix, score) = prefixes.first(where: { item.name.hasPrefix($0.0) }) else { continue }
+                    let kind = String(item.name.dropFirst(prefix.count))
+                    let key = ["author": "authors", "tag": "tags", "title": "titles", "feed": "feeds", "text": "texts", "url": "urls"][kind] ?? kind
+                    var values = rules[key] ?? [:]
+                    if score == 0 { values.removeValue(forKey: name) } else { values[name] = score }
+                    rules[key] = values
+                }
+                training[feedID] = rules
+            case "/profile/set_preference", "/reader/logout": break
+            default: throw URLError(.unsupportedURL)
+            }
+            payload = ["code": 1]
+        } else if path == "/reader/feeds" {
+            payload = feedListResponse(username: username)
+        } else if path == "/reader/unread_story_hashes" {
+            // OfflineSyncUnreads.m needs feed-keyed hash/timestamp tuples to finish syncing and start its local fetch queue.
+            var hashes = Dictionary(uniqueKeysWithValues: feeds.map { ($0["id"] as! String, [[Any]]()) })
+            for (index, recipe) in recipes.enumerated() {
+                let hash = recipe["id"] as! String
+                guard !read.contains(hash) else { continue }
+                hashes[recipe["feed_id"] as! String, default: []].append([hash, epoch - (index + 1) * 420])
+            }
+            payload = ["unread_feed_story_hashes": hashes]
+        } else if path == "/reader/refresh_feeds" || path == "/reader/feed_unread_count" {
+            payload = ["feeds": Dictionary(uniqueKeysWithValues: unreadCountRows().map { ($0["feed_id"] as! String, ["ps": $0["ps"]!, "nt": $0["nt"]!, "ng": $0["ng"]!]) }), "social_feeds": [:]]
+        } else if path == "/reader/favicons" {
+            payload = Dictionary(uniqueKeysWithValues: feeds.map { ($0["id"] as! String, NSNull()) })
+        } else if path.hasPrefix("/reader/feed/") || path.hasPrefix("/reader/river_stories") || path.hasPrefix("/reader/starred_stories") {
+            let feedID = path.hasPrefix("/reader/feed/") ? url.pathComponents.last : nil
+            let selectedIDs = Set(items.filter { ["f", "f[]", "feeds", "feeds[]"].contains($0.name) }.compactMap(\.value))
+            let hashes = Set(items.filter { ["h", "h[]"].contains($0.name) }.compactMap(\.value))
+            let selected = (Int(value("page") ?? "1") ?? 1) > 1 ? [] : recipes.filter { recipe in
+                let id = recipe["id"] as! String
+                let source = recipe["feed_id"] as! String
+                return (feedID == nil || source == feedID) && (selectedIDs.isEmpty || selectedIDs.contains(source)) &&
+                    (hashes.isEmpty || hashes.contains(id)) && (!path.hasPrefix("/reader/starred_stories") || saved.contains(id))
+            }
+            payload = storiesResponse(selected, feedID: feedID)
+        } else { throw URLError(.unsupportedURL) }
+        return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!,
+                try JSONSerialization.data(withJSONObject: payload))
+    }
+}
+
+#if DEBUG && targetEnvironment(simulator)
+private extension URLSessionConfiguration {
+    @objc class func newsblurMarketingDefaultConfiguration() -> URLSessionConfiguration {
+        // NewsBlurUITestHarness.swift exchanges this method only for an opted-in cooking capture process.
+        let configuration = newsblurMarketingDefaultConfiguration()
+        configuration.protocolClasses = [ReaderUITestURLProtocol.self] +
+            (configuration.protocolClasses ?? []).filter { $0 != ReaderUITestURLProtocol.self }
+        return configuration
+    }
+}
+#endif
+
+private final class ReaderUITestURLProtocol: URLProtocol {
+    private static var isInstalled = false
+
+    static func installIfNeeded() {
+        guard !isInstalled else { return }
+        _ = URLProtocol.registerClass(ReaderUITestURLProtocol.self)
+        isInstalled = true
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == ReaderUITestFixtures.baseURL.host
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        do {
+            let (response, data) = try ReaderUITestFixtures.response(for: request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class AddSiteUITestEnvironment: AddSiteViewModelAppEnvironment {
+    let url: String? = "https://ui-test.newsblur.example"
+    let dictFoldersArray: Any? = [
+        "Tech",
+        "Tech \u{25B8} Swift"
+    ]
+}
+
+private final class AddSiteUITestURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        do {
+            let (response, data) = try mockedResponse(for: request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+
+    private func mockedResponse(for request: URLRequest) throws -> (HTTPURLResponse, Data) {
+        guard let url = request.url else {
+            throw URLError(.badURL)
+        }
+
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+
+        switch url.path {
+        case "/rss_feeds/feed_autocomplete":
+            let term = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "term" })?
+                .value ?? ""
+            let payload: [String: Any] = [
+                "term": term,
+                "feeds": [
+                    [
+                        "feed_title": "Swift UI Test Feed",
+                        "feed_address": "https://ui-test.newsblur.example/swift.xml",
+                        "num_subscribers": 42,
+                        "last_story_seconds_ago": 3600
+                    ],
+                    [
+                        "feed_title": "Engineering UI Test Feed",
+                        "feed_address": "https://ui-test.newsblur.example/engineering.xml",
+                        "num_subscribers": 17,
+                        "last_story_seconds_ago": 7200
+                    ]
+                ]
+            ]
+            return (response, try JSONSerialization.data(withJSONObject: payload))
+        case "/reader/add_url":
+            let payload: [String: Any] = ["code": 1]
+            return (response, try JSONSerialization.data(withJSONObject: payload))
+        default:
+            throw URLError(.unsupportedURL)
+        }
+    }
+}
+
+// NewsBlurUITestHarness.swift intercepts every Discover request, including mutations and unexpected URLs.
+private final class DiscoverSitesUITestURLProtocol: URLProtocol {
+    private var delayedResponse: DispatchWorkItem?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() { delayedResponse?.cancel() }
+
+    override func startLoading() {
+        // NewsBlurUITestHarness.swift keeps slow bundle requests pending while testing immediate dismissal.
+        let slowPreview = ProcessInfo.processInfo.arguments.contains("-onboarding-slow-previews") &&
+            request.url?.path == "/discover/popular_feeds" && request.url?.query?.contains("category=") == true
+        let slowAddition = ProcessInfo.processInfo.arguments.contains("-onboarding-slow-additions") && request.url?.path == "/reader/add_url"
+        let progressivePreview = ProcessInfo.processInfo.arguments.contains("-onboarding-progressive-previews") &&
+            request.url?.path == "/discover/popular_feeds" && request.url?.query?.contains("category=") == true &&
+            request.url?.query?.contains("type=rss") != true
+        let slowCatalog = ProcessInfo.processInfo.arguments.contains("-onboarding-slow-catalog") &&
+            request.url?.path == "/discover/popular_feeds" && request.url?.query?.contains("limit=1") == true
+        let iconID = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "feed_ids" })?.value }
+        let slowIcon = ProcessInfo.processInfo.arguments.contains("-onboarding-progressive-icons") &&
+            request.url?.path == "/reader/favicons" && OnboardingIconCatalog.cards[""]?.prefix(5).dropFirst().contains(where: { $0.id == iconID }) == true
+        if slowPreview || slowAddition || progressivePreview || slowCatalog || slowIcon {
+
+            let work = DispatchWorkItem { [weak self] in self?.sendResponse() }
+            delayedResponse = work
+            DispatchQueue.global().asyncAfter(deadline: .now() + (slowIcon ? 12 : slowCatalog ? 10 : progressivePreview ? 20 : 8), execute: work)
+        } else {
+            sendResponse()
+        }
+    }
+
+    private func sendResponse() {
+        do {
+            guard let url = request.url, url.host == ReaderUITestFixtures.baseURL.host else {
+                throw URLError(.unsupportedURL)
+            }
+            let payload = try responsePayload(url: url)
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
+                                           headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: try JSONSerialization.data(withJSONObject: payload))
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    private func parameters(url: URL) -> [String: String] {
+        var data = request.httpBody ?? Data()
+        if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count <= 0 { break }
+                data.append(contentsOf: buffer.prefix(count))
+            }
+        }
+        let query = String(data: data, encoding: .utf8) ?? ""
+        let components = URLComponents(string: "https://fixture.example/?\(query)")
+        let items = (URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+            + (components?.queryItems ?? [])
+        return items.reduce(into: [:]) { $0[$1.name] = $1.value ?? "" }
+    }
+
+    private func feed(_ name: String, slug: String) -> [String: Any] {
+        ["feed_title": name, "feed_address": "https://ui-test.newsblur.example/\(slug).xml",
+         "feed_link": "https://ui-test.newsblur.example/\(slug)", "num_subscribers": 1240,
+         "average_stories_per_month": 18, "description": "Independent reporting, useful ideas, and thoughtful stories.",
+         "stories": [
+            ["story_hash": "ui-story-swift-1", "story_title": "Swift Fixture Story One",
+             "story_authors": "First Author", "story_content": "<p>The first preview includes useful article text.</p>"],
+            ["story_hash": "ui-story-swift-2", "story_title": "Swift Fixture Story Two",
+             "story_authors": "Second Author",
+             "story_content": "<p>Second preview excerpt includes <strong>the actual story</strong> &amp; its context.</p><p>Another paragraph supplies enough text to fill two lines in the preview without showing HTML markup or taking over the page.</p>"]
+         ]]
+    }
+
+    private func responsePayload(url: URL) throws -> [String: Any] {
+        if url.path == "/api/social/account" {
+            return ["code": 1, "providers": ["apple", "google"], "has_password": false]
+        }
+        if url.path == "/reader/add_feeds", request.httpMethod == "GET" {
+            return ["batch_add_supported": false]
+        }
+        let params = parameters(url: url)
+        if url.path.hasPrefix("/discover/similar/") {
+            if (Int(params["page"] ?? "1") ?? 1) > 1 { return ["discover_feeds": [:]] }
+            var related = feed("Related Journal", slug: "folder-required")
+            related["last_story_date"] = "2000-01-02T00:00:00Z"
+            return ["discover_feeds": ["fixture-related": [
+                "feed": related, "stories": related["stories"] ?? []
+            ]]]
+        }
+        switch url.path {
+        case "/reader/favicons":
+            let ids = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.filter { $0.name == "feed_ids" }.compactMap(\.value) ?? []
+            return ids.reduce(into: [:]) { response, id in
+                let number = Int(id) ?? 0
+                let image = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 24)).image { context in
+                    UIColor(hue: CGFloat(number % 251) / 251, saturation: 0.8, brightness: 0.85, alpha: 1).setFill()
+                    context.fill(CGRect(x: 0, y: 0, width: 24, height: 24))
+                    UIColor.white.setFill()
+                    context.fill(CGRect(x: 3 + number % 11, y: 4, width: 5, height: 15))
+                }
+                response[id] = image.pngData()?.base64EncodedString()
+            }
+        case "/discover/trending":
+            return ["trending_feeds": ["fixture-trending": ["feed": feed("The Daily Perspective", slug: "daily"),
+                "stories": [["story_title": "A better way to follow the news", "story_authors": "Alex Morgan"]]]]]
+        case "/discover/autocomplete":
+            let science = (params["term"] ?? "").localizedCaseInsensitiveContains("science")
+            return ["term": params["term"] ?? "", "feeds": [
+                ["label": science ? "Science Daily" : "Swift by Sundell",
+                 "value": "https://ui-test.newsblur.example/\(science ? "science" : "swift").xml", "num_subscribers": 42]
+            ]]
+        case "/discover/popular_feeds":
+            let type = params["type"] ?? "all"
+            if ProcessInfo.processInfo.arguments.contains("onboarding") ||
+                (params["staleness"] == "year" && params["exclude_subscribed"] == "false") {
+                let types = type == "all" ? ["rss", "newsletter", "youtube", "reddit", "podcast"] : [type]
+                let titles = ["rss": "Independent Journal", "youtube": "Practical Engineering", "reddit": "r/science",
+                              "newsletter": "The Marginalian", "podcast": "Radiolab"]
+                let icons = ["rss": "newspaper.fill", "newsletter": "envelope.fill", "youtube": "play.rectangle.fill",
+                             "reddit": "bubble.left.and.bubble.right.fill", "podcast": "mic.fill"]
+                let entries: [[String: Any]] = types.map { source in
+                    var entry = feed(titles[source] ?? source, slug: source)
+                    entry["feed_url"] = entry["feed_address"]
+                    entry["feed_type"] = source
+                    entry["last_story_date"] = Date().ISO8601Format()
+                    entry["favicon"] = UIImage(systemName: icons[source] ?? "globe")?.withTintColor(.systemTeal, renderingMode: .alwaysOriginal).pngData()?.base64EncodedString()
+                    if params["include_stories"] == "true", var stories = entry["stories"] as? [[String: Any]] {
+                        stories.append(["story_title": "Why scientists are changing the way we understand our world",
+                                        "story_content": "<p>A third recent preview for this source.</p>"])
+                        for index in stories.indices {
+                            stories[index]["story_hash"] = source + "-story-" + String(index)
+                            stories[index]["story_title"] = index == 0 ? "New discoveries reveal how the natural world works" : "How researchers are finding answers to important questions"
+                            stories[index]["image_urls"] = ["https://ui-test.newsblur.example/onboarding-preview.jpg"]
+                        }
+                        entry["stories"] = stories
+                    } else { entry["stories"] = [] }
+                    return entry
+                }
+                return ["feeds": entries, "has_more": false, "categories": ["Technology", "Science", "Design", "Food", "Travel", "Books"]]
+            }
+            if params["query"] == "catalog fallback" {
+                return ["feeds": [feed("Catalog Science", slug: "catalog-science")], "has_more": false]
+            }
+            let titles = ["all": "The Daily Perspective", "youtube": "Practical Engineering", "reddit": "r/science",
+                          "newsletter": "The Marginalian", "podcast": "Radiolab"]
+            let title = params["subcategory"].map { "\($0) sites" }
+                ?? params["category"].map { "\($0) sites" }
+                ?? titles[type] ?? "Independent Journal"
+            var catalogFeed = feed(title, slug: type)
+            catalogFeed["title"] = ProcessInfo.processInfo.arguments.contains("onboarding") ? (titles[type] ?? "Independent Journal") : title
+            catalogFeed["feed_url"] = catalogFeed["feed_address"]
+            catalogFeed["feed_type"] = type
+            return ["feeds": [catalogFeed], "has_more": false,
+                    "categories": ["Technology", "Science", "Design", "Food", "Travel", "Books"],
+                    "grouped_categories": [["name": "Technology", "feed_count": 1,
+                                            "subcategories": [["name": "Engineering", "feed_count": 1]]]],
+                    "platform_counts": ["substack": 1, "beehiiv": 1]]
+        case "/discover/youtube/search", "/discover/reddit/search", "/discover/podcast/search":
+            if params["query"] == "catalog fallback" {
+                return ["code": -1, "message": "Reddit API request failed.", "results": []]
+            }
+            let type = url.path.components(separatedBy: "/")[2]
+            return ["results": [feed("\(type.capitalized) Science Result", slug: "\(type)-science")]]
+        case "/discover/newsletter/convert":
+            return ["feed_url": "https://ui-test.newsblur.example/newsletter.xml"]
+        case "/discover/link_popular_feed":
+            return ["feed_id": Int(ReaderUITestFixtures.swiftFeedId) ?? 1]
+        case "/reader/add_url":
+            if params["url"]?.contains("missing") == true {
+                return ["code": -1, "message": "No feed was found at this address. Check the URL and try again."]
+            }
+            if params["url"]?.contains("folder-required") == true && params["folder"] != "Swift" {
+                return ["code": -1, "message": "Choose the Swift folder before adding this fixture."]
+            }
+            return ["code": 1]
+        case "/discover/google-news/feed":
+            return ["feed_url": "https://ui-test.newsblur.example/google-news.xml"]
+        case "/webfeed/analyze":
+            if params["url"]?.contains("blocked") == true {
+                return ["code": -1, "message": "This page could not be accessed. Try a public page."]
+            }
+            if params["url"]?.contains("rss") == true {
+                return ["code": 2, "feed_address": "https://ui-test.newsblur.example/existing.xml"]
+            }
+            return ["code": 1]
+        case "/webfeed/status":
+            return ["status": "complete", "variants_data": ["page_title": "Independent Journal", "html_hash": "fixture-hash",
+                "variants": [
+                    ["label": "Latest articles", "story_container": "//article", "title": ".//h2", "link": ".//a/@href",
+                     "preview_stories": [["title": "How cities are changing", "link": "https://ui-test.newsblur.example/cities"]]],
+                    ["label": "Featured stories", "story_container": "//section/article", "title": ".//h3", "link": ".//a/@href",
+                     "preview_stories": [["title": "Ideas for a quieter internet", "link": "https://ui-test.newsblur.example/ideas"]]]
+                ]]]
+        case "/webfeed/subscribe":
+            guard params["variant_index"] == "1", params["story_container_xpath"] == "//section/article" else {
+                return ["code": -1, "message": "Choose Featured stories to verify the selected variant."]
+            }
+            return ["code": 1]
+        default:
+            throw URLError(.unsupportedURL)
+        }
+    }
+}

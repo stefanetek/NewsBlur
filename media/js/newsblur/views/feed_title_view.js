@@ -84,6 +84,8 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
         Backbone.View.prototype.remove.call(this);
     },
 
+    // feed_title_view.js: dir="auto" on .feed_title isolates the feed name, so a title in another
+    // script keeps its punctuation and truncates at its own end (see media/css/reader/reader_rtl.css).
     render: function () {
         var feed = this.model;
         var extra_classes = this.extra_classes();
@@ -108,47 +110,51 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
                         var end_date = NEWSBLUR.reader.flags.date_filter_end;\
                         if (start_date && end_date) { %>\
                         <% if (start_date === end_date) { %>\
-                        Stories on <%= start_date %>\
+                        <%- interpolate(gettext("Stories on %(date)s"), {date: start_date}, true) %>\
                         <% } else { %>\
-                        Stories from <%= start_date %> to <%= end_date %>\
+                        <%- interpolate(gettext("Stories from %(start_date)s to %(end_date)s"), {start_date: start_date, end_date: end_date}, true) %>\
                         <% } %>\
                         &middot;\
                       <% } else if (start_date) { %>\
-                        Stories newer than <%= start_date %>\
+                        <%- interpolate(gettext("Stories newer than %(date)s"), {date: start_date}, true) %>\
                         &middot;\
                       <% } else if (end_date) { %>\
-                        Stories older than <%= end_date %>\
+                        <%- interpolate(gettext("Stories older than %(date)s"), {date: end_date}, true) %>\
                         &middot;\
                       <% } %>\
-                      <%= NEWSBLUR.assets.view_setting(feed.id, "read_filter") %>\
+                      <%- setting_label(read_filter) %>\
                       &middot;\
-                      <%= NEWSBLUR.assets.view_setting(feed.id, "order") %>\
+                      <%- setting_label(NEWSBLUR.assets.view_setting(feed.id, "order")) %>\
                       <% if (has_notifications && has_notifications.length) { %>\
                           &middot;\
                           <div class="NB-feedbar-notifications-icon"></div>\
+                      <% } %>\
+                      <% if (has_auto_mark_read) { %>\
+                          &middot;\
+                          <div class="NB-feedbar-auto-mark-read-icon"></div>\
                       <% } %>\
                   </span>\
               </div>\
               <div class="NB-story-title-indicator">\
                   <div class="NB-story-title-indicator-count"></div>\
-                  <span class="NB-story-title-indicator-text">show hidden stories</span>\
+                  <span class="NB-story-title-indicator-text"><%- gettext("show hidden stories") %></span>\
               </div>\
               <% if (show_discover) { %>\
                 <div class="NB-feedbar-discover-container">\
                     <div class="NB-feedbar-discover-icon"></div>\
                     <% if (feed.get("similar_feeds") && feed.get("similar_feeds").length) { %>\
                         <% _.map(feed.get("similar_feeds"), (feed_id) => { %>\
-                            <img class="feed_favicon" src="<%= $.favicon(feed_id) %>">\
+                            <%= $.favicon_html(feed_id) %>\
                         <% }); %>\
                     <% } else { %>\
-                        <span class="NB-feedbar-discover-text">Related</span>\
+                        <span class="NB-feedbar-discover-text"><%- gettext("Related Sites") %></span>\
                     <% } %>\
                     <div class="NB-icon"></div>\
                 </div>\
               <% } %>\
           <% } %>\
-          <img class="feed_favicon" src="<%= $.favicon(feed) %>" <% if (type == "story") { %>role="button"<% } %>>\
-          <span class="feed_title">\
+          <%= $.favicon_html(feed, { role: type == "story" ? "button" : null }) %>\
+          <span class="feed_title" dir="auto">\
             <%= feed.get("feed_title") %>\
           </span>\
           <div class="NB-feed-exception-icon"></div>\
@@ -157,21 +163,25 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
           <div class="NB-feed-highlight"></div>\
           <% if (organizer) { %>\
               <div class="NB-feed-organizer-sort NB-feed-organizer-subscribers">\
-                <%= pluralize("subscriber", feed.get("num_subscribers"), true) %>\
+                <%- interpolate(ngettext("%(count)s subscriber", "%(count)s subscribers", feed.get("num_subscribers")), {count: Inflector.commas(feed.get("num_subscribers"))}, true) %>\
               </div>\
               <div class="NB-feed-organizer-sort NB-feed-organizer-laststory">\
                 <%= feed.relative_last_story_date() %>\
               </div>\
               <div class="NB-feed-organizer-sort NB-feed-organizer-monthlycount">\
-                <%= pluralize("story", feed.get("average_stories_per_month"), true) %>/month\
+                <%- interpolate(ngettext("%(count)s story/month", "%(count)s stories/month", feed.get("average_stories_per_month")), {count: Inflector.commas(feed.get("average_stories_per_month"))}, true) %>\
               </div>\
               <div class="NB-feed-organizer-sort NB-feed-organizer-opens">\
-                <%= pluralize("open", feed.get("feed_opens"), true) %>\
+                <%- interpolate(ngettext("%(count)s open", "%(count)s opens", feed.get("feed_opens")), {count: Inflector.commas(feed.get("feed_opens"))}, true) %>\
               </div>\
           <% } %>\
         </<%= list_type %>>\
         ', {
             feed: feed,
+            read_filter: NEWSBLUR.classifier_filter_utils.read_filter_for_matching_view(
+                NEWSBLUR.assets.view_setting(feed.id, "read_filter"),
+                NEWSBLUR.reader.flags['classifier_filter']
+            ),
             type: this.options.type,
             disable_hover: this.options.disable_hover,
             extra_classes: extra_classes,
@@ -181,9 +191,25 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
             highlighted: this.options.feed_chooser &&
                 this.model.highlighted_in_folder(this.options.folder_title),
             organizer: this.options.organizer,
-            pluralize: Inflector.pluralize,
+            setting_label: this.setting_label,
             show_discover: NEWSBLUR.assets.preference("show_discover"),
-            has_notifications: this.model.get('notification_types') || []
+            has_notifications: this.model.get('notification_types') || [],
+            has_auto_mark_read: (function () {
+                // Feed has its own setting
+                if (this.model.get('auto_mark_read_days') !== null && this.model.get('auto_mark_read_days') !== undefined) {
+                    return true;
+                }
+                // Or feed's folder has a setting (inheritance)
+                var folders = NEWSBLUR.assets.get_feed_folders(this.model.id);
+                var feed_folder_title = folders && folders.length > 0 ? folders[0] : null;
+                if (feed_folder_title) {
+                    var folder_setting = NEWSBLUR.assets.get_folder_auto_mark_read(feed_folder_title);
+                    if (folder_setting !== null && folder_setting !== undefined) {
+                        return true;
+                    }
+                }
+                return false;
+            }).call(this)
         }));
 
         if (this.options.type == 'story') {
@@ -210,6 +236,18 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
         return this;
     },
 
+    // feed_title_view.js: Display label for read_filter/order view setting identifiers,
+    // which stay untranslated because they are stored preferences and sent to the server.
+    setting_label: function (value) {
+        var labels = {
+            all: gettext("All"),
+            unread: gettext("Unread"),
+            newest: gettext("Newest"),
+            oldest: gettext("Oldest")
+        };
+        return labels[value] || value;
+    },
+
     extra_classes: function () {
         var feed = this.model;
         var extra_classes = '';
@@ -226,6 +264,9 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
         }
         if ((starred_feed && starred_feed.get('count')) || feed.is_starred()) {
             extra_classes += ' unread_starred';
+        }
+        if (feed.is_briefing_section && feed.is_briefing_section()) {
+            extra_classes += ' unread_positive NB-briefing-section-feed';
         }
 
         if (feed.is_feed()) {
@@ -280,8 +321,8 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
     render_updated_time: function () {
         if (this.options.type == 'story') {
             var updated_text = this.model.get('updated') ?
-                this.model.get('updated') + ' ago' :
-                'Loading...';
+                interpolate(gettext("%(time)s ago"), { time: this.model.get('updated') }, true) :
+                gettext('Loading...');
             this.$('.NB-feedbar-last-updated-date').text(updated_text);
         }
     },
@@ -363,6 +404,10 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
                 model: this.model,
                 $feed: this.$el
             });
+        } else if (this.model.is_briefing_section && this.model.is_briefing_section()) {
+            NEWSBLUR.reader.open_daily_briefing({
+                section: this.model.get('section_key')
+            });
         } else {
             NEWSBLUR.reader.open_feed(this.model.id, { $feed: this.$el });
         }
@@ -397,6 +442,7 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
         if (dblclick_pref == "ignore") return;
         if (this.options.type == "story") return;
         if (this.options.starred_tag) return;
+        if (this.options.briefing_section) return;
         if (this.options.feed_chooser) return;
         if ($('.NB-modal-feedchooser').is(':visible')) return;
 
@@ -426,6 +472,7 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
 
     mark_feed_as_read: function (e, days) {
         if (this.options.starred_tag) return;
+        if (this.options.briefing_section) return;
         if (e) {
             e.preventDefault();
             e.stopPropagation();
@@ -435,8 +482,19 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
         _.delay(_.bind(function () {
             this.flags.double_click = false;
         }, this), 500);
+
+        var self = this;
+        var $container = this.$('.NB-feedbar-mark-feed-read-container');
+        if ($container.length && NEWSBLUR.reader.should_confirm_mark_read('feed')) {
+            NEWSBLUR.reader.show_mark_read_confirm($container, function () {
+                NEWSBLUR.reader.mark_feed_as_read(self.model.id, days);
+                $container.fadeOut(400);
+            }, { days: days });
+            return false;
+        }
+
         NEWSBLUR.reader.mark_feed_as_read(this.model.id, days);
-        this.$('.NB-feedbar-mark-feed-read-container').fadeOut(400);
+        $container.fadeOut(400);
         if (e) {
             return false;
         }
@@ -454,23 +512,26 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
         var $expand = this.$(".NB-feedbar-mark-feed-read-expand");
         var $times = this.$(".NB-feedbar-mark-feed-read-time");
         var times_count = $times.length;
+        // feed_title_view.js: the mirrored CSS (utils/rtl_css.py) pins these from the left in RTL,
+        // so the times fan out from that side and the container makes room on its right.
+        var is_rtl = NEWSBLUR.utils.is_rtl();
+        var edge = is_rtl ? 'left' : 'right';
+        var expand_to = { opacity: 0 };
+        expand_to[edge] = 0;
 
         $hidden.hide();
         $markread.css('z-index', times_count + 1);
-        $container.css('margin-left', $times.eq(0).outerWidth(true) * (times_count - 1) + 12);
-        $expand.animate({
-            right: 0,
-            opacity: 0
-        }, {
+        $container.css(is_rtl ? 'margin-right' : 'margin-left', $times.eq(0).outerWidth(true) * (times_count - 1) + 12);
+        $expand.animate(expand_to, {
             queue: false,
             easing: 'easeInQuint',
             duration: 180,
             complete: function () {
                 $times.each(function (i) {
+                    var fan_to = {};
+                    fan_to[edge] = (32 * (i + 1)) + 6;
                     $(this).css('z-index', times_count - i);
-                    $(this).animate({
-                        right: (32 * (i + 1)) + 6
-                    }, {
+                    $(this).animate(fan_to, {
                         queue: false,
                         easing: 'easeOutBack',
                         duration: 280 + 100 * (Math.pow(i, 0.5))
@@ -489,6 +550,7 @@ NEWSBLUR.Views.FeedTitleView = Backbone.View.extend({
     show_manage_menu: function (e) {
         if (this.options.feed_chooser) return;
 
+        if (this.model.is_briefing_section && this.model.is_briefing_section()) return;
         var feed_type = this.model.is_social() ? 'socialfeed' :
             this.model.is_starred() ? 'starred' :
                 this.model.is_search() ? 'search' :

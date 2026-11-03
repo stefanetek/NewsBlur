@@ -12,15 +12,13 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginHorizontal="1dp"
-        android:layout_weight="1"
-        android:animateLayoutChanges="true"
         android:background="@drawable/intel_toggle_background_selector"
-        android:gravity="center_vertical"
+        android:gravity="center"
         android:orientation="horizontal"
-        android:paddingLeft="8dp"
-        android:paddingTop="6dp"
-        android:paddingRight="8dp"
-        android:paddingBottom="6dp">
+        android:paddingStart="6dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="4dp">
 
         <TextView
             android:id="@+id/toggle_all_text"
@@ -29,6 +27,7 @@
             android:layout_height="wrap_content"
             android:enabled="false"
             android:gravity="center"
+            android:singleLine="true"
             android:text="@string/state_all" />
     </LinearLayout>
 
@@ -37,20 +36,18 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginHorizontal="1dp"
-        android:layout_weight="1"
-        android:animateLayoutChanges="true"
         android:background="@drawable/intel_toggle_background_selector"
-        android:gravity="center_vertical"
+        android:gravity="center"
         android:orientation="horizontal"
-        android:paddingLeft="8dp"
-        android:paddingTop="6dp"
-        android:paddingRight="8dp"
-        android:paddingBottom="6dp">
+        android:paddingStart="6dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="4dp">
 
         <ImageView
             android:id="@+id/toggle_some_icon"
-            android:layout_width="20dp"
-            android:layout_height="20dp"
+            android:layout_width="16dp"
+            android:layout_height="16dp"
             android:scaleType="centerCrop"
             android:src="@drawable/ic_indicator_unread" />
 
@@ -59,8 +56,9 @@
             style="?toggleText"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="2dp"
+            android:layout_marginStart="1dp"
             android:gravity="center"
+            android:singleLine="true"
             android:text="@string/state_unread" />
     </LinearLayout>
 
@@ -69,20 +67,18 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginHorizontal="1dp"
-        android:layout_weight="1"
-        android:animateLayoutChanges="true"
         android:background="@drawable/intel_toggle_background_selector"
-        android:gravity="center_vertical"
+        android:gravity="center"
         android:orientation="horizontal"
-        android:paddingLeft="8dp"
-        android:paddingTop="6dp"
-        android:paddingRight="8dp"
-        android:paddingBottom="6dp">
+        android:paddingStart="6dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="4dp">
 
         <ImageView
             android:id="@+id/toggle_focus_icon"
-            android:layout_width="17dp"
-            android:layout_height="17dp"
+            android:layout_width="14dp"
+            android:layout_height="14dp"
             android:src="@drawable/ic_indicator_focus" />
 
         <TextView
@@ -90,8 +86,9 @@
             style="?toggleText"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="2dp"
+            android:layout_marginStart="1dp"
             android:gravity="center"
+            android:singleLine="true"
             android:text="@string/state_focus" />
     </LinearLayout>
 
@@ -100,20 +97,18 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginHorizontal="1dp"
-        android:layout_weight="1"
-        android:animateLayoutChanges="true"
         android:background="@drawable/intel_toggle_background_selector"
-        android:gravity="center_vertical"
+        android:gravity="center"
         android:orientation="horizontal"
-        android:paddingLeft="8dp"
-        android:paddingTop="6dp"
-        android:paddingRight="8dp"
-        android:paddingBottom="6dp">
+        android:paddingStart="6dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="4dp">
 
         <ImageView
             android:id="@+id/toggle_saved_icon"
-            android:layout_width="20dp"
-            android:layout_height="20dp"
+            android:layout_width="16dp"
+            android:layout_height="16dp"
             android:src="@drawable/ic_saved" />
 
         <TextView
@@ -121,8 +116,9 @@
             style="?toggleText"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="2dp"
+            android:layout_marginStart="1dp"
             android:gravity="center"
+            android:singleLine="true"
             android:text="@string/state_saved" />
 
     </LinearLayout>

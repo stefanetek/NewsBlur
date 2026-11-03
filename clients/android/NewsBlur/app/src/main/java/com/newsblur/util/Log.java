@@ -5,6 +5,7 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.IOException;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -33,14 +34,16 @@ public class Log {
     private static final String E = "ERROR ";
 
     private static final String LOG_NAME_INTERNAL = "logbuffer.txt";
+    private static final String LOG_NAME_ATTACHMENT = "logbuffer-email.txt";
     private static final int MAX_QUEUE_SIZE = 10;
     private static final int MAX_LINE_SIZE = 2 * 1024;
     private static final int TRIM_LINES = 1000;                 // trim the log down to 1000 lines
     private static final long MAX_SIZE = 2000L * MAX_LINE_SIZE; // when it is at least 2000 lines long
 
+    private static final Object FILE_LOCK = new Object();
     private static Queue<String> q;
     private static ExecutorService executor;
-    private static File logloc = null;
+    private static volatile File logloc = null;
     static {
         q = new ConcurrentLinkedQueue<String>();
         executor = Executors.newFixedThreadPool(1);
@@ -116,22 +119,41 @@ public class Log {
             }
             q.offer(s.toString());
         }
-        Runnable r = new Runnable() {
-            public void run() {
-                proc();
-            }
-        };
+        Runnable r = Log::proc;
         executor.execute(r);
     }
 
-    public static void offerContext(Context c) {
-        logloc = c.getExternalCacheDir();
+    public static void offerContext(final Context c) {
+        // NbApplication.kt calls this on the main thread; Android's cache lookup can block on disk.
+        executor.execute(() -> {
+            initializeLogDirectory(c);
+            proc();
+        });
+    }
+
+    private static void initializeLogDirectory(final Context c) {
+        File cacheDir = null;
+        try {
+            cacheDir = c.getExternalCacheDir();
+        } catch (NullPointerException | SecurityException unavailableStorage) {
+            // Log.java may initialize in a WebView process without external storage access.
+        }
+        if (cacheDir == null) {
+            try {
+                cacheDir = c.getCacheDir();
+            } catch (NullPointerException | SecurityException unavailableStorage) {
+                // Log.java must not crash application startup when neither cache is accessible.
+            }
+        }
+        logloc = cacheDir;
     }
 
     private static void proc() {
         if (logloc == null) return; // not yet spun up
-        for (String line = q.poll(); line != null; line = q.poll()) {
-            writeLine(line);
+        synchronized (FILE_LOCK) {
+            for (String line = q.poll(); line != null; line = q.poll()) {
+                writeLine(line);
+            }
         }
     }
 
@@ -147,24 +169,42 @@ public class Log {
         }
         if (f.length() < MAX_SIZE) return;
         android.util.Log.i(Log.class.getName(), "trimming");
-        List<String> lines = new ArrayList<String>(TRIM_LINES * 2);
-        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
-            for (String l = r.readLine(); l != null; l = r.readLine()) {
-                lines.add(l);
-            }
+        try {
+            writeLatestLinesForAttachment(f, f, TRIM_LINES);
         } catch (Throwable t) {;}
-        int offset = lines.size() - TRIM_LINES;
-        try (BufferedWriter w = new BufferedWriter(new FileWriter(f, false))) {
+    }
+
+    static void writeLatestLinesForAttachment(File source, File target, int maxLines) throws IOException {
+        List<String> lines = new ArrayList<String>(TRIM_LINES * 2);
+        if (source.exists()) {
+            try (BufferedReader r = new BufferedReader(new FileReader(source))) {
+                for (String l = r.readLine(); l != null; l = r.readLine()) {
+                    lines.add(l);
+                }
+            }
+        }
+        int offset = Math.max(0, lines.size() - maxLines);
+        try (BufferedWriter w = new BufferedWriter(new FileWriter(target, false))) {
             for (int i = offset; i < lines.size(); i++) {
                 w.append(lines.get(i));
                 w.newLine();
             }
-        } catch (Throwable t) {;}
+        }
     }
 
     public static File getLogfile() {
-        return new File(logloc, LOG_NAME_INTERNAL);
+        if (logloc == null) return null;
+        proc();
+        synchronized (FILE_LOCK) {
+            File source = new File(logloc, LOG_NAME_INTERNAL);
+            File attachment = new File(logloc, LOG_NAME_ATTACHMENT);
+            try {
+                writeLatestLinesForAttachment(source, attachment, TRIM_LINES);
+                return attachment;
+            } catch (Throwable t) {
+                return source;
+            }
+        }
     }
 
 }
-

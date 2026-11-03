@@ -8,12 +8,379 @@
 
 import UIKit
 import SwiftUI
+import QuartzCore
+
+@objcMembers final class BottomNextFeedControl: UIControl {
+    private let capsuleView = UIView()
+    private let arrowContainer = UIView()
+    private let arrowImageView = UIImageView()
+    private let targetIconView = UIImageView()
+    private let titleLabel = UILabel()
+    private var isReady = false
+    private var didConfigureReadyState = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        isUserInteractionEnabled = true
+        isAccessibilityElement = true
+        accessibilityTraits = .button
+        alpha = 0
+
+        capsuleView.translatesAutoresizingMaskIntoConstraints = false
+        capsuleView.layer.cornerRadius = 12
+        capsuleView.layer.cornerCurve = .continuous
+        capsuleView.layer.shadowOffset = CGSize(width: 0, height: 4)
+        capsuleView.layer.shadowRadius = 14
+        capsuleView.layer.shadowOpacity = 0.14
+        addSubview(capsuleView)
+
+        arrowContainer.translatesAutoresizingMaskIntoConstraints = false
+        arrowContainer.layer.cornerRadius = 13
+        arrowContainer.layer.cornerCurve = .continuous
+        capsuleView.addSubview(arrowContainer)
+
+        arrowImageView.translatesAutoresizingMaskIntoConstraints = false
+        arrowImageView.contentMode = .scaleAspectFit
+        arrowImageView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        arrowImageView.image = UIImage(systemName: "arrow.up")
+        arrowContainer.addSubview(arrowImageView)
+
+        targetIconView.translatesAutoresizingMaskIntoConstraints = false
+        targetIconView.contentMode = .scaleAspectFit
+        targetIconView.layer.cornerRadius = 4
+        targetIconView.layer.cornerCurve = .continuous
+        targetIconView.clipsToBounds = true
+        capsuleView.addSubview(targetIconView)
+
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = UIFont(name: "WhitneySSm-Medium", size: 16.5) ?? .systemFont(ofSize: 16.5, weight: .semibold)
+        titleLabel.numberOfLines = 1
+        titleLabel.lineBreakMode = .byTruncatingTail
+        capsuleView.addSubview(titleLabel)
+
+        NSLayoutConstraint.activate([
+            capsuleView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            capsuleView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            capsuleView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            capsuleView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+
+            arrowContainer.leadingAnchor.constraint(equalTo: capsuleView.leadingAnchor, constant: 12),
+            arrowContainer.centerYAnchor.constraint(equalTo: capsuleView.centerYAnchor),
+            arrowContainer.widthAnchor.constraint(equalToConstant: 26),
+            arrowContainer.heightAnchor.constraint(equalToConstant: 26),
+
+            arrowImageView.centerXAnchor.constraint(equalTo: arrowContainer.centerXAnchor),
+            arrowImageView.centerYAnchor.constraint(equalTo: arrowContainer.centerYAnchor),
+            arrowImageView.widthAnchor.constraint(equalToConstant: 17),
+            arrowImageView.heightAnchor.constraint(equalToConstant: 17),
+
+            targetIconView.leadingAnchor.constraint(equalTo: arrowContainer.trailingAnchor, constant: 10),
+            targetIconView.centerYAnchor.constraint(equalTo: capsuleView.centerYAnchor),
+            targetIconView.widthAnchor.constraint(equalToConstant: 22),
+            targetIconView.heightAnchor.constraint(equalToConstant: 22),
+
+            titleLabel.leadingAnchor.constraint(equalTo: targetIconView.trailingAnchor, constant: 9),
+            titleLabel.trailingAnchor.constraint(equalTo: capsuleView.trailingAnchor, constant: -14),
+            titleLabel.centerYAnchor.constraint(equalTo: capsuleView.centerYAnchor),
+            titleLabel.heightAnchor.constraint(equalToConstant: 22)
+        ])
+
+        updateTheme()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(kind: String, title: String?, icon: UIImage?, progress: CGFloat, ready: Bool) {
+        let hasTarget = title?.isEmpty == false
+        // FeedDetailViewController.swift names the next folder or site in a complete translated sentence.
+        let nextUnread = kind == "folder" ? NBLocalization.text("Next unread folder, %@") : NBLocalization.text("Next unread site, %@")
+
+        titleLabel.text = hasTarget ? title : NBLocalization.text("Feed list")
+        accessibilityLabel = hasTarget ? String(format: nextUnread, title ?? "") : NBLocalization.text("Feed list")
+
+        if let icon {
+            targetIconView.image = icon.withRenderingMode(.alwaysOriginal)
+        } else {
+            let fallbackName = kind == "folder" ? "folder.fill" : "globe"
+            targetIconView.image = UIImage(systemName: fallbackName)?.withRenderingMode(.alwaysTemplate)
+        }
+
+        transform = CGAffineTransform(translationX: 0, y: 12)
+        arrowContainer.transform = ready ? CGAffineTransform(scaleX: 1.06, y: 1.06) : .identity
+
+        setReady(ready)
+    }
+
+    func updateTheme() {
+        capsuleView.backgroundColor = ThemeManager.color(fromRGB: [0xFFFFFF, 0xFAF5ED, 0x3A3A3C, 0x252527]).withAlphaComponent(0.96)
+        capsuleView.layer.shadowColor = ThemeManager.shared.isDarkTheme
+            ? UIColor.black.cgColor
+            : ThemeManager.color(fromRGB: [0x737A84]).cgColor
+        capsuleView.layer.borderWidth = 1
+        capsuleView.layer.borderColor = ThemeManager.color(fromRGB: [0xE0E4EA, 0xD7CBBB, 0x515153, 0x3A3A3C]).cgColor
+        applyReadyState(isReady, animated: false)
+    }
+
+    private func setReady(_ ready: Bool) {
+        let shouldAnimate = didConfigureReadyState && ready != isReady
+        isReady = ready
+        didConfigureReadyState = true
+        applyReadyState(ready, animated: shouldAnimate)
+    }
+
+    private func applyReadyState(_ ready: Bool, animated: Bool) {
+        let changes = {
+            self.arrowContainer.backgroundColor = ready ? self.activeArrowBackgroundColor : self.inactiveArrowBackgroundColor
+            self.arrowImageView.tintColor = ready ? .white : self.inactiveArrowColor
+            self.arrowImageView.transform = ready ? CGAffineTransform(rotationAngle: .pi) : .identity
+            self.titleLabel.textColor = ready ? self.activeTitleColor : self.inactiveTitleColor
+            self.targetIconView.alpha = ready ? 1 : 0.74
+            self.targetIconView.tintColor = ready ? self.activeTitleColor : self.inactiveTitleColor
+        }
+
+        if animated {
+            UIView.animate(withDuration: 0.22,
+                           delay: 0,
+                           options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseInOut],
+                           animations: changes)
+        } else {
+            changes()
+        }
+    }
+
+    private var activeArrowBackgroundColor: UIColor {
+        ThemeManager.color(fromRGB: [0x477DBF, 0x8A6A33, 0x5A8FD3, 0x5A8FD3])
+    }
+
+    private var inactiveArrowBackgroundColor: UIColor {
+        ThemeManager.color(fromRGB: [0xDCE2EA, 0xE5D9C8, 0x555557, 0x444446])
+    }
+
+    private var activeTitleColor: UIColor {
+        ThemeManager.color(fromRGB: [0x2D6EAE, 0x7A5B24, 0x8CBFFF, 0x9DCAFF])
+    }
+
+    private var inactiveTitleColor: UIColor {
+        ThemeManager.color(fromRGB: [0x2A2D32, 0x3C3226, 0xF2F2F7, 0xF2F2F7])
+    }
+
+    private var inactiveArrowColor: UIColor {
+        ThemeManager.color(fromRGB: [0x59606A, 0x75685A, 0xD8D8D8, 0xD8D8D8])
+    }
+}
+
+@objcMembers final class DailyBriefingSectionInfo: NSObject {
+    let title: String
+    let dateText: String
+    let isCollapsed: Bool
+    let isLoadingSection: Bool
+    let rowCount: Int
+
+    init(
+        title: String,
+        dateText: String,
+        isCollapsed: Bool,
+        isLoadingSection: Bool,
+        rowCount: Int
+    ) {
+        self.title = title
+        self.dateText = dateText
+        self.isCollapsed = isCollapsed
+        self.isLoadingSection = isLoadingSection
+        self.rowCount = rowCount
+    }
+}
 
 /// List of stories for a feed.
 class FeedDetailViewController: FeedDetailObjCViewController {
-    lazy var gridViewController = makeGridViewController()
+    private struct TryFeedRefreshContext: Equatable {
+        let account: String
+        let host: String
+        let feedID: String
+        let readFilter: String
+        let order: String
+        let generation: UInt
+    }
+
+    private final class TryFeedRefresh {
+        let context: TryFeedRefreshContext
+        var poll: DispatchWorkItem?
+        var timeout: DispatchWorkItem?
+
+        init(context: TryFeedRefreshContext) { self.context = context }
+
+        func cancel() {
+            poll?.cancel()
+            timeout?.cancel()
+        }
+    }
+
+    private var tryFeedRefresh: TryFeedRefresh?
+    private var attemptedTryFeedRefresh: TryFeedRefreshContext?
+    var tryFeedRefreshPollInterval: TimeInterval { 2 }
+    var tryFeedRefreshTimeout: TimeInterval { 60 }
+
+    @objc var isAutomaticallyRefreshingTryFeed: Bool { tryFeedRefresh != nil }
+
+    private var tryFeedRefreshContext: TryFeedRefreshContext? {
+        guard let app = appDelegate, let collection = storiesCollection,
+              !collection.inSearch, (!app.inFindingStoryMode || app.tryFeedStoryId == nil),
+              !collection.isRiverView, !collection.isSocialView,
+              !collection.isSavedView, !collection.isReadView, !collection.isWidgetView,
+              app.isTryFeedView || app.detailViewController?.canReturnToDiscoverSites == true,
+              let feedID = collection.activeFeed?["id"],
+              let previewID = app.tryFeedFeedId,
+              String(describing: feedID) == previewID else { return nil }
+        return TryFeedRefreshContext(account: app.activeUsername ?? "", host: app.url ?? "",
+                                     feedID: previewID, readFilter: collection.activeReadFilter ?? "all",
+                                     order: collection.activeOrder ?? "newest", generation: fetchRequestId)
+    }
+
+    override func resetFeedDetail() {
+        cancelTryFeedRefresh()
+        super.resetFeedDetail()
+    }
+
+    override func reloadStories() {
+        cancelTryFeedRefresh()
+        super.reloadStories()
+    }
+
+    override func finishedLoadingFeed(_ results: [AnyHashable: Any]!, feedPage: Int, feedId: String!) {
+        super.finishedLoadingFeed(results, feedPage: feedPage, feedId: feedId)
+        guard feedPage == 1, let stories = results?["stories"] as? [Any], stories.isEmpty,
+              let receivedID = results?["feed_id"], String(describing: receivedID) == feedId,
+              let context = tryFeedRefreshContext, context.feedID == feedId,
+              attemptedTryFeedRefresh != context else { return }
+        startTryFeedRefresh(context)
+    }
+
+    override func instafetchFeed() {
+        guard tryFeedRefreshContext != nil, storiesCollection.storyCount == 0 else {
+            super.instafetchFeed()
+            return
+        }
+        guard tryFeedRefresh == nil else { return }
+        fetchRequestId += 1
+        guard let context = tryFeedRefreshContext else { return }
+        startTryFeedRefresh(context)
+    }
+
+    private func cancelTryFeedRefresh() {
+        if tryFeedRefresh != nil { finishRefresh() }
+        tryFeedRefresh?.cancel()
+        tryFeedRefresh = nil
+        attemptedTryFeedRefresh = nil
+    }
+
+    private func startTryFeedRefresh(_ context: TryFeedRefreshContext) {
+        tryFeedRefresh?.cancel()
+        let refresh = TryFeedRefresh(context: context)
+        tryFeedRefresh = refresh
+        attemptedTryFeedRefresh = context
+        pageFetching = true
+        pageFinished = false
+        isOnline = true
+        isShowingFetching = true
+        messageView.isHidden = true
+        showFetchingBanner(NBLocalization.text("Fetching stories from this site..."), isOffline: false)
+
+        let timeout = DispatchWorkItem { [weak self, weak refresh] in
+            guard let self, let refresh, self.isCurrentTryFeedRefresh(refresh) else { return }
+            self.finishTryFeedRefresh(refresh, response: nil)
+        }
+        refresh.timeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + tryFeedRefreshTimeout, execute: timeout)
+        requestTryFeedRefresh(refresh, force: true)
+    }
+
+    private func isCurrentTryFeedRefresh(_ refresh: TryFeedRefresh) -> Bool {
+        guard tryFeedRefresh === refresh else { return false }
+        guard tryFeedRefreshContext == refresh.context else {
+            refresh.cancel()
+            tryFeedRefresh = nil
+            return false
+        }
+        return true
+    }
+
+    private func requestTryFeedRefresh(_ refresh: TryFeedRefresh, force: Bool) {
+        guard isCurrentTryFeedRefresh(refresh) else { return }
+        let endpoint = force ? "refresh_feed" : "feed"
+        let url = "\(refresh.context.host)/reader/\(endpoint)/\(refresh.context.feedID)"
+        var parameters: [String: Any] = ["page": 1, "include_hidden": true,
+                                       "read_filter": refresh.context.readFilter, "order": refresh.context.order]
+        if !force { parameters["insta_fetch"] = true }
+        appDelegate.get(url, parameters: parameters, success: { [weak self, weak refresh] _, object in
+            guard let self, let refresh, self.isCurrentTryFeedRefresh(refresh) else { return }
+            guard let response = object as? [AnyHashable: Any],
+                  let feedID = response["feed_id"], String(describing: feedID) == refresh.context.feedID,
+                  let stories = response["stories"] as? [Any] else {
+                self.finishTryFeedRefresh(refresh, response: nil)
+                return
+            }
+            if !stories.isEmpty {
+                self.finishTryFeedRefresh(refresh, response: response)
+            } else if response["has_exception"] as? Bool == true {
+                self.finishTryFeedRefresh(refresh, response: nil)
+            } else if response["not_yet_fetched"] as? Bool == true || response["fetched_once"] as? Bool == false {
+                // reader.js polls unfetched Try feeds until the fetch completes.
+                let poll = DispatchWorkItem { [weak self, weak refresh] in
+                    guard let self, let refresh else { return }
+                    self.requestTryFeedRefresh(refresh, force: false)
+                }
+                refresh.poll = poll
+                DispatchQueue.main.asyncAfter(deadline: .now() + self.tryFeedRefreshPollInterval, execute: poll)
+            } else {
+                self.finishTryFeedRefresh(refresh, response: response)
+            }
+        }, failure: { [weak self, weak refresh] _, _ in
+            guard let self, let refresh, self.isCurrentTryFeedRefresh(refresh) else { return }
+            self.finishTryFeedRefresh(refresh, response: nil)
+        })
+    }
+
+    private func finishTryFeedRefresh(_ refresh: TryFeedRefresh, response: [AnyHashable: Any]?) {
+        guard isCurrentTryFeedRefresh(refresh) else { return }
+        refresh.cancel()
+        tryFeedRefresh = nil
+        if let response {
+            storiesCollection.feedPage = 1
+            finishedLoadingFeed(response, feedPage: 1, feedId: refresh.context.feedID)
+        }
+        pageFetching = false
+        isShowingFetching = false
+        hideFetchingBanner()
+        finishRefresh()
+        if storiesCollection.storyCount == 0 {
+            pageFinished = true
+            messageLabel.text = response == nil
+                ? NBLocalization.text("Unable to fetch stories. Pull to refresh to try again.")
+                : NBLocalization.text("No stories are available from this site yet.")
+            messageView.isHidden = false
+        }
+    }
+
+    private var gridViewController: UIHostingController<FeedDetailGridView>?
+    
+    private var dashboardViewController: UIHostingController<FeedDetailDashboardView>?
+
+    private var dailyBriefingViewController: UIHostingController<DailyBriefingRootView>?
     
     lazy var storyCache = StoryCache()
+
+    private lazy var dailyBriefingStore = DailyBriefingStore(controller: self)
+
+    private var shouldShowDailyBriefingOverlay: Bool {
+        isDailyBriefingView && dailyBriefingStore.presentationState != .stories
+    }
+
+    private var shouldShowDailyBriefingStoryTitles: Bool {
+        isDailyBriefingView && dailyBriefingStore.presentationState == .stories
+    }
     
     enum SectionLayoutKind: Int, CaseIterable {
         /// Feed cells before the story.
@@ -29,16 +396,20 @@ class FeedDetailViewController: FeedDetailObjCViewController {
         case loading
     }
     
-    var wasGrid: Bool {
-        return appDelegate.detailViewController.wasGrid
+    var wasGridView: Bool {
+        return appDelegate.detailViewController.wasGridView
     }
     
     var isExperimental: Bool {
-        return appDelegate.detailViewController.style == .experimental
+        return appDelegate.detailViewController.style == .experimental || isDashboard
     }
     
     var isSwiftUI: Bool {
-        return isGrid || isExperimental
+        return isGridView || isExperimental
+    }
+
+    var isDailyBriefingView: Bool {
+        return storiesCollection.isDailyBriefing
     }
     
     var feedColumns: Int {
@@ -68,6 +439,16 @@ class FeedDetailViewController: FeedDetailObjCViewController {
         }
     }
     
+    enum DashboardOperation {
+        case none
+        case change(DashList)
+        case addFirst
+        case addBefore(DashList)
+        case addAfter(DashList)
+    }
+    
+    var dashboardOperation = DashboardOperation.none
+    
     private func makeGridViewController() -> UIHostingController<FeedDetailGridView> {
         let gridView = FeedDetailGridView(feedDetailInteraction: self, cache: storyCache)
         let gridViewController = UIHostingController(rootView: gridView)
@@ -76,73 +457,177 @@ class FeedDetailViewController: FeedDetailObjCViewController {
         return gridViewController
     }
     
+    private func makeDashboardViewController() -> UIHostingController<FeedDetailDashboardView> {
+        let dashboardView = FeedDetailDashboardView(feedDetailInteraction: self, cache: storyCache)
+        let dashboardViewController = UIHostingController(rootView: dashboardView)
+        dashboardViewController.view.translatesAutoresizingMaskIntoConstraints = false
+        
+        return dashboardViewController
+    }
+
+    private func makeDailyBriefingViewController() -> UIHostingController<DailyBriefingRootView> {
+        let briefingView = DailyBriefingRootView(store: dailyBriefingStore)
+        let briefingViewController = UIHostingController(rootView: briefingView)
+        briefingViewController.view.translatesAutoresizingMaskIntoConstraints = false
+        briefingViewController.view.backgroundColor = ThemeManager.color(
+            fromRGB: [0xF0F2ED, 0xF3E2CB, 0x2C2C2E, 0x161618]
+        )
+        briefingViewController.view.isOpaque = true
+
+        return briefingViewController
+    }
+    
+    private func add(viewController: UIViewController) {
+        addChild(viewController)
+        view.addSubview(viewController.view)
+        viewController.didMove(toParent: self)
+
+        let topAnchor = storyTitlesHeaderBar?.contentTopAnchor ?? view.topAnchor
+        NSLayoutConstraint.activate([
+            viewController.view.topAnchor.constraint(equalTo: topAnchor),
+            viewController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            viewController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            viewController.view.bottomAnchor.constraint(equalTo:
+                storyTitlesHeaderBar?.contentBottomAnchor ?? view.safeAreaLayoutGuide.bottomAnchor)
+        ])
+    }
+    
     override func viewDidLoad() {
         super.viewDidLoad()
         
-        addChild(gridViewController)
-        view.addSubview(gridViewController.view)
-        gridViewController.didMove(toParent: self)
-        
-        NSLayoutConstraint.activate([
-            gridViewController.view.topAnchor.constraint(equalTo: view.topAnchor),
-            gridViewController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            gridViewController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            gridViewController.view.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-        ])
-        
         changedLayout()
+    }
+
+    fileprivate func refreshDailyBriefingPresentation() {
+        guard isViewLoaded else { return }
+
+        updateContentVisibility()
+    }
+
+    private var isPhoneOrCompactLayout: Bool {
+        if let detail = appDelegate.detailViewController {
+            return detail.isPhoneOrCompact
+        }
+        return UIDevice.current.userInterfaceIdiom == .phone || appDelegate.isCompactWidth
+    }
+
+    private func correctReturnFrameIfNeeded() {
+        guard let navigationController else { return }
+        // FeedDetailViewController.swift uses safe-area spacing supplied by the compact phone header.
+        if let compactNavigation = navigationController as? CompactPhoneNavigationController,
+           !compactNavigation.compactNavigationBar.isHidden {
+            return
+        }
+
+        let containerBounds = view.superview?.bounds ?? navigationController.view.bounds
+        let correctedFrame = FeedDetailReturnFrameDecision.correctedFrame(
+            view.frame,
+            containerBounds: containerBounds,
+            navigationBarMinY: navigationController.navigationBar.frame.minY,
+            isPhoneOrCompact: isPhoneOrCompactLayout
+        )
+
+        guard correctedFrame != view.frame else { return }
+
+        NSLog(
+            "FeedDetailViewController: correcting return frame from \(view.frame) to \(correctedFrame)"
+        )
+
+        view.frame = correctedFrame
+        view.setNeedsUpdateConstraints()
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        view.setNeedsDisplay()
     }
     
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        
-        if view.frame.origin.y == 0, let navigationController, navigationController.navigationBar.frame.origin.y < 0 {
-            print("FeedDetailViewController: viewWillAppear in the wrong place: frame: \(view.frame), nav frame: \(navigationController.navigationBar.frame); this is a bug that started with iOS 18; working around it")
-            
-            view.frame.origin.y = -navigationController.navigationBar.frame.origin.y
-            
-            view.setNeedsUpdateConstraints()
-            view.setNeedsLayout()
-            view.setNeedsDisplay()
-        }
+
+        correctReturnFrameIfNeeded()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+
+        correctReturnFrameIfNeeded()
     }
     
     @objc override func loadingFeed() {
         // Make sure the view has loaded.
         _ = view
-        
-        if appDelegate.detailViewController.isPhone {
+
+        if appDelegate.detailViewController.isPhoneOrCompact {
             changedLayout()
-            
+
             DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) {
                 self.reload()
             }
         } else {
-            let wasGrid = wasGrid
-            
+            let wasGridView = wasGridView
+
             self.appDelegate.detailViewController.updateLayout(reload: false, fetchFeeds: false)
-            
-            if wasGrid != isGrid {
+
+            if wasGridView != isGridView {
                 DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) {
                     self.appDelegate.detailViewController.updateLayout(reload: true, fetchFeeds: false)
                 }
             }
+        }
+
+        if appDelegate.isTryFeedView && tryFeedBannerView == nil {
+            showTryFeedSubscribeBanner()
+        } else if !appDelegate.isTryFeedView && tryFeedBannerView != nil {
+            hideTryFeedSubscribeBanner()
         }
     }
     
     @objc override func changedLayout() {
         // Make sure the view has loaded.
         _ = view
-        
-        storyTitlesTable.isHidden = !isLegacyTable
-        gridViewController.view.isHidden = isLegacyTable
-        
-        print("🪿 changedLayout for \(isLegacyTable ? "legacy table" : "SwiftUI grid layout")")
-        
+
+        updateContentVisibility()
+
         deferredReload()
+    }
+
+    private func updateContentVisibility() {
+        let shouldShowStoryTitlesTable = shouldShowDailyBriefingStoryTitles || (!isDailyBriefingView && isLegacyTable && !isDashboard)
+
+        storyTitlesTable.isHidden = !shouldShowStoryTitlesTable
+
+        if let gridViewController {
+            gridViewController.view.isHidden = isDailyBriefingView || isLegacyTable || isDashboard
+        } else if !isDailyBriefingView && !isLegacyTable && !isDashboard {
+            let viewController = makeGridViewController()
+            add(viewController: viewController)
+            gridViewController = viewController
+        }
+
+        if let dashboardViewController {
+            dashboardViewController.view.isHidden = isDailyBriefingView || !isDashboard
+        } else if isDashboard {
+            let viewController = makeDashboardViewController()
+            add(viewController: viewController)
+            dashboardViewController = viewController
+        }
+
+        if let dailyBriefingViewController {
+            dailyBriefingViewController.view.isHidden = !shouldShowDailyBriefingOverlay
+        } else if shouldShowDailyBriefingOverlay {
+            let viewController = makeDailyBriefingViewController()
+            add(viewController: viewController)
+            dailyBriefingViewController = viewController
+        }
+
+        // Keep pill bar above content views
+        if let headerContainer = storyTitlesHeaderBar?.headerContainer {
+            view.bringSubviewToFront(headerContainer)
+        }
     }
     
     var reloadWorkItem: DispatchWorkItem?
+    private weak var activeStorySwipeCell: MCSwipeTableViewCell?
+    private var reloadDeferredForStorySwipe = false
     
     var pendingStories = [Story.ID : Story]()
     
@@ -150,13 +635,9 @@ class FeedDetailViewController: FeedDetailObjCViewController {
     
     var scrollingDate = Date.distantPast
     
+//    var findingStory: Story?
+    
     func deferredReload(story: Story? = nil) {
-        if let story {
-            print("🪿 queuing deferred reload for \(story)")
-        } else {
-            print("🪿 queuing deferred reload")
-        }
-        
         reloadWorkItem?.cancel()
         
         if let story {
@@ -171,12 +652,9 @@ class FeedDetailViewController: FeedDetailObjCViewController {
             }
             
             if pendingStories.isEmpty {
-                print("🪿 starting deferred reload")
-                
                 let secondsSinceScroll = -scrollingDate.timeIntervalSinceNow
-                
+
                 if secondsSinceScroll < 0.5 {
-                    print("🪿 too soon to reload; \(secondsSinceScroll) seconds since scroll")
                     deferredReload(story: story)
                     return
                 }
@@ -199,8 +677,69 @@ class FeedDetailViewController: FeedDetailObjCViewController {
     @objc override func reloadImmediately() {
         configureDataSource()
     }
+
+    @objc override func reloadTable() {
+        super.reloadTable()
+        appDelegate.detailViewController?.storyTitlesDidReload(self)
+    }
+
+    @objc func resetForAccountChange() {
+        storiesCollection.reset()
+        resetFeedDetail()
+        // FeedDetailObjCViewController.m's offline fallback only belongs to a selected feed.
+        pageFinished = true
+        storiesCollection.inSearch = false
+        storiesCollection.searchQuery = nil
+        storiesCollection.savedSearchQuery = nil
+        storyCache.resetForAccountChange()
+        title = nil
+        navigationItem.titleView = nil
+        // FeedDetailObjCViewController.m uses this same state before any feed is selected.
+        messageLabel.text = NBLocalization.text("Select a feed or folder")
+        messageView.isHidden = false
+        reloadImmediately()
+    }
+
+    @objc func resetPendingReloadsForFeedChange() {
+        reloadWorkItem?.cancel()
+        reloadWorkItem = nil
+        pendingStories.removeAll()
+        activeStorySwipeCell = nil
+        reloadDeferredForStorySwipe = false
+        swipingIndexPath = nil
+        swipingStoryHash = nil
+    }
+
+    override func swipeTableViewCellDidStartSwiping(_ cell: MCSwipeTableViewCell!) {
+        super.swipeTableViewCellDidStartSwiping(cell)
+        activeStorySwipeCell = cell
+    }
+
+    override func swipeTableViewCell(_ cell: MCSwipeTableViewCell!,
+                                    didEndSwipingSwipingWith state: MCSwipeTableViewCellState,
+                                    mode: MCSwipeTableViewCellMode) {
+        guard activeStorySwipeCell === cell else { return }
+        super.swipeTableViewCell(cell, didEndSwipingSwipingWith: state, mode: mode)
+    }
+
+    override func swipeTableViewCellDidFinishSwiping(_ cell: MCSwipeTableViewCell!) {
+        guard activeStorySwipeCell === cell else { return }
+        activeStorySwipeCell = nil
+        swipingIndexPath = nil
+        swipingStoryHash = nil
+        if reloadDeferredForStorySwipe {
+            reloadDeferredForStorySwipe = false
+            deferredReload()
+        }
+    }
     
     @objc override func reload() {
+//        if appDelegate.findingStoryDictionary != nil {
+//            findingStory = Story(index: 0, dictionary: appDelegate.findingStoryDictionary)
+//        } else if !appDelegate.inFindingStoryMode {
+//            findingStory = nil
+//        }
+        
         deferredReload()
     }
     
@@ -216,69 +755,181 @@ class FeedDetailViewController: FeedDetailObjCViewController {
             storyTitlesTable.reloadRows(at: [indexPath], with: rowAnimation)
         }
     }
+    
+    @objc override func doneDashboardChooseSite(_ riverId: String?) {
+        guard let riverId else {
+            dashboardOperation = .none
+            return
+        }
+        
+        switch dashboardOperation {
+            case .none:
+                break
+            case .change(let dashList):
+                storyCache.change(dash: dashList, to: riverId)
+            case .addFirst:
+                storyCache.addFirst(riverId: riverId)
+            case .addBefore(let dashList):
+                storyCache.add(riverId: riverId, before: true, dash: dashList)
+            case .addAfter(let dashList):
+                storyCache.add(riverId: riverId, before: false, dash: dashList)
+        }
+        
+        dashboardOperation = .none
+    }
+
+    @objc func fetchDailyBriefingPage(_ page: Int32, withCallback callback: (() -> Void)?) {
+        dailyBriefingStore.fetch(page: Int(page), callback: callback)
+    }
+
+    @objc func openDailyBriefingSettingsFrom(_ sourceView: UIView) {
+        openDailyBriefingSettings(sourceView: sourceView, barButtonItem: nil)
+    }
+
+    @objc func openDailyBriefingSettingsFromBarButton(_ barButtonItem: UIBarButtonItem) {
+        openDailyBriefingSettings(sourceView: nil, barButtonItem: barButtonItem)
+    }
+
+    private func openDailyBriefingSettings(sourceView: UIView?, barButtonItem: UIBarButtonItem?) {
+        let host = UIHostingController(rootView: DailyBriefingSettingsPopoverView(store: dailyBriefingStore))
+        host.modalPresentationStyle = .popover
+        host.preferredContentSize = CGSize(width: 520, height: 760)
+
+        if let popover = host.popoverPresentationController {
+            if let barButtonItem {
+                popover.barButtonItem = barButtonItem
+                popover.permittedArrowDirections = .any
+            } else if let sourceView {
+                popover.sourceView = sourceView
+                popover.sourceRect = sourceView.bounds
+                popover.permittedArrowDirections = .any
+            }
+        }
+
+        present(host, animated: true)
+    }
+
+    @objc(dailyBriefingSectionCount)
+    func dailyBriefingSectionCount() -> Int {
+        dailyBriefingStore.tableSections.count
+    }
+
+    @objc(dailyBriefingNumberOfRowsInSection:)
+    func dailyBriefingNumberOfRows(inSection section: Int) -> Int {
+        guard let section = dailyBriefingStore.tableSection(at: section) else {
+            return 0
+        }
+
+        if section.isLoadingSection {
+            return 1
+        }
+
+        return section.isCollapsed ? 0 : section.rowLocations.count
+    }
+
+    @objc(dailyBriefingSectionInfoForSection:)
+    func dailyBriefingSectionInfo(forSection section: Int) -> DailyBriefingSectionInfo? {
+        guard let section = dailyBriefingStore.tableSection(at: section) else {
+            return nil
+        }
+
+        return DailyBriefingSectionInfo(
+            title: section.title,
+            dateText: section.dateText,
+            isCollapsed: section.isCollapsed,
+            isLoadingSection: section.isLoadingSection,
+            rowCount: section.rowLocations.count
+        )
+    }
+
+    @objc(dailyBriefingIsLoadingSection:)
+    func dailyBriefingIsLoadingSection(_ section: Int) -> Bool {
+        dailyBriefingStore.tableSection(at: section)?.isLoadingSection ?? false
+    }
+
+    @objc(dailyBriefingStoryLocationForIndexPath:)
+    func dailyBriefingStoryLocation(for indexPath: NSIndexPath) -> Int {
+        dailyBriefingStore.storyLocation(for: indexPath as IndexPath)
+    }
+
+    @objc(indexPathForDailyBriefingStoryLocation:)
+    func indexPathForDailyBriefingStoryLocation(_ location: Int) -> NSIndexPath? {
+        dailyBriefingStore.indexPath(forStoryLocation: location) as NSIndexPath?
+    }
+
+    @objc(toggleDailyBriefingSectionAt:)
+    func toggleDailyBriefingSection(at section: Int) {
+        dailyBriefingStore.toggleSection(at: section)
+    }
+
+    @objc(resetDailyBriefingState)
+    func resetDailyBriefingState() {
+        dailyBriefingStore.resetForFeedChange()
+    }
 }
 
 extension FeedDetailViewController {
     func configureDataSource(story: Story? = nil) {
+        // FeedDetailViewController.swift keeps a page response from recycling the cell before its swipe action finishes.
+        if activeStorySwipeCell != nil {
+            reloadDeferredForStorySwipe = true
+            return
+        }
+
+        if isDailyBriefingView {
+            refreshDailyBriefingPresentation()
+
+            if shouldShowDailyBriefingStoryTitles {
+                reloadTable()
+            }
+            return
+        }
+
+        // FeedDetailViewController.swift: the native table reads StoriesCollection directly.
+        // Only build StoryCache's complete SwiftUI models when a SwiftUI layout uses them.
+        if isLegacyTable {
+            reloadTable()
+            return
+        }
+
+        if isDashboard {
+            storyCache.redrawDashboard()
+            
+            if dashboardIndex < 0 {
+                return
+            }
+        }
+        
         if let story {
             storyCache.reload(story: story)
         } else {
             storyCache.reload()
         }
         
-        if isLegacyTable {
-            reloadTable()
-        }
+//        if findingStory != nil {
+//            storyCache.selected = findingStory
+//            findingStory = nil
+//        }
+        
+//        if pageFinished, dashboardAwaitingFinish, dashboardIndex >= 0 {
+//            dashboardAwaitingFinish = false
+//            appDelegate.feedsViewController.loadDashboard()
+//        }
     }
     
-#if targetEnvironment(macCatalyst)
     override func tableView(_ tableView: UITableView, contextMenuConfigurationForRowAt indexPath: IndexPath, point: CGPoint) -> UIContextMenuConfiguration? {
+        guard GesturePreferences.storyLongPressShowsMenu || isMac else { return nil }
         let location = storyLocation(for: indexPath)
-        
-        guard location < storiesCollection.storyLocationsCount else {
-            return nil
-        }
-        
-        let storyIndex = storiesCollection.index(fromLocation: location)
-        let story = Story(index: storyIndex)
-        
-        appDelegate.activeStory = story.dictionary
-        
-        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { suggestedActions in
-            let read = UIAction(title: story.isRead ? "Mark as unread" : "Mark as read", image: Utilities.imageNamed("mark-read", sized: 14)) { action in
-                self.appDelegate.storiesCollection.toggleStoryUnread(story.dictionary)
-                self.reload()
-            }
-            
-            let newer = UIAction(title: "Mark newer stories read", image: Utilities.imageNamed("mark-read", sized: 14)) { action in
-                self.markFeedsRead(fromTimestamp: story.timestamp, andOlder: false)
-                self.reload()
-            }
-            
-            let older = UIAction(title: "Mark older stories read", image: Utilities.imageNamed("mark-read", sized: 14)) { action in
-                self.markFeedsRead(fromTimestamp: story.timestamp, andOlder: true)
-                self.reload()
-            }
-            
-            let saved = UIAction(title: story.isSaved ? "Unsave this story" : "Save this story", image: Utilities.imageNamed("saved-stories", sized: 14)) { action in
-                self.appDelegate.storiesCollection.toggleStorySaved(story.dictionary)
-                self.reload()
-            }
-            
-            let send = UIAction(title: "Send this story to…", image: Utilities.imageNamed("email", sized: 14)) { action in
-                self.appDelegate.showSend(to: self, sender: self.view)
-            }
-            
-            let train = UIAction(title: "Train this story", image: Utilities.imageNamed("train", sized:    14)) { action in
-                self.appDelegate.openTrainStory(self.view)
-            }
-            
-            let submenu = UIMenu(title: "", options: .displayInline, children: [saved, send, train])
-            
-            return UIMenu(title: "", children: [read, newer, older, submenu])
-        }
+        guard location >= 0, location < storiesCollection.storyLocationsCount,
+              let cell = tableView.cellForRow(at: indexPath) else { return nil }
+        let index = storiesCollection.index(fromLocation: location)
+        guard index >= 0, index < storiesCollection.activeFeedStories.count,
+              let dictionary = storiesCollection.activeFeedStories[index] as? [String: Any] else { return nil }
+        let story = Story(index: index, dictionary: dictionary)
+        let groups = RowActionMenus.story(story, controller: self, source: cell)
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in RowActionMenus.menu(groups) }
     }
-#endif
+
 }
 
 extension FeedDetailViewController: FeedDetailInteraction {
@@ -289,6 +940,7 @@ extension FeedDetailViewController: FeedDetailInteraction {
     var isPremiumRestriction: Bool {
         return !appDelegate.isPremium &&
         storiesCollection.isRiverView &&
+        !storiesCollection.isDailyBriefing &&
         !storiesCollection.isReadView &&
         !storiesCollection.isWidgetView &&
         !storiesCollection.isSocialView &&
@@ -299,36 +951,65 @@ extension FeedDetailViewController: FeedDetailInteraction {
         instafetchFeed()
     }
     
+    func tapped(dash: DashList) {
+        if dash.isFolder {
+            appDelegate.feedsViewController.selectFolder(dash.folderId)
+        } else if let feedId = dash.feedId {
+            appDelegate.feedsViewController.selectFeed(feedId, inFolder: dash.folderId)
+        }
+    }
+    
     func visible(story: Story) {
-        print("🐓 Visible: \(story.debugTitle)")
-        
-        guard storiesCollection.activeFeedStories != nil else {
+        NSLog("🐓 Visible: \(story.debugTitle)")
+
+        guard storiesCollection.activeFeedStories != nil, !isDashboard else {
             return
         }
-        
+
         let cacheCount = storyCache.before.count + storyCache.after.count
-        
+
         if cacheCount > 0, story.index >= cacheCount - 5 {
-            let debug = Date()
-            
-            if storiesCollection.isRiverView, storiesCollection.activeFolder != nil {
-                fetchRiverPage(storiesCollection.feedPage + 1, withCallback: nil)
+            if storiesCollection.feedPage >= 100 {
+                pageFinished = true
             } else {
-                fetchFeedDetail(storiesCollection.feedPage + 1, withCallback: nil)
+                let debug = Date()
+
+                if storiesCollection.isRiverView, storiesCollection.activeFolder != nil {
+                    fetchRiverPage(storiesCollection.feedPage + 1, withCallback: nil)
+                } else {
+                    fetchFeedDetail(storiesCollection.feedPage + 1, withCallback: nil)
+                }
+
+                NSLog("🐓 Fetching next page took \(-debug.timeIntervalSinceNow) seconds")
             }
-            
-            print("🐓 Fetching next page took \(-debug.timeIntervalSinceNow) seconds")
         }
         
         scrollingDate = Date()
     }
     
-    func tapped(story: Story) {
+    func tapped(story: Story, in dash: DashList?) {
         if presentedViewController != nil {
             return
         }
         
-        print("🪿 Tapped \(story.debugTitle)")
+        NSLog("🪿 Tapped \(story.debugTitle)")
+        
+        if isDashboard {
+            tappedDashboard(story: story, in: dash)
+            return
+        }
+
+        if story.isClusterStory {
+            guard let feedId = story.feed?.id ?? appDelegate.feedIdWithoutSearchQuery("\(story.dictionary["story_feed_id"] ?? "")"),
+                  !feedId.isEmpty,
+                  appDelegate.isSubscribedFeedId(forStoryClusters: feedId),
+                  !story.hash.isEmpty else {
+                return
+            }
+
+            appDelegate.loadFeed(feedId, withStory: story.hash, storyTitle: story.title, animated: false)
+            return
+        }
         
         let indexPath = IndexPath(row: story.index, section: 0)
         
@@ -341,32 +1022,83 @@ extension FeedDetailViewController: FeedDetailInteraction {
         }
     }
     
+    func tappedDashboard(story: Story, in dash: DashList?) {
+        guard let dash/*, let feedId = story.feed?.id*/ else {
+            return
+        }
+        
+        appDelegate.detailViewController.storyTitlesFromDashboardStory = true
+        
+        appDelegate.inFindingStoryMode = true
+        appDelegate.findingStoryStartDate = Date()
+        appDelegate.findingStoryDictionary = story.dictionary
+        appDelegate.tryFeedStoryId = story.hash
+        appDelegate.tryFeedFeedId = dash.feedId
+        
+        if dash.isFolder {
+            appDelegate.feedsViewController.selectFolder(dash.folderId)
+        } else if let feedId = dash.feedId {
+            appDelegate.feedsViewController.selectFeed(feedId, inFolder: dash.folderId)
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            self.appDelegate.detailViewController.storyTitlesFromDashboardStory = false
+        }
+    }
+    
+    func changeDashboard(dash: DashList) {
+        self.dashboardOperation = .change(dash)
+        
+        self.appDelegate.showDashboardSites(dash.riverId)
+    }
+    
+    func addFirstDashboard() {
+        self.dashboardOperation = .addFirst
+        
+        self.appDelegate.showDashboardSites(nil)
+    }
+    
+    func addDashboard(before: Bool, dash: DashList) {
+        self.dashboardOperation = before ? .addBefore(dash) : .addAfter(dash)
+        
+        self.appDelegate.showDashboardSites(nil)
+    }
+    
+    func reloadOneDash(with dash: DashList) {
+        self.appDelegate.feedsViewController.reloadOneDash(with: dash.index)
+    }
+    
     func reading(story: Story) {
-        print("🪿 Reading \(story.debugTitle)")
+        NSLog("🪿 Reading \(story.debugTitle)")
     }
     
     func read(story: Story) {
+        guard !story.isClusterStory else {
+            return
+        }
+
         if suppressMarkAsRead {
             return
         }
         
         let dict = story.dictionary
         
-        if isSwiftUI, storiesCollection.isStoryUnread(dict) {
-            print("🪿 Marking as read \(story.debugTitle)")
-            
-            storiesCollection.markStoryRead(dict)
-            storiesCollection.syncStory(asRead: dict)
+        if isSwiftUI, appDelegate.feedDetailViewController.markStoryReadIfNeeded(dict, isScrolling: false) {
+            NSLog("🪿 Marking as read \(story.debugTitle)")
             
             deferredReload(story: story)
         }
     }
     
     func unread(story: Story) {
+        guard !story.isClusterStory else {
+            return
+        }
+
         let dict = story.dictionary
         
         if isSwiftUI, !storiesCollection.isStoryUnread(dict) {
-            print("🪿 Marking as unread \(story.debugTitle)")
+            NSLog("🪿 Marking as unread \(story.debugTitle)")
             
             storiesCollection.markStoryUnread(dict)
             storiesCollection.syncStory(asRead: dict)
@@ -376,13 +1108,1731 @@ extension FeedDetailViewController: FeedDetailInteraction {
     }
     
     func hid(story: Story) {
-        print("🪿 Hiding \(story.debugTitle)")
-
+        NSLog("🪿 Hiding \(story.debugTitle)")
+        
         appDelegate.activeStory = nil
         reload()
+    }
+    
+    func scrolled(story: Story, offset: CGFloat?) {
+        let feedDetailHeight = view.frame.size.height
+        let storyHeight = appDelegate.storyPagesViewController.currentPage.view.frame.size.height
+        let skipHeader: CGFloat = 200
+        
+        // NSLog("🪿🎛️ Scrolled story \(story.debugTitle) to offset \(offset ?? 0), story height: \(storyHeight), feed detail height: \(feedDetailHeight)")
+        
+        let gap = appDelegate.storyPagesViewController.traverseBottomGap
+        if offset == nil {
+            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = storyHeight - feedDetailHeight + gap
+        } else if let offset, offset - storyHeight + skipHeader < feedDetailHeight, offset > feedDetailHeight {
+            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = offset - feedDetailHeight + gap
+        } else {
+            appDelegate.storyPagesViewController.traverseBottomConstraint.constant = gap
+        }
     }
 
     func openPremiumDialog() {
         appDelegate.showPremiumDialog()
     }
+}
+
+private let dailyBriefingBuiltInSectionKeys = [
+    "top_stories",
+    "infrequent",
+    "long_read",
+    "classifier_match",
+    "follow_up",
+    "widely_covered",
+]
+
+@MainActor
+private final class DailyBriefingStore: ObservableObject {
+    private struct ParseMetrics {
+        let groups: [Group]
+        let stories: [AnyDictionary]
+        let summaryCount: Int
+        let curatedCount: Int
+        let prepareSummaryMs: Double
+        let prepareCuratedMs: Double
+        let totalMs: Double
+    }
+
+    private struct ApplyStoriesMetrics {
+        let ensureFeedsMs: Double
+        let ensureBriefingFeedMs: Double
+        let setStoriesMs: Double
+        let rebuildStoryLocationsMs: Double
+        let refreshAndReloadMs: Double
+        let totalMs: Double
+
+        static let zero = ApplyStoriesMetrics(
+            ensureFeedsMs: 0,
+            ensureBriefingFeedMs: 0,
+            setStoriesMs: 0,
+            rebuildStoryLocationsMs: 0,
+            refreshAndReloadMs: 0,
+            totalMs: 0
+        )
+    }
+
+    struct SectionDefinition: Identifiable, Hashable {
+        let key: String
+        let name: String
+        let subtitle: String
+
+        var id: String { key }
+    }
+
+    struct ModelOption: Identifiable, Hashable {
+        let key: String
+        let displayName: String
+        let vendorDisplay: String
+
+        var id: String { key }
+    }
+
+    struct Preferences: Equatable {
+        var enabled = true
+        var frequency = "daily"
+        var preferredTime = "morning"
+        var preferredDay = "sun"
+        var storyCount = 10
+        var storySources = "all"
+        var readFilter = "unread"
+        var summaryStyle = "bullets"
+        var includeRead = false
+        var builtInSections = Dictionary(uniqueKeysWithValues: dailyBriefingBuiltInSectionKeys.map { ($0, true) })
+        var customSectionPrompts = [String]()
+        var customSectionEnabled = [Bool]()
+        var notificationTypes = Set<String>()
+        var briefingFeedId: String?
+        var briefingModel = ""
+        var briefingModels = [ModelOption]()
+        var folders = [String]()
+
+        var selectedFolder: String? {
+            get {
+                guard storySources.hasPrefix("folder:") else { return nil }
+                return String(storySources.dropFirst(7))
+            }
+            set {
+                storySources = newValue.map { "folder:\($0)" } ?? "all"
+            }
+        }
+
+        mutating func addKeywordSection() {
+            guard customSectionPrompts.count < 5 else { return }
+            customSectionPrompts.append("")
+            customSectionEnabled.append(true)
+        }
+
+        mutating func removeKeywordSection(at index: Int) {
+            guard customSectionPrompts.indices.contains(index),
+                  customSectionEnabled.indices.contains(index) else {
+                return
+            }
+
+            customSectionPrompts.remove(at: index)
+            customSectionEnabled.remove(at: index)
+        }
+
+        func sectionsPayload() -> [String: Bool] {
+            var sections = builtInSections
+
+            for index in customSectionPrompts.indices {
+                let key = "custom_\(index + 1)"
+                let enabled = customSectionEnabled.indices.contains(index) ? customSectionEnabled[index] : true
+                sections[key] = enabled
+            }
+
+            return sections
+        }
+
+        func sectionOrderPayload() -> [String] {
+            dailyBriefingBuiltInSectionKeys + customSectionPrompts.indices.map { "custom_\($0 + 1)" }
+        }
+    }
+
+    struct Group: Identifiable, Hashable {
+        let id: String
+        let title: String
+        let dateText: String
+        let storyHashes: [String]
+        let summaryHash: String?
+        let isPreview: Bool
+
+        var curatedCount: Int {
+            max(storyHashes.count - (summaryHash == nil ? 0 : 1), 0)
+        }
+    }
+
+    // FeedDetailViewController.swift rebuilds these titles so a language change shows on the next render.
+    static var builtInSections: [SectionDefinition] { [
+        SectionDefinition(key: "top_stories", name: NBLocalization.text("Top stories"), subtitle: NBLocalization.text("The most important stories from your feeds")),
+        SectionDefinition(key: "infrequent", name: NBLocalization.text("From infrequent sites"), subtitle: NBLocalization.text("Stories from feeds that rarely publish")),
+        SectionDefinition(key: "long_read", name: NBLocalization.text("Long reads for later"), subtitle: NBLocalization.text("Longer articles worth setting time aside for")),
+        SectionDefinition(key: "classifier_match", name: NBLocalization.text("Based on your interests"), subtitle: NBLocalization.text("Stories matching your trained topics and authors")),
+        SectionDefinition(key: "follow_up", name: NBLocalization.text("Follow-ups"), subtitle: NBLocalization.text("New posts from feeds you recently read")),
+        SectionDefinition(key: "widely_covered", name: NBLocalization.text("Widely covered"), subtitle: NBLocalization.text("Stories covered by 3+ feeds")),
+    ] }
+
+    // FeedDetailViewController.swift keeps platform names untranslated.
+    static var notificationOptions: [DailyBriefingOption<String>] { [
+        DailyBriefingOption(value: "email", title: NBLocalization.text("Email")),
+        DailyBriefingOption(value: "web", title: NBLocalization.text("Web")),
+        DailyBriefingOption(value: "ios", title: "iOS"),
+        DailyBriefingOption(value: "android", title: "Android"),
+    ] }
+
+    weak var controller: FeedDetailViewController?
+
+    let appDelegate = NewsBlurAppDelegate.shared!
+
+    @Published var groups = [Group]()
+    @Published var preferences: Preferences?
+    @Published var collapsedGroupIDs = Set<String>()
+    @Published private(set) var hasLoadedPreferences = false
+    @Published private(set) var hasLoadedPreferenceDetails = false
+    @Published var isLoading = false
+    @Published var isLoadingMore = false
+    @Published var isSaving = false
+    @Published var isGenerating = false
+    @Published var progressMessage: String?
+    @Published var errorMessage: String?
+    @Published private(set) var isLoadingInitialData = false
+    @Published private(set) var refreshID = UUID()
+
+    private var hasNextPage = false
+    private var currentPage = 1
+    private var storyLocations = [String: Int]()
+    private var allStories = [AnyDictionary]()
+    private var pendingPreferenceCompletions = [() -> Void]()
+    private var requestToken = UUID()
+    private var isLoadingPreferences = false
+
+    private static func timingNow() -> CFTimeInterval {
+        CACurrentMediaTime()
+    }
+
+    private static func elapsedMs(since start: CFTimeInterval) -> Double {
+        (timingNow() - start) * 1000
+    }
+
+    private func logTiming(_ message: String) {
+        NSLog("DailyBriefing iOS timing: %@", message)
+    }
+
+    init(controller: FeedDetailViewController) {
+        self.controller = controller
+    }
+
+    var presentationState: DailyBriefingPresentationState {
+        DailyBriefingPresentationDecision.presentationState(
+            hasLoadedPreferences: hasLoadedPreferences,
+            preferencesEnabled: preferences?.enabled ?? false,
+            isLoadingInitialData: isLoadingInitialData,
+            hasStories: !groups.isEmpty
+        )
+    }
+
+    var needsSetup: Bool {
+        presentationState == .settings
+    }
+
+    var shouldShowOverlay: Bool {
+        presentationState != .stories
+    }
+
+    func story(for hash: String) -> Story? {
+        _ = refreshID
+
+        guard let location = storyLocations[hash] else { return nil }
+
+        return Story(index: location)
+    }
+
+    func isCollapsed(_ group: Group) -> Bool {
+        collapsedGroupIDs.contains(group.id)
+    }
+
+    func toggleCollapse(_ group: Group) {
+        if collapsedGroupIDs.contains(group.id) {
+            collapsedGroupIDs.remove(group.id)
+        } else {
+            collapsedGroupIDs.insert(group.id)
+        }
+    }
+
+    var tableSections: [DailyBriefingListSection] {
+        DailyBriefingSectionLayoutDecision.sections(
+            groups: groups.map {
+                DailyBriefingListGroup(
+                    id: $0.id,
+                    title: $0.title,
+                    dateText: $0.dateText,
+                    storyHashes: $0.storyHashes
+                )
+            },
+            storyLocationsByHash: storyLocations,
+            collapsedGroupIDs: collapsedGroupIDs,
+            includesLoadingSection: true
+        )
+    }
+
+    func tableSection(at section: Int) -> DailyBriefingListSection? {
+        guard tableSections.indices.contains(section) else { return nil }
+        return tableSections[section]
+    }
+
+    func storyLocation(for indexPath: IndexPath) -> Int {
+        guard let section = tableSection(at: indexPath.section) else {
+            return allStories.count
+        }
+
+        if section.isLoadingSection {
+            return allStories.count
+        }
+
+        guard !section.isCollapsed, section.rowLocations.indices.contains(indexPath.row) else {
+            return allStories.count
+        }
+
+        return section.rowLocations[indexPath.row]
+    }
+
+    func indexPath(forStoryLocation location: Int) -> IndexPath? {
+        for (sectionIndex, section) in tableSections.enumerated() where !section.isLoadingSection && !section.isCollapsed {
+            if let rowIndex = section.rowLocations.firstIndex(of: location) {
+                return IndexPath(row: rowIndex, section: sectionIndex)
+            }
+        }
+
+        if location == allStories.count,
+           let loadingSectionIndex = tableSections.firstIndex(where: { $0.isLoadingSection }) {
+            return IndexPath(row: 0, section: loadingSectionIndex)
+        }
+
+        return nil
+    }
+
+    func toggleSection(at section: Int) {
+        guard groups.indices.contains(section) else { return }
+        toggleCollapse(groups[section])
+    }
+
+    func resetForFeedChange() {
+        requestToken = UUID()
+        groups = []
+        preferences = nil
+        collapsedGroupIDs = []
+        hasLoadedPreferences = false
+        hasLoadedPreferenceDetails = false
+        isLoading = false
+        isLoadingMore = false
+        isSaving = false
+        isGenerating = false
+        progressMessage = nil
+        errorMessage = nil
+        isLoadingInitialData = false
+        refreshID = UUID()
+        hasNextPage = false
+        currentPage = 1
+        storyLocations = [:]
+        allStories = []
+        pendingPreferenceCompletions.removeAll()
+        isLoadingPreferences = false
+    }
+
+    func loadPreferencesIfNeeded() {
+        if !hasLoadedPreferenceDetails && !isLoadingPreferences {
+            loadPreferences(completion: nil)
+        }
+    }
+
+    func loadMoreIfNeeded(after group: Group) {
+        guard groups.last?.id == group.id,
+              hasNextPage,
+              !isLoadingMore,
+              !isGenerating else {
+            return
+        }
+
+        fetch(page: currentPage + 1, callback: nil)
+    }
+
+    func fetch(page: Int, callback: (() -> Void)?) {
+        guard let _ = controller else {
+            callback?()
+            return
+        }
+
+        if page > 1 && (!hasNextPage || isLoadingMore) {
+            callback?()
+            return
+        }
+
+        if !DailyBriefingPresentationDecision.shouldFetchStories(
+            page: page,
+            hasLoadedPreferences: hasLoadedPreferences,
+            preferencesEnabled: preferences?.enabled ?? false
+        ) {
+            callback?()
+            return
+        }
+
+        fetchStories(page: page, callback: callback)
+    }
+
+    private func fetchStories(page: Int, callback: (() -> Void)?) {
+        guard let controller else {
+            callback?()
+            return
+        }
+
+        if page == 1 {
+            isLoading = true
+            isLoadingInitialData = true
+            errorMessage = nil
+        } else {
+            isLoadingMore = true
+        }
+
+        controller.pageFetching = true
+        controller.pageFinished = false
+
+        let token = UUID()
+        requestToken = token
+        let requestStartedAt = Self.timingNow()
+        guard let url = requestURL(path: "/briefing/stories?page=\(page)") else {
+            finishFailedRequest(message: NBLocalization.text("Unable to load Daily Briefing."), callback: callback)
+            return
+        }
+
+        appDelegate.get(url, parameters: nil as Any?, success: { [weak self] _, responseObject in
+            guard let self else { return }
+            guard self.requestToken == token else { return }
+            guard self.controller?.storiesCollection.isDailyBriefing == true else { return }
+            guard let data = responseObject as? [String: Any] else {
+                self.finishFailedRequest(message: NBLocalization.text("Unable to load Daily Briefing."), callback: callback)
+                return
+            }
+
+            let responseMs = Self.elapsedMs(since: requestStartedAt)
+            self.apply(response: data, page: page)
+            let totalMs = Self.elapsedMs(since: requestStartedAt)
+            let briefingCount = (data["briefings"] as? [[String: Any]] ?? []).count
+            self.logTiming(
+                String(
+                    format: "page=%ld response=%.1fms total=%.1fms briefings=%ld stories=%ld has_next=%@ state=%@",
+                    page,
+                    responseMs,
+                    totalMs,
+                    briefingCount,
+                    self.allStories.count,
+                    self.hasNextPage ? "yes" : "no",
+                    String(describing: self.presentationState)
+                )
+            )
+
+            self.isLoading = false
+            self.isLoadingMore = false
+            self.isLoadingInitialData = false
+            controller.pageFetching = false
+            controller.pageFinished = !self.hasNextPage
+            controller.isShowingFetching = false
+            controller.isOnline = true
+            controller.hideFetchingBanner()
+            callback?()
+        }, failure: { [weak self] _, error in
+            guard let self else { return }
+            self.finishFailedRequest(message: Self.errorDescription(error, fallback: NBLocalization.text("Unable to load Daily Briefing.")), callback: callback)
+        })
+    }
+
+    func save(preferences draft: Preferences, generate: Bool, completion: (() -> Void)? = nil) {
+        guard !isSaving else { return }
+
+        isSaving = true
+        errorMessage = nil
+
+        guard let url = requestURL(path: "/briefing/preferences") else {
+            isSaving = false
+            errorMessage = NBLocalization.text("Unable to save Daily Briefing settings.")
+            completion?()
+            return
+        }
+        let parameters = makePreferenceParameters(from: draft, forceEnabled: generate ? true : nil)
+
+        appDelegate.post(url, parameters: parameters, success: { [weak self] _, _ in
+            guard let self else { return }
+
+            self.preferences = draft
+            self.hasLoadedPreferences = true
+            self.hasLoadedPreferenceDetails = true
+
+            self.saveNotifications(for: draft.briefingFeedId, notificationTypes: Array(draft.notificationTypes)) {
+                if generate {
+                    self.generateBriefing(from: draft, completion: completion)
+                } else {
+                    self.isSaving = false
+                    self.controller?.refreshDailyBriefingPresentation()
+                    self.controller?.reload()
+                    completion?()
+                }
+            }
+        }, failure: { [weak self] _, error in
+            guard let self else { return }
+
+            self.isSaving = false
+            self.errorMessage = Self.errorDescription(error, fallback: NBLocalization.text("Unable to save Daily Briefing settings."))
+            completion?()
+        })
+    }
+
+    private func loadPreferences(completion: (() -> Void)?) {
+        if let completion {
+            pendingPreferenceCompletions.append(completion)
+        }
+
+        guard !isLoadingPreferences else { return }
+        isLoadingPreferences = true
+
+        guard let url = requestURL(path: "/briefing/preferences") else {
+            isLoadingPreferences = false
+            isLoading = false
+            isLoadingInitialData = false
+            errorMessage = NBLocalization.text("Unable to load Daily Briefing settings.")
+            runPendingPreferenceCompletions()
+            return
+        }
+
+        appDelegate.get(url, parameters: nil as Any?, success: { [weak self] _, responseObject in
+            guard let self else { return }
+            self.isLoadingPreferences = false
+
+            if let data = responseObject as? [String: Any] {
+                self.preferences = self.parsePreferences(data)
+                self.hasLoadedPreferences = true
+                self.hasLoadedPreferenceDetails = true
+                self.controller?.refreshDailyBriefingPresentation()
+            }
+            self.runPendingPreferenceCompletions()
+        }, failure: { [weak self] _, error in
+            guard let self else { return }
+            self.isLoadingPreferences = false
+            self.isLoading = false
+            self.isLoadingInitialData = false
+            self.controller?.pageFetching = false
+            self.controller?.pageFinished = true
+            self.controller?.isShowingFetching = false
+            self.controller?.hideFetchingBanner()
+            self.errorMessage = Self.errorDescription(error, fallback: NBLocalization.text("Unable to load Daily Briefing settings."))
+            self.controller?.refreshDailyBriefingPresentation()
+            self.runPendingPreferenceCompletions()
+        })
+    }
+
+    private func runPendingPreferenceCompletions() {
+        let completions = pendingPreferenceCompletions
+        pendingPreferenceCompletions.removeAll()
+        completions.forEach { $0() }
+    }
+
+    private func generateBriefing(from draft: Preferences, completion: (() -> Void)?) {
+        isGenerating = true
+        progressMessage = NBLocalization.text("Generating your Daily Briefing...")
+
+        guard let url = requestURL(path: "/briefing/generate") else {
+            isSaving = false
+            isGenerating = false
+            progressMessage = nil
+            errorMessage = NBLocalization.text("Unable to generate Daily Briefing.")
+            completion?()
+            return
+        }
+
+        appDelegate.post(url, parameters: [:], success: { [weak self] _, responseObject in
+            guard let self else { return }
+
+            var updated = draft
+            updated.enabled = true
+
+            if let data = responseObject as? [String: Any],
+               let feedId = Self.stringValue(data["briefing_feed_id"]) {
+                updated.briefingFeedId = feedId
+            }
+
+            self.preferences = updated
+
+            self.saveNotifications(for: updated.briefingFeedId, notificationTypes: Array(updated.notificationTypes)) {
+                self.isSaving = false
+                completion?()
+                self.pollForGeneratedBriefing(remainingAttempts: 20)
+            }
+        }, failure: { [weak self] _, error in
+            guard let self else { return }
+            self.isSaving = false
+            self.isGenerating = false
+            self.progressMessage = nil
+            self.errorMessage = Self.errorDescription(error, fallback: NBLocalization.text("Unable to generate Daily Briefing."))
+            completion?()
+        })
+    }
+
+    private func pollForGeneratedBriefing(remainingAttempts: Int) {
+        guard remainingAttempts > 0 else {
+            isGenerating = false
+            progressMessage = nil
+            errorMessage = NBLocalization.text("Daily Briefing generation timed out. Please try again.")
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) { [weak self] in
+            guard let self else { return }
+
+            self.fetch(page: 1) {
+                if !self.groups.isEmpty {
+                    self.isGenerating = false
+                    self.progressMessage = nil
+                    self.errorMessage = nil
+                } else {
+                    self.pollForGeneratedBriefing(remainingAttempts: remainingAttempts - 1)
+                }
+            }
+        }
+    }
+
+    private func saveNotifications(for feedId: String?, notificationTypes: [String], completion: @escaping () -> Void) {
+        guard let feedId, !feedId.isEmpty else {
+            completion()
+            return
+        }
+
+        guard let url = requestURL(path: "/notifications/feed/") else {
+            completion()
+            return
+        }
+        let parameters: [String: Any] = [
+            "feed_id": feedId,
+            "notification_types": notificationTypes,
+            "notification_filter": "unread",
+        ]
+
+        appDelegate.post(url, parameters: parameters, success: { _, _ in
+            completion()
+        }, failure: { [weak self] _, error in
+            self?.errorMessage = Self.errorDescription(error, fallback: NBLocalization.text("Unable to save notification settings."))
+            completion()
+        })
+    }
+
+    private func finishFailedRequest(message: String, callback: (() -> Void)?) {
+        controller?.pageFetching = false
+        controller?.pageFinished = true
+        controller?.isShowingFetching = false
+        isLoading = false
+        isLoadingMore = false
+        isLoadingInitialData = false
+        progressMessage = nil
+        errorMessage = message
+        controller?.refreshDailyBriefingPresentation()
+        callback?()
+    }
+
+    private func finishWithoutStories(callback: (() -> Void)?) {
+        groups = []
+        allStories = []
+        appDelegate.storiesCollection.setStories([])
+        rebuildStoryLocations()
+        appDelegate.activeStory = nil
+
+        controller?.pageFetching = false
+        controller?.pageFinished = true
+        controller?.isShowingFetching = false
+        controller?.hideFetchingBanner()
+
+        isLoading = false
+        isLoadingMore = false
+        isLoadingInitialData = false
+
+        controller?.refreshDailyBriefingPresentation()
+        controller?.reload()
+        callback?()
+    }
+
+    private func apply(response: [String: Any], page: Int) {
+        let applyStartedAt = Self.timingNow()
+        let preferenceStartedAt = Self.timingNow()
+        let hadPreferenceDetails = hasLoadedPreferenceDetails
+
+        if let preferencesData = response["preferences"] as? [String: Any] {
+            preferences = parsePreferences(preferencesData)
+            hasLoadedPreferences = true
+            hasLoadedPreferenceDetails = true
+        } else if var preferences {
+            if let enabled = response["enabled"] as? Bool {
+                preferences.enabled = enabled
+            }
+            if let feedId = Self.stringValue(response["briefing_feed_id"]) {
+                preferences.briefingFeedId = feedId
+            }
+            self.preferences = preferences
+            if response["enabled"] != nil {
+                hasLoadedPreferences = true
+            }
+            hasLoadedPreferenceDetails = hadPreferenceDetails
+        } else if let enabled = response["enabled"] as? Bool {
+            var preferences = Preferences()
+            preferences.enabled = enabled
+            preferences.briefingFeedId = Self.stringValue(response["briefing_feed_id"])
+            self.preferences = preferences
+            hasLoadedPreferences = true
+            hasLoadedPreferenceDetails = false
+        } else {
+            hasLoadedPreferenceDetails = hadPreferenceDetails
+        }
+        let preferenceMs = Self.elapsedMs(since: preferenceStartedAt)
+
+        let ensureBriefingFeedStartedAt = Self.timingNow()
+        if let feedId = Self.stringValue(response["briefing_feed_id"]) {
+            ensureBriefingFeedExists(feedId: feedId)
+        }
+        let ensureBriefingFeedMs = Self.elapsedMs(since: ensureBriefingFeedStartedAt)
+
+        let briefings = response["briefings"] as? [[String: Any]] ?? []
+        let isPreview = response["is_preview"] as? Bool ?? false
+        let parsed = parseGroups(from: briefings, isPreview: isPreview)
+
+        let mergeStartedAt = Self.timingNow()
+        if page == 1 {
+            groups = parsed.groups
+            allStories = parsed.stories
+            collapsedGroupIDs = DailyBriefingSectionLayoutDecision.defaultCollapsedGroupIDs(
+                for: parsed.groups.map(\.id)
+            )
+        } else {
+            groups.append(contentsOf: parsed.groups)
+            allStories.append(contentsOf: parsed.stories)
+            collapsedGroupIDs.formUnion(parsed.groups.map(\.id))
+        }
+        let mergeMs = Self.elapsedMs(since: mergeStartedAt)
+
+        hasNextPage = response["has_next_page"] as? Bool ?? false
+        currentPage = response["page"] as? Int ?? page
+
+        let applyStoriesMetrics = applyStories()
+        logTiming(
+            String(
+                format: "apply page=%ld preferences=%.1fms ensure_response_feed=%.1fms parse=%.1fms prepare_summary=%.1fms prepare_curated=%.1fms merge=%.1fms ensure_story_feeds=%.1fms ensure_preferences_feed=%.1fms set_stories=%.1fms rebuild_locations=%.1fms refresh_reload=%.1fms apply_stories=%.1fms total=%.1fms groups=%ld summaries=%ld curated=%ld stories=%ld",
+                page,
+                preferenceMs,
+                ensureBriefingFeedMs,
+                parsed.totalMs,
+                parsed.prepareSummaryMs,
+                parsed.prepareCuratedMs,
+                mergeMs,
+                applyStoriesMetrics.ensureFeedsMs,
+                applyStoriesMetrics.ensureBriefingFeedMs,
+                applyStoriesMetrics.setStoriesMs,
+                applyStoriesMetrics.rebuildStoryLocationsMs,
+                applyStoriesMetrics.refreshAndReloadMs,
+                applyStoriesMetrics.totalMs,
+                Self.elapsedMs(since: applyStartedAt),
+                parsed.groups.count,
+                parsed.summaryCount,
+                parsed.curatedCount,
+                allStories.count
+            )
+        )
+    }
+
+    private func applyStories() -> ApplyStoriesMetrics {
+        guard let controller else { return .zero }
+        let applyStartedAt = Self.timingNow()
+
+        let ensureFeedsStartedAt = Self.timingNow()
+        for story in allStories {
+            ensureFeedExists(for: story)
+        }
+        let ensureFeedsMs = Self.elapsedMs(since: ensureFeedsStartedAt)
+
+        let ensureBriefingFeedStartedAt = Self.timingNow()
+        if let preferences, let feedId = preferences.briefingFeedId {
+            ensureBriefingFeedExists(feedId: feedId)
+        }
+        let ensureBriefingFeedMs = Self.elapsedMs(since: ensureBriefingFeedStartedAt)
+
+        let setStoriesStartedAt = Self.timingNow()
+        appDelegate.storiesCollection.setStories(allStories)
+        let setStoriesMs = Self.elapsedMs(since: setStoriesStartedAt)
+
+        let rebuildStartedAt = Self.timingNow()
+        rebuildStoryLocations()
+        let rebuildStoryLocationsMs = Self.elapsedMs(since: rebuildStartedAt)
+
+        if let activeHash = Self.stringValue(appDelegate.activeStory?["story_hash"]),
+           let location = storyLocations[activeHash],
+           location < appDelegate.storiesCollection.activeFeedStories.count,
+           let story = appDelegate.storiesCollection.activeFeedStories[location] as? AnyDictionary {
+            appDelegate.activeStory = story
+        } else if groups.isEmpty {
+            appDelegate.activeStory = nil
+        }
+
+        let refreshStartedAt = Self.timingNow()
+        controller.refreshDailyBriefingPresentation()
+        controller.reload()
+        let refreshAndReloadMs = Self.elapsedMs(since: refreshStartedAt)
+
+        return ApplyStoriesMetrics(
+            ensureFeedsMs: ensureFeedsMs,
+            ensureBriefingFeedMs: ensureBriefingFeedMs,
+            setStoriesMs: setStoriesMs,
+            rebuildStoryLocationsMs: rebuildStoryLocationsMs,
+            refreshAndReloadMs: refreshAndReloadMs,
+            totalMs: Self.elapsedMs(since: applyStartedAt)
+        )
+    }
+
+    private func rebuildStoryLocations() {
+        storyLocations.removeAll()
+
+        guard let activeStories = appDelegate.storiesCollection.activeFeedStories else {
+            refreshID = UUID()
+            return
+        }
+
+        for (index, storyAny) in activeStories.enumerated() {
+            if let story = storyAny as? AnyDictionary,
+               let hash = Self.stringValue(story["story_hash"]) {
+                storyLocations[hash] = index
+            }
+        }
+
+        refreshID = UUID()
+    }
+
+    private func parseGroups(from briefings: [[String: Any]], isPreview: Bool) -> ParseMetrics {
+        let parseStartedAt = Self.timingNow()
+        var groups = [Group]()
+        var stories = [AnyDictionary]()
+        let briefingFeedId = preferences?.briefingFeedId
+        var summaryCount = 0
+        var curatedCount = 0
+        var prepareSummaryMs = 0.0
+        var prepareCuratedMs = 0.0
+
+        for briefing in briefings {
+            let briefingId = Self.stringValue(briefing["briefing_id"]) ?? UUID().uuidString
+            var storyHashes = [String]()
+            var summaryHash: String?
+            let slot = Self.stringValue(briefing["slot"])
+
+            if let summaryStory = briefing["summary_story"] as? AnyDictionary {
+                let prepareStartedAt = Self.timingNow()
+                let prepared = prepareStory(summaryStory, fallbackFeedId: briefingFeedId, fallbackFeedTitle: "Daily Briefing", isDailyBriefingSummary: true)
+                prepareSummaryMs += Self.elapsedMs(since: prepareStartedAt)
+                stories.append(prepared)
+                if let hash = Self.stringValue(prepared["story_hash"]) {
+                    storyHashes.append(hash)
+                    summaryHash = hash
+                }
+                summaryCount += 1
+            }
+
+            let curatedStories = briefing["curated_stories"] as? [AnyDictionary] ?? []
+            for story in curatedStories {
+                let prepareStartedAt = Self.timingNow()
+                let prepared = prepareStory(story, fallbackFeedId: briefingFeedId, fallbackFeedTitle: story["feed_title"] as? String, isDailyBriefingSummary: false)
+                prepareCuratedMs += Self.elapsedMs(since: prepareStartedAt)
+                stories.append(prepared)
+                if let hash = Self.stringValue(prepared["story_hash"]) {
+                    storyHashes.append(hash)
+                }
+                curatedCount += 1
+            }
+
+            groups.append(Group(
+                id: briefingId,
+                title: Self.formattedBriefingTitle(from: slot),
+                dateText: Self.formattedDateTitle(from: briefing["briefing_date"] as? String),
+                storyHashes: storyHashes,
+                summaryHash: summaryHash,
+                isPreview: isPreview
+            ))
+        }
+
+        return ParseMetrics(
+            groups: groups,
+            stories: stories,
+            summaryCount: summaryCount,
+            curatedCount: curatedCount,
+            prepareSummaryMs: prepareSummaryMs,
+            prepareCuratedMs: prepareCuratedMs,
+            totalMs: Self.elapsedMs(since: parseStartedAt)
+        )
+    }
+
+    private func prepareStory(_ story: AnyDictionary, fallbackFeedId: String?, fallbackFeedTitle: String?, isDailyBriefingSummary: Bool) -> AnyDictionary {
+        var prepared = story
+        prepared["sticky"] = true
+        prepared["is_daily_briefing_summary"] = isDailyBriefingSummary
+
+        if prepared["read_status"] == nil {
+            prepared["read_status"] = 0
+        }
+
+        if prepared["story_feed_id"] == nil {
+            if let fallbackFeedId {
+                prepared["story_feed_id"] = fallbackFeedId
+            } else if let feedId = story["feed_id"] {
+                prepared["story_feed_id"] = feedId
+            }
+        }
+
+        if prepared["feed_title"] == nil, let fallbackFeedTitle {
+            prepared["feed_title"] = fallbackFeedTitle
+        }
+
+        if prepared["story_content"] == nil {
+            prepared["story_content"] = ""
+        }
+
+        let previewText = Self.previewText(from: Self.stringValue(prepared["story_content"]) ?? "")
+        prepared["daily_briefing_preview_text"] = previewText
+        prepared["daily_briefing_preview_length"] = previewText.count
+
+        return prepared
+    }
+
+    private func ensureBriefingFeedExists(feedId: String) {
+        let feed: AnyDictionary = [
+            "id": feedId,
+            "feed_title": "Daily Briefing",
+            "favicon_color": "95968E",
+            "favicon_fade": "C5C6BE",
+        ]
+
+        if appDelegate.dictActiveFeeds == nil {
+            appDelegate.dictActiveFeeds = NSMutableDictionary()
+        }
+        if appDelegate.dictFeeds == nil {
+            appDelegate.dictFeeds = NSMutableDictionary()
+        }
+
+        appDelegate.dictActiveFeeds[feedId] = feed
+        appDelegate.dictFeeds[feedId] = feed
+    }
+
+    private func ensureFeedExists(for story: AnyDictionary) {
+        guard let feedId = Self.stringValue(story["story_feed_id"]) else { return }
+        guard appDelegate.dictFeeds[feedId] == nil && appDelegate.dictActiveFeeds[feedId] == nil else { return }
+
+        let feed: AnyDictionary = [
+            "id": feedId,
+            "feed_title": Self.stringValue(story["feed_title"]) ?? "Daily Briefing",
+            "favicon_color": Self.stringValue(story["favicon_color"]) ?? "95968E",
+            "favicon_fade": "C5C6BE",
+        ]
+
+        appDelegate.dictActiveFeeds[feedId] = feed
+        appDelegate.dictFeeds[feedId] = feed
+    }
+
+    private func parsePreferences(_ data: [String: Any]) -> Preferences {
+        var preferences = Preferences()
+
+        preferences.enabled = Self.boolValue(data["enabled"], default: true)
+        preferences.frequency = Self.stringValue(data["frequency"]) ?? preferences.frequency
+        preferences.preferredTime = Self.stringValue(data["preferred_time"]) ?? preferences.preferredTime
+        preferences.preferredDay = Self.stringValue(data["preferred_day"]) ?? preferences.preferredDay
+        preferences.storyCount = Self.intValue(data["story_count"]) ?? preferences.storyCount
+        preferences.storySources = Self.stringValue(data["story_sources"]) ?? preferences.storySources
+        preferences.readFilter = Self.stringValue(data["read_filter"]) ?? preferences.readFilter
+        preferences.summaryStyle = Self.stringValue(data["summary_style"]) ?? preferences.summaryStyle
+        preferences.includeRead = Self.boolValue(data["include_read"], default: preferences.includeRead)
+        preferences.briefingFeedId = Self.stringValue(data["briefing_feed_id"])
+        preferences.briefingModel = Self.stringValue(data["briefing_model"]) ?? preferences.briefingModel
+        preferences.folders = data["folders"] as? [String] ?? []
+        preferences.notificationTypes = Set(data["notification_types"] as? [String] ?? [])
+        preferences.briefingModels = (data["briefing_models"] as? [[String: Any]] ?? []).compactMap {
+            guard let key = Self.stringValue($0["key"]),
+                  let displayName = Self.stringValue($0["display_name"]) else {
+                return nil
+            }
+
+            return ModelOption(
+                key: key,
+                displayName: displayName,
+                vendorDisplay: Self.stringValue($0["vendor_display"]) ?? ""
+            )
+        }
+
+        let sections = data["sections"] as? [String: Any] ?? [:]
+        for definition in Self.builtInSections {
+            preferences.builtInSections[definition.key] = Self.boolValue(sections[definition.key], default: true)
+        }
+
+        preferences.customSectionPrompts = data["custom_section_prompts"] as? [String] ?? []
+        preferences.customSectionEnabled = preferences.customSectionPrompts.indices.map { index in
+            Self.boolValue(sections["custom_\(index + 1)"], default: true)
+        }
+
+        if preferences.briefingModel.isEmpty {
+            preferences.briefingModel = preferences.briefingModels.first?.key ?? ""
+        }
+
+        return preferences
+    }
+
+    private func makePreferenceParameters(from preferences: Preferences, forceEnabled: Bool?) -> [String: Any] {
+        let enabled = forceEnabled ?? preferences.enabled
+
+        return [
+            "enabled": enabled ? "true" : "false",
+            "frequency": preferences.frequency,
+            "preferred_time": preferences.preferredTime,
+            "preferred_day": preferences.preferredDay,
+            "story_count": "\(preferences.storyCount)",
+            "story_sources": preferences.storySources,
+            "read_filter": preferences.readFilter,
+            "summary_style": preferences.summaryStyle,
+            "include_read": preferences.includeRead ? "true" : "false",
+            "sections": Self.jsonString(from: preferences.sectionsPayload()),
+            "custom_section_prompts": Self.jsonString(from: preferences.customSectionPrompts),
+            "section_order": Self.jsonString(from: preferences.sectionOrderPayload()),
+            "briefing_model": preferences.briefingModel,
+        ]
+    }
+
+    private static func jsonString(from value: Any) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: []),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+
+        return string
+    }
+
+    private static func previewText(from html: String) -> String {
+        guard !html.isEmpty else { return "" }
+
+        // Daily Briefing only needs a short teaser. Bound the input so opening
+        // the folder doesn't parse full article HTML for every story.
+        let clippedHTML = html.count > 12_000 ? String(html.prefix(12_000)) : html
+        let plainText = clippedHTML
+            .convertHTML()
+            .decodingXMLEntities()
+            .decodingHTMLEntities() ?? clippedHTML
+
+        let squashed = plainText
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return String(squashed.prefix(500))
+    }
+
+    private func requestURL(path: String) -> String? {
+        guard let baseURL = appDelegate.url else {
+            return nil
+        }
+
+        return "\(baseURL)\(path)"
+    }
+
+    private static func errorDescription(_ error: Error?, fallback: String) -> String {
+        error?.localizedDescription ?? fallback
+    }
+
+    private static func stringValue(_ value: Any?) -> String? {
+        if let string = value as? String, !string.isEmpty {
+            return string
+        } else if let number = value as? NSNumber {
+            return number.stringValue
+        } else {
+            return nil
+        }
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        if let int = value as? Int {
+            return int
+        } else if let number = value as? NSNumber {
+            return number.intValue
+        } else if let string = value as? String {
+            return Int(string)
+        } else {
+            return nil
+        }
+    }
+
+    private static func boolValue(_ value: Any?, default defaultValue: Bool) -> Bool {
+        if let bool = value as? Bool {
+            return bool
+        } else if let number = value as? NSNumber {
+            return number.boolValue
+        } else if let string = value as? String {
+            return ["true", "1", "yes"].contains(string.lowercased())
+        } else {
+            return defaultValue
+        }
+    }
+
+    private static func formattedDateTitle(from isoString: String?) -> String {
+        guard let isoString else { return "Today" }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let fallbackFormatter = ISO8601DateFormatter()
+        fallbackFormatter.formatOptions = [.withInternetDateTime]
+
+        let date = formatter.date(from: isoString) ?? fallbackFormatter.date(from: isoString) ?? Date()
+        let calendar = Calendar.current
+
+        if calendar.isDateInToday(date) {
+            return "Today, \(Self.compactDateString(from: date))"
+        } else if calendar.isDateInYesterday(date) {
+            return "Yesterday, \(Self.compactDateString(from: date))"
+        } else if calendar.isDate(date, equalTo: Date(), toGranularity: .year) {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "EEE, MMM d"
+            return formatter.string(from: date)
+        } else {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "MMM d, yyyy"
+            return formatter.string(from: date)
+        }
+    }
+
+    private static func compactDateString(from date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+        return formatter.string(from: date)
+    }
+
+    private static func formattedBriefingTitle(from slot: String?) -> String {
+        switch slot?.lowercased() {
+        case "morning":
+            return NBLocalization.text("Morning Briefing")
+        case "afternoon":
+            return NBLocalization.text("Afternoon Briefing")
+        case "evening":
+            return NBLocalization.text("Evening Briefing")
+        default:
+            return NBLocalization.text("Daily Briefing")
+        }
+    }
+}
+
+private struct DailyBriefingOption<Value: Hashable>: Identifiable {
+    let value: Value
+    let title: String
+
+    var id: Value { value }
+}
+
+private struct DailyBriefingRootView: View {
+    @ObservedObject var store: DailyBriefingStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if let errorMessage = store.errorMessage {
+                    DailyBriefingStatusCard(title: NBLocalization.text("Unable to load Daily Briefing"), message: errorMessage, isError: true)
+                }
+
+                switch store.presentationState {
+                case .loading:
+                    EmptyView()
+                case .settings:
+                    DailyBriefingSetupView(store: store)
+                case .empty:
+                    if let progressMessage = store.progressMessage {
+                        DailyBriefingStatusCard(title: NBLocalization.text("Working…"), message: progressMessage, isError: false)
+                    }
+                    DailyBriefingEmptyView(store: store)
+                case .stories:
+                    EmptyView()
+                }
+            }
+            .padding(16)
+        }
+        .background(Color.themed([0xF0F2ED, 0xF3E2CB, 0x2C2C2E, 0x161618]))
+    }
+}
+
+private struct DailyBriefingEmptyView: View {
+    @ObservedObject var store: DailyBriefingStore
+
+    var body: some View {
+        VStack(alignment: .center, spacing: 14) {
+            Image("briefing")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 44, height: 44)
+                .foregroundColor(Color.themed([0x95968E, 0x8B7B6B, 0xAAAAAA, 0xAAAAAA]))
+
+            Text(NBLocalization.text("No briefings yet"))
+                .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 22))
+                .foregroundColor(Color.themed([0x333333, 0x3C3226, 0xE0E0E0, 0xE0E0E0]))
+
+            Text(NBLocalization.text("Set up Daily Briefing to generate a summary of the stories that matter most to you."))
+                .font(dailyBriefingFont(named: "WhitneySSm-Book", size: 15))
+                .foregroundColor(Color.themed([0x666666, 0x8B7B6B, 0xA0A0A0, 0xA0A0A0]))
+                .multilineTextAlignment(.center)
+
+            if let preferences = store.preferences {
+                Button(NBLocalization.text("Generate Daily Briefing")) {
+                    store.save(preferences: preferences, generate: true)
+                }
+                .buttonStyle(DailyBriefingPrimaryButtonStyle())
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(24)
+        .background(DailyBriefingCardBackground())
+    }
+}
+
+private struct DailyBriefingSetupView: View {
+    @ObservedObject var store: DailyBriefingStore
+
+    @State private var draft = DailyBriefingStore.Preferences()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                Image("briefing")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 42, height: 42)
+                    .foregroundColor(Color.themed([0x95968E, 0x8B7B6B, 0xAAAAAA, 0xAAAAAA]))
+
+                Text(NBLocalization.text("Daily Briefing"))
+                    .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 26))
+                    .foregroundColor(Color.themed([0x333333, 0x3C3226, 0xF2F2F7, 0xF2F2F7]))
+
+                Text(NBLocalization.text("Get a summary of your top stories, delivered on your schedule."))
+                    .font(dailyBriefingFont(named: "WhitneySSm-Book", size: 16))
+                    .foregroundColor(Color.themed([0x666666, 0x8B7B6B, 0xA0A0A0, 0xA0A0A0]))
+            }
+
+            DailyBriefingSettingsForm(store: store, draft: $draft, showsSaveButton: false)
+        }
+        .onAppear {
+            if let preferences = store.preferences {
+                draft = preferences
+            }
+            if !store.hasLoadedPreferenceDetails {
+                store.loadPreferencesIfNeeded()
+            }
+        }
+        .onChange(of: store.preferences) { preferences in
+            if let preferences {
+                draft = preferences
+            }
+        }
+    }
+}
+
+private struct DailyBriefingSettingsPopoverView: View {
+    @ObservedObject var store: DailyBriefingStore
+
+    @State private var draft = DailyBriefingStore.Preferences()
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text(NBLocalization.text("Daily Briefing Settings"))
+                    .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 24))
+                    .foregroundColor(Color.themed([0x333333, 0x3C3226, 0xF2F2F7, 0xF2F2F7]))
+                    .padding(.bottom, 4)
+
+                if let errorMessage = store.errorMessage {
+                    DailyBriefingStatusCard(title: NBLocalization.text("Save failed"), message: errorMessage, isError: true)
+                }
+
+                if store.preferences == nil || !store.hasLoadedPreferenceDetails {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        Text(NBLocalization.text("Loading settings…"))
+                            .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 14))
+                    }
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .background(DailyBriefingCardBackground())
+                } else {
+                    DailyBriefingSettingsForm(store: store, draft: $draft, showsSaveButton: true)
+                }
+            }
+            .padding(16)
+        }
+        .background(Color.themed([0xF0F2ED, 0xF3E2CB, 0x2C2C2E, 0x161618]))
+        .onAppear {
+            if let preferences = store.preferences {
+                draft = preferences
+            }
+            if !store.hasLoadedPreferenceDetails {
+                store.loadPreferencesIfNeeded()
+            }
+        }
+        .onChange(of: store.preferences) { preferences in
+            if let preferences {
+                draft = preferences
+            }
+        }
+    }
+}
+
+private struct DailyBriefingSettingsForm: View {
+    @ObservedObject var store: DailyBriefingStore
+    @Binding var draft: DailyBriefingStore.Preferences
+
+    let showsSaveButton: Bool
+
+    private let frequencyOptions = [
+        DailyBriefingOption(value: "thrice_daily", title: NBLocalization.text("3x daily")),
+        DailyBriefingOption(value: "twice_daily", title: NBLocalization.text("2x daily")),
+        DailyBriefingOption(value: "daily", title: NBLocalization.text("Daily")),
+        DailyBriefingOption(value: "weekly", title: NBLocalization.text("Weekly")),
+    ]
+
+    private let timeOptions = [
+        DailyBriefingOption(value: "morning", title: NBLocalization.text("Morning")),
+        DailyBriefingOption(value: "afternoon", title: NBLocalization.text("Afternoon")),
+        DailyBriefingOption(value: "evening", title: NBLocalization.text("Evening")),
+    ]
+
+    private let dayOptions = [
+        DailyBriefingOption(value: "sun", title: NBLocalization.text("Sunday")),
+        DailyBriefingOption(value: "mon", title: NBLocalization.text("Monday")),
+        DailyBriefingOption(value: "tue", title: NBLocalization.text("Tuesday")),
+        DailyBriefingOption(value: "wed", title: NBLocalization.text("Wednesday")),
+        DailyBriefingOption(value: "thu", title: NBLocalization.text("Thursday")),
+        DailyBriefingOption(value: "fri", title: NBLocalization.text("Friday")),
+        DailyBriefingOption(value: "sat", title: NBLocalization.text("Saturday")),
+    ]
+
+    private let storyCountOptions = [
+        DailyBriefingOption(value: 5, title: "5"),
+        DailyBriefingOption(value: 10, title: "10"),
+        DailyBriefingOption(value: 15, title: "15"),
+        DailyBriefingOption(value: 20, title: "20"),
+        DailyBriefingOption(value: 25, title: "25"),
+    ]
+
+    private let summaryStyleOptions = [
+        DailyBriefingOption(value: "bullets", title: NBLocalization.text("Bullets")),
+        DailyBriefingOption(value: "editorial", title: NBLocalization.text("Editorial")),
+        DailyBriefingOption(value: "headlines", title: NBLocalization.text("Headlines")),
+    ]
+
+    private let readFilterOptions = [
+        DailyBriefingOption(value: "unread", title: NBLocalization.text("Unread")),
+        DailyBriefingOption(value: "focus", title: NBLocalization.text("Focus")),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            DailyBriefingSettingsCard(title: NBLocalization.text("Auto-generate"), subtitle: NBLocalization.text("Automatically create briefings on your schedule")) {
+                Toggle(NBLocalization.text("Enabled"), isOn: $draft.enabled)
+                    .toggleStyle(.switch)
+            }
+
+            DailyBriefingSettingsCard(title: NBLocalization.text("Schedule"), subtitle: NBLocalization.text("Choose how often and when your briefing is generated")) {
+                DailyBriefingMenuRow(title: NBLocalization.text("Frequency"), selection: $draft.frequency, options: frequencyOptions)
+                DailyBriefingMenuRow(title: NBLocalization.text("Preferred time"), selection: $draft.preferredTime, options: timeOptions)
+                if draft.frequency == "weekly" {
+                    DailyBriefingMenuRow(title: NBLocalization.text("Preferred day"), selection: $draft.preferredDay, options: dayOptions)
+                }
+            }
+
+            DailyBriefingSettingsCard(title: NBLocalization.text("Length & Style"), subtitle: NBLocalization.text("Control how much is included and how it is written")) {
+                DailyBriefingMenuRow(title: NBLocalization.text("Story count"), selection: $draft.storyCount, options: storyCountOptions)
+                DailyBriefingMenuRow(title: NBLocalization.text("Writing style"), selection: $draft.summaryStyle, options: summaryStyleOptions)
+            }
+
+            DailyBriefingSettingsCard(title: NBLocalization.text("Sources"), subtitle: NBLocalization.text("Choose which stories are eligible for Daily Briefing")) {
+                DailyBriefingMenuRow(
+                    title: NBLocalization.text("Feed source"),
+                    selection: Binding(
+                        get: { draft.selectedFolder ?? "__all__" },
+                        set: { draft.selectedFolder = $0 == "__all__" ? nil : $0 }
+                    ),
+                    options: [DailyBriefingOption(value: "__all__", title: NBLocalization.text("All Site Stories"))] + draft.folders.map {
+                        DailyBriefingOption(value: $0, title: $0)
+                    }
+                )
+                DailyBriefingMenuRow(title: NBLocalization.text("Filter"), selection: $draft.readFilter, options: readFilterOptions)
+                Toggle(NBLocalization.text("Include already-read stories"), isOn: $draft.includeRead)
+            }
+
+            DailyBriefingSettingsCard(title: NBLocalization.text("Sections"), subtitle: NBLocalization.text("Only sections with matching stories will be included")) {
+                ForEach(DailyBriefingStore.builtInSections) { definition in
+                    Toggle(isOn: Binding(
+                        get: { draft.builtInSections[definition.key] ?? true },
+                        set: { draft.builtInSections[definition.key] = $0 }
+                    )) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(definition.name)
+                                .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 15))
+                            Text(definition.subtitle)
+                                .font(dailyBriefingFont(named: "WhitneySSm-Book", size: 13))
+                                .foregroundColor(Color.themed([0x6E6E73, 0x8B7B6B, 0xAEAEB2, 0x98989D]))
+                        }
+                    }
+                }
+            }
+
+            DailyBriefingSettingsCard(title: NBLocalization.text("Keyword Sections"), subtitle: NBLocalization.text("Add custom keyword filters that become their own briefing sections")) {
+                ForEach(Array(draft.customSectionPrompts.indices), id: \.self) { index in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Toggle(String(format: NBLocalization.text("Keyword section %@"), NBLocalization.formattedCount(index + 1)), isOn: Binding(
+                                get: { draft.customSectionEnabled.indices.contains(index) ? draft.customSectionEnabled[index] : true },
+                                set: { newValue in
+                                    if draft.customSectionEnabled.indices.contains(index) {
+                                        draft.customSectionEnabled[index] = newValue
+                                    }
+                                }
+                            ))
+                            Spacer()
+                            Button(role: .destructive) {
+                                draft.removeKeywordSection(at: index)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                        }
+
+                        TextField(NBLocalization.text("Keywords"), text: Binding(
+                            get: { draft.customSectionPrompts[index] },
+                            set: { draft.customSectionPrompts[index] = $0 }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                if draft.customSectionPrompts.count < 5 {
+                    Button {
+                        draft.addKeywordSection()
+                    } label: {
+                        Label(NBLocalization.text("Add keyword section"), systemImage: "plus.circle")
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            DailyBriefingSettingsCard(title: NBLocalization.text("Notifications"), subtitle: NBLocalization.text("Choose where Daily Briefing alerts should go")) {
+                ForEach(DailyBriefingStore.notificationOptions) { option in
+                    Toggle(option.title, isOn: Binding(
+                        get: { draft.notificationTypes.contains(option.value) },
+                        set: { newValue in
+                            if newValue {
+                                draft.notificationTypes.insert(option.value)
+                            } else {
+                                draft.notificationTypes.remove(option.value)
+                            }
+                        }
+                    ))
+                }
+            }
+
+            if draft.briefingModels.count > 1 {
+                DailyBriefingSettingsCard(title: NBLocalization.text("Model"), subtitle: NBLocalization.text("Pick which model writes your Daily Briefing")) {
+                    DailyBriefingMenuRow(
+                        title: NBLocalization.text("Model"),
+                        selection: $draft.briefingModel,
+                        options: draft.briefingModels.map { DailyBriefingOption(value: $0.key, title: $0.displayName) }
+                    )
+                }
+            }
+
+            HStack(spacing: 12) {
+                if showsSaveButton {
+                    Button(NBLocalization.text("Save")) {
+                        store.save(preferences: draft, generate: false)
+                    }
+                    .buttonStyle(DailyBriefingSecondaryButtonStyle())
+                }
+
+                Button(showsSaveButton ? NBLocalization.text("Generate Now") : NBLocalization.text("Generate Daily Briefing")) {
+                    store.save(preferences: draft, generate: true)
+                }
+                .buttonStyle(DailyBriefingPrimaryButtonStyle())
+                .disabled(store.isSaving || store.isGenerating)
+            }
+
+            if store.isSaving || store.isGenerating {
+                HStack(spacing: 12) {
+                    ProgressView()
+                    Text(store.progressMessage ?? NBLocalization.text("Saving Daily Briefing settings…"))
+                        .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 14))
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
+}
+
+private struct DailyBriefingGroupView: View {
+    let group: DailyBriefingStore.Group
+
+    @ObservedObject var store: DailyBriefingStore
+
+    let feedDetailInteraction: FeedDetailInteraction
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                store.toggleCollapse(group)
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: store.isCollapsed(group) ? "chevron.forward.circle.fill" : "chevron.down.circle.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                    Text(group.title)
+                        .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 18))
+                    Spacer()
+                    Text(NBLocalization.plural("%@ stories", groupedCount: group.curatedCount))
+                        .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 13))
+                        .foregroundColor(Color.themed([0x6E6E73, 0x8B7B6B, 0xAEAEB2, 0x98989D]))
+                }
+                .foregroundColor(Color.themed([0x333333, 0x3C3226, 0xF2F2F7, 0xF2F2F7]))
+                .padding(16)
+            }
+            .buttonStyle(.plain)
+
+            if !store.isCollapsed(group) {
+                VStack(spacing: 10) {
+                    ForEach(group.storyHashes, id: \.self) { hash in
+                        DailyBriefingStoryRowView(
+                            storyHash: hash,
+                            isSummary: hash == group.summaryHash,
+                            store: store,
+                            feedDetailInteraction: feedDetailInteraction
+                        )
+                    }
+
+                    if group.isPreview {
+                        Button {
+                            feedDetailInteraction.openPremiumDialog()
+                        } label: {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(NBLocalization.text("Premium Archive"))
+                                    .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 13))
+                                    .foregroundColor(Color.themed([0x2030C0, 0x2030C0, 0x8FB3FF, 0x8FB3FF]))
+                                Text(NBLocalization.text("Get Daily Briefing with all of your top stories."))
+                                    .font(dailyBriefingFont(named: "WhitneySSm-Book", size: 14))
+                                    .foregroundColor(Color.themed([0x333333, 0x3C3226, 0xE0E0E0, 0xE0E0E0]))
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                            .background(Color.themed([0xF8FAFF, 0xF2E7D8, 0x36384A, 0x26283A]))
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
+            }
+        }
+        .background(DailyBriefingCardBackground())
+        .onAppear {
+            store.loadMoreIfNeeded(after: group)
+        }
+    }
+}
+
+private struct DailyBriefingStoryRowView: View {
+    let storyHash: String
+    let isSummary: Bool
+
+    @ObservedObject var store: DailyBriefingStore
+
+    let feedDetailInteraction: FeedDetailInteraction
+
+    var body: some View {
+        let _ = store.refreshID
+
+        if let story = store.story(for: storyHash) {
+            Button {
+                feedDetailInteraction.tapped(story: story, in: nil)
+            } label: {
+                VStack(alignment: .leading, spacing: 8) {
+                    if isSummary {
+                        Text(NBLocalization.text("Daily Briefing"))
+                            .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 12))
+                            .foregroundColor(Color.themed([0x2030C0, 0x7D5A1A, 0x8FB3FF, 0x8FB3FF]))
+                    } else if let feedName = story.feed?.name, !feedName.isEmpty {
+                        Text(feedName)
+                            .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 12))
+                            .foregroundColor(Color.themed([0x6E6E73, 0x8B7B6B, 0xAEAEB2, 0x98989D]))
+                    }
+
+                    HStack(alignment: .top, spacing: 10) {
+                        Circle()
+                            .fill(story.isRead ? Color.clear : Color.themed([0x4A89DC, 0x7D5A1A, 0x78A8F0, 0x78A8F0]))
+                            .frame(width: 8, height: 8)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.themed([0xC7CCD6, 0xD4C8B8, 0x555555, 0x555555]), lineWidth: 1)
+                            )
+                            .padding(.top, 6)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(story.title)
+                                .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: isSummary ? 18 : 16))
+                                .foregroundColor(Color.themed([0x1C1C1E, 0x3C3226, 0xF2F2F7, 0xF2F2F7]))
+                                .multilineTextAlignment(.leading)
+
+                            if isSummary, !story.shortContent.isEmpty {
+                                Text(story.shortContent)
+                                    .font(dailyBriefingFont(named: "WhitneySSm-Book", size: 14))
+                                    .foregroundColor(Color.themed([0x4C4D4A, 0x5C4A3D, 0xC8C8C8, 0xB8B8B8]))
+                                    .lineLimit(5)
+                            }
+
+                            Text(story.dateAndAuthor)
+                                .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 12))
+                                .foregroundColor(Color.themed([0x6E6E73, 0x8B7B6B, 0xAEAEB2, 0x98989D]))
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(story.isSelected
+                              ? Color.themed([0xFFFDEF, 0xEEE0CE, 0x303A40, 0x1E1F22])
+                              : Color.themed([0xFFFFFF, 0xFAF5ED, 0x3A3A3C, 0x2C2C2E]))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.themed([0xD1D1D6, 0xD4C8B8, 0x4C4C4E, 0x3A3A3A]), lineWidth: 1)
+                )
+                .opacity(story.isRead ? 0.78 : 1.0)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+private struct DailyBriefingStatusCard: View {
+    let title: String
+    let message: String
+    let isError: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 16))
+            Text(message)
+                .font(dailyBriefingFont(named: "WhitneySSm-Book", size: 14))
+                .multilineTextAlignment(.leading)
+        }
+        .foregroundColor(isError
+                         ? Color.themed([0x8C1D18, 0x8C1D18, 0xFFB4AB, 0xFFB4AB])
+                         : Color.themed([0x333333, 0x3C3226, 0xE0E0E0, 0xE0E0E0]))
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(isError
+                      ? Color.themed([0xFDECEA, 0xF8E3D8, 0x482828, 0x3A2222])
+                      : Color.themed([0xFFFFFF, 0xFAF5ED, 0x3A3A3C, 0x2C2C2E]))
+        )
+    }
+}
+
+private struct DailyBriefingSettingsCard<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let content: Content
+
+    init(title: String, subtitle: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.subtitle = subtitle
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 18))
+                Text(subtitle)
+                    .font(dailyBriefingFont(named: "WhitneySSm-Book", size: 13))
+                    .foregroundColor(Color.themed([0x6E6E73, 0x8B7B6B, 0xAEAEB2, 0x98989D]))
+            }
+
+            content
+        }
+        .foregroundColor(Color.themed([0x1C1C1E, 0x3C3226, 0xF2F2F7, 0xF2F2F7]))
+        .padding(16)
+        .background(DailyBriefingCardBackground())
+    }
+}
+
+private struct DailyBriefingMenuRow<Value: Hashable>: View {
+    let title: String
+    @Binding var selection: Value
+    let options: [DailyBriefingOption<Value>]
+
+    var body: some View {
+        HStack {
+            Text(title)
+                .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 15))
+            Spacer()
+            Picker(title, selection: $selection) {
+                ForEach(options) { option in
+                    Text(option.title).tag(option.value)
+                }
+            }
+            .pickerStyle(.menu)
+        }
+    }
+}
+
+private struct DailyBriefingCardBackground: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: 18)
+            .fill(Color.themed([0xFFFFFF, 0xFAF5ED, 0x3A3A3C, 0x262628]))
+    }
+}
+
+private struct DailyBriefingPrimaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 15))
+            .foregroundColor(.white)
+            .padding(.vertical, 12)
+            .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color.themed([0x4A89DC, 0xA46B2A, 0x4A78B0, 0x375E8A]))
+            )
+            .opacity(configuration.isPressed ? 0.82 : 1.0)
+    }
+}
+
+private struct DailyBriefingSecondaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(dailyBriefingFont(named: "WhitneySSm-Medium", size: 15))
+            .foregroundColor(Color.themed([0x333333, 0x3C3226, 0xF2F2F7, 0xF2F2F7]))
+            .padding(.vertical, 12)
+            .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color.themed([0xE7E9E3, 0xEADFD0, 0x4A4A4C, 0x343436]))
+            )
+            .opacity(configuration.isPressed ? 0.82 : 1.0)
+    }
+}
+
+private func dailyBriefingFont(named: String, size: CGFloat) -> Font {
+    .custom(named, size: size)
 }

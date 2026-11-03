@@ -1,3 +1,9 @@
+"""User authentication helpers: AJAX login decorators, OAuth, and user-agent extraction.
+
+Provides ajax_login_required and admin_only decorators for views,
+OAuth token verification, and request user-agent/platform detection.
+"""
+
 import hashlib
 
 from django.conf import settings
@@ -129,7 +135,9 @@ def generate_secret_token(phrase, size=12):
 def extract_user_agent(request):
     user_agent = request.environ.get("HTTP_USER_AGENT", "").lower()
     platform = "------"
-    if "ipad app" in user_agent:
+    if "mac app" in user_agent:
+        platform = "Mac"
+    elif "ipad app" in user_agent:
         platform = "iPad"
     elif "iphone app" in user_agent:
         platform = "iPhone"
@@ -185,5 +193,7 @@ def extract_user_agent(request):
         platform = "FeedRe"
     elif "feed reader-background" in user_agent:
         platform = "FeReBg"
+    elif "netnewswire" in user_agent:
+        platform = "NNWire"
 
     return platform

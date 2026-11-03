@@ -54,9 +54,10 @@ import urllib.request
 import urllib.robotparser
 from io import StringIO
 
-import requests
 import sgmllib
 from lxml import etree
+
+from utils.url_safety import safe_requests_get
 
 # XML-RPC support allows feedfinder to query Syndic8 for possible matches.
 # Python 2.3 now comes with this module by default, otherwise you can download it
@@ -85,7 +86,7 @@ class URLGatekeeper:
     def __init__(self):
         self.rpcache = {}  # a dictionary of RobotFileParser objects, by domain
         self.urlopener = urllib.request.build_opener()
-        self.urlopener.version = "NewsBlur Feed Finder (Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0)"
+        self.urlopener.version = "NewsBlur Feed Finder (Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0)"
         _debuglog(self.urlopener.version)
         self.urlopener.addheaders = [("User-Agent", self.urlopener.version)]
         # self.urlopener.addheaders = [('User-Agent', self.urlopener.version), ('Accept', '*')]
@@ -117,7 +118,10 @@ class URLGatekeeper:
         if check and not self.can_fetch(url):
             return ""
         try:
-            return requests.get(url, headers=dict(self.urlopener.addheaders)).text
+            r = safe_requests_get(url, headers=dict(self.urlopener.addheaders))
+            if r.status_code in [403, 204, 202] or not r.text.strip():
+                r = safe_requests_get(url, headers={"User-Agent": None})
+            return r.text
         except:
             return ""
 
@@ -261,20 +265,26 @@ def tryBrokenRedirect(data):
 
 
 def couldBeFeedData(data):
-    data = data.lower()
-    if data.count("<html"):
+    data_lower = data.lower()
+    if data_lower.count("<html"):
         return 0
-    return data.count("<rss") + data.count("<rdf") + data.count("<feed")
+    stripped = data.strip()
+    if stripped.startswith("[") and '"rendered"' in stripped[:2000] and '"link"' in stripped[:2000]:
+        return 1
+    return data_lower.count("<rss") + data_lower.count("<rdf") + data_lower.count("<feed")
 
 
 def isFeed(uri):
     _debuglog("seeing if %s is a feed" % uri)
-    protocol = urllib.parse.urlparse(uri)
+    try:
+        protocol = urllib.parse.urlparse(uri)
+    except ValueError:
+        return 0
     if protocol[0] not in ("http", "https"):
         return 0
     try:
         data = _gatekeeper.get(uri, check=False)
-    except (KeyError, UnicodeDecodeError):
+    except (KeyError, UnicodeDecodeError, ValueError):
         return False
     count = couldBeFeedData(data)
     return count
@@ -362,7 +372,11 @@ def feeds(uri, all=False, querySyndic8=False, _recurs=None):
             "index.xml",  # MT
             "index.rss",  # Slash
         ]
-        outfeeds.extend(list(filter(isFeed, [urllib.parse.urljoin(fulluri, x) for x in suffixes])))
+        try:
+            guesses = [urllib.parse.urljoin(fulluri, x) for x in suffixes]
+        except ValueError:
+            guesses = []
+        outfeeds.extend(list(filter(isFeed, guesses)))
     if (all or not outfeeds) and querySyndic8:
         # still no luck, search Syndic8 for feeds (requires xmlrpclib)
         _debuglog("still no luck, searching Syndic8")

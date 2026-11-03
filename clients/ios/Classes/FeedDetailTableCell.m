@@ -8,7 +8,7 @@
 
 #import "NewsBlurAppDelegate.h"
 #import "FeedDetailTableCell.h"
-#import "DashboardViewController.h"
+#import "ActivitiesViewController.h"
 #import "ABTableViewCell.h"
 #import "UIView+TKCategory.h"
 #import "UIImageView+AFNetworking.h"
@@ -22,6 +22,32 @@ static UIFont *indicatorFont = nil;
 
 @class FeedDetailViewController;
 
+@interface FeedDetailTableCell ()
+
+@property (nonatomic, strong) UIImage *cachedRoundedSiteFavicon;
+@property (nonatomic) BOOL siteFaviconPrepared;
+
+- (UIImage *)roundedSiteFaviconImage;
+
+@end
+
+@interface FeedDetailTableCellView ()
+
+@property (nonatomic, strong) StoryTextLayoutRequest *cachedRegularLayoutKey;
+@property (nonatomic) CGSize cachedRegularTitleSize;
+@property (nonatomic) CGSize cachedRegularContentSize;
+@property (nonatomic) CGFloat cachedRegularContentGap;
+
+- (void)updateRegularLayoutCacheWithBounds:(CGRect)bounds
+                               contentRect:(CGRect)contentRect
+                            fontDescriptor:(UIFontDescriptor *)fontDescriptor
+                            paragraphStyle:(NSMutableParagraphStyle *)paragraphStyle
+                             comfortMargin:(CGFloat)comfortMargin
+                              riverPadding:(CGFloat)riverPadding
+                            hasCachedImage:(BOOL)hasCachedImage;
+
+@end
+
 @implementation FeedDetailTableCell
 
 @synthesize storyTitle;
@@ -29,6 +55,7 @@ static UIFont *indicatorFont = nil;
 @synthesize storyDate;
 @synthesize storyContent;
 @synthesize storyHash;
+@synthesize clusterTier;
 @synthesize storyTimestamp;
 @synthesize storyScore;
 @synthesize storyImage;
@@ -39,6 +66,8 @@ static UIFont *indicatorFont = nil;
 @synthesize isSaved;
 @synthesize textSize;
 @synthesize isRiverOrSocial;
+@synthesize isClusterStory;
+@synthesize isDailyBriefingSummary;
 @synthesize feedColorBar;
 @synthesize feedColorBarTopBorder;
 @synthesize hasAlpha;
@@ -66,6 +95,8 @@ static UIFont *indicatorFont = nil;
         self.selectedBackgroundView = selectedBackground;
         
         [self.contentView addSubview:cellContent];
+        // FeedDetailTableCell.m redraws its mirrored layout when the account language changes direction.
+        [self registerForTraitChanges:@[UITraitLayoutDirection.class] withAction:@selector(setNeedsDisplay)];
     }
     
     return self;
@@ -85,57 +116,167 @@ static UIFont *indicatorFont = nil;
     [self setNeedsDisplay];
 }
 
+// FeedDetailTableCell.m reads each part of the row as a translated phrase for VoiceOver.
 - (NSString *)accessibilityLabel {
-    NSMutableString *output = [NSMutableString stringWithString:self.siteTitle ?: @"no site"];
+    NSString *siteTitle = self.siteTitle ?: [NBLocalization text:@"no site"];
+    NSString *storyTitle = self.storyTitle ?: [NBLocalization text:@"no story"];
+    NSString *storyDate = self.storyDate ?: [NBLocalization text:@"no date"];
+    if (self.isClusterStory) {
+        NSString *tierLabel = [StoryClusterDisplayDecision clusterTierLabelForValue:self.clusterTier];
+        return [NSString stringWithFormat:@"%@, \"%@\", %@, %@",
+                siteTitle,
+                storyTitle,
+                tierLabel ?: [NBLocalization text:@"Related"],
+                storyDate];
+    }
+
+    NSMutableString *output = [NSMutableString stringWithString:siteTitle];
     
-    [output appendFormat:@", \"%@\"", self.storyTitle ?: @"no story"];
+    [output appendFormat:@", \"%@\"", storyTitle];
     
     if (self.storyAuthor.length) {
-        [output appendFormat:@", by %@", self.storyAuthor ?: @"no author"];
+        [output appendFormat:@", %@", [NSString stringWithFormat:[NBLocalization text:@"by %@"], self.storyAuthor]];
     }
     
-    [output appendFormat:@", at %@", self.storyDate ?: @"no date"];
-    [output appendFormat:@". %@", self.storyContent ?: @"no content"];
+    [output appendFormat:@", %@", [NSString stringWithFormat:[NBLocalization text:@"at %@"], storyDate]];
+    [output appendFormat:@". %@", self.storyContent ?: [NBLocalization text:@"no content"]];
     
     return output;
 }
 
-- (void)setupGestures {
-    NSString *unreadIcon;
-    if (storyScore == -1) {
-        unreadIcon = @"indicator-hidden";
-    } else if (storyScore == 1) {
-        unreadIcon = @"indicator-focus";
-    } else {
-        unreadIcon = @"indicator-unread";
-    }
-    
-    UIColor *shareColor = self.isSaved ?
-                            UIColorFromRGB(0xF69E89) :
-                            UIColorFromRGB(0xA4D97B);
-    UIColor *readColor = self.isRead ?
-                            UIColorFromRGB(0xBED49F) :
-                            UIColorFromRGB(0xFFFFD2);
-    
-    if (!self.isReadAvailable) {
-        unreadIcon = nil;
-        readColor = nil;
-    }
-    
-    appDelegate = [NewsBlurAppDelegate sharedAppDelegate];
-    [self setDelegate:(FeedDetailViewController <MCSwipeTableViewCellDelegate> *)appDelegate.feedDetailViewController];
-    
-    [self setFirstStateIconName:@"saved-stories"
-                     firstColor:shareColor
-            secondStateIconName:nil
-                    secondColor:nil
-                  thirdIconName:unreadIcon
-                     thirdColor:readColor
-                 fourthIconName:nil
-                    fourthColor:nil];
+- (NSString *)accessibilityValue {
+    return [NSString stringWithFormat:@"%@, %@",
+            self.isRead ? [NBLocalization text:@"Read"] : [NBLocalization text:@"Unread"],
+            self.isSaved ? [NBLocalization text:@"Saved"] : [NBLocalization text:@"Unsaved"]];
+}
 
-    self.mode = MCSwipeTableViewCellModeSwitch;
+- (void)setupGestures {
+    appDelegate = [NewsBlurAppDelegate sharedAppDelegate];
+    BOOL right = [StoryTitleSwipePreference usesRowSwipeRight:YES canMarkRead:self.isReadAvailable];
+    BOOL left = [StoryTitleSwipePreference usesRowSwipeRight:NO canMarkRead:self.isReadAvailable];
+    self.shouldDrag = (right || left) && !self.isClusterStory;
+    self.mode = self.shouldDrag ? MCSwipeTableViewCellModeSwitch : MCSwipeTableViewCellModeNone;
+    self.delegate = self.shouldDrag ? appDelegate.feedDetailViewController : nil;
+    if (!self.shouldDrag) return;
+
+    StoryTitleSwipeAction rightAction = StoryTitleSwipePreference.rightAction;
+    StoryTitleSwipeAction leftAction = StoryTitleSwipePreference.leftAction;
+    NSString *rightIcon = right ? [StoryTitleSwipePreference iconNameForAction:rightAction isRead:self.isRead score:storyScore] : nil;
+    NSString *leftIcon = left ? [StoryTitleSwipePreference iconNameForAction:leftAction isRead:self.isRead score:storyScore] : nil;
+    UIColor *rightColor = right ? [StoryTitleSwipePreference colorForAction:rightAction isSaved:self.isSaved isRead:self.isRead] : nil;
+    UIColor *leftColor = left ? [StoryTitleSwipePreference colorForAction:leftAction isSaved:self.isSaved isRead:self.isRead] : nil;
+    [self setFirstStateIconName:rightIcon firstColor:rightColor
+          secondStateIconName:nil secondColor:nil
+                 thirdIconName:leftIcon thirdColor:leftColor
+                fourthIconName:nil fourthColor:nil];
     self.shouldAnimatesIcons = NO;
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if ([gestureRecognizer isKindOfClass:UIPanGestureRecognizer.class]) {
+        UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)gestureRecognizer;
+        CGPoint velocity = [pan velocityInView:self];
+        if (!self.shouldDrag && !GesturePreferences.storiesEnabled) {
+            // FeedDetailTableCell.m consumes disabled row swipes while reserving the leading edge for navigation.
+            CGFloat startX = [pan locationInView:self].x - [pan translationInView:self].x;
+            // FeedDetailTableCell.m reserves the right edge instead when navigation swipes back from it.
+            BOOL backSwipe = self.nb_isRightToLeft ? (velocity.x < 0 && startX > CGRectGetWidth(self.bounds) - 20)
+                                                   : (velocity.x > 0 && startX < 20);
+            return fabs(velocity.x) > fabs(velocity.y) && !backSwipe;
+        }
+        // FeedDetailTableCell.m leaves menu swipes to UITableView and back swipes to navigation.
+        if (![StoryTitleSwipePreference usesRowSwipeRight:velocity.x > 0 canMarkRead:self.isReadAvailable]) return NO;
+    }
+    return [super gestureRecognizerShouldBegin:gestureRecognizer];
+}
+
+- (BOOL)readStateAnimationsEnabled {
+    return !UIAccessibilityIsReduceMotionEnabled();
+}
+
+- (BOOL)isRead {
+    return isRead;
+}
+
+- (void)setIsRead:(BOOL)read {
+    // FeedDetailTableCell.m uses Core Animation's reserved key because CATransition ignores custom keys.
+    [cellContent.layer removeAnimationForKey:kCATransition];
+    isRead = read;
+}
+
+- (void)setRead:(BOOL)read animated:(BOOL)animated {
+    if (isRead == read) return;
+
+    BOOL shouldAnimate = animated && self.readStateAnimationsEnabled && self.window &&
+        !self.hidden && !self.window.hidden &&
+        CGRectIntersectsRect([self convertRect:self.bounds toView:self.window], self.window.bounds);
+    if (shouldAnimate) {
+        // FeedDetailTableCell.m finishes pending unread drawing before capturing the existing layer contents.
+        [self.layer displayIfNeeded];
+        [cellContent.layer displayIfNeeded];
+        shouldAnimate = cellContent.layer.contents != nil;
+    }
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.isRead = read;
+    if (shouldAnimate) {
+        CATransition *fade = [CATransition animation];
+        fade.type = kCATransitionFade;
+        fade.duration = 0.2;
+        fade.beginTime = [cellContent.layer convertTime:CACurrentMediaTime() fromLayer:nil];
+        fade.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [cellContent.layer addAnimation:fade forKey:kCATransition];
+    }
+    [self setNeedsDisplay];
+    if (shouldAnimate) {
+        // FeedDetailTableCell.m changes all read artwork in the same transaction as its fade, without a row reload.
+        [self.layer displayIfNeeded];
+        [cellContent.layer displayIfNeeded];
+    }
+    [CATransaction commit];
+}
+
+- (void)setStoryHash:(NSString *)newStoryHash {
+    if (storyHash != newStoryHash && ![storyHash isEqualToString:newStoryHash]) {
+        [cellContent.layer removeAnimationForKey:kCATransition];
+    }
+    storyHash = newStoryHash;
+}
+
+- (void)prepareForReuse {
+    [cellContent.layer removeAnimationForKey:kCATransition];
+    [super prepareForReuse];
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (!self.window) [cellContent.layer removeAnimationForKey:kCATransition];
+}
+
+- (void)setSiteFavicon:(UIImage *)newSiteFavicon {
+    if (siteFavicon == newSiteFavicon && !self.siteFaviconPrepared) {
+        return;
+    }
+
+    self.siteFaviconPrepared = NO;
+    siteFavicon = newSiteFavicon;
+    self.cachedRoundedSiteFavicon = nil;
+}
+
+- (void)setPreparedSiteFavicon:(UIImage *)image {
+    // FeedDetailTableCell.m consumes the same rounded artwork without applying its edge clipping twice.
+    self.siteFavicon = image;
+    self.cachedRoundedSiteFavicon = image;
+    self.siteFaviconPrepared = image != nil;
+}
+
+- (UIImage *)roundedSiteFaviconImage {
+    if (!self.cachedRoundedSiteFavicon && self.siteFavicon) {
+        self.cachedRoundedSiteFavicon = [Utilities roundCorneredImage:self.siteFavicon radius:4 convertToSize:CGSizeMake(16, 16)];
+    }
+
+    return self.cachedRoundedSiteFavicon;
 }
 
 
@@ -159,6 +300,8 @@ static UIFont *indicatorFont = nil;
             fontDescriptor = [fontDescriptor fontDescriptorWithSize:18.0f];
         }
     }
+
+    appDelegate.fontDescriptorTitleSize = fontDescriptor;
     
     return fontDescriptor;
 }
@@ -171,12 +314,55 @@ static UIFont *indicatorFont = nil;
 @synthesize storyImage;
 @synthesize appDelegate;
 
+- (void)updateRegularLayoutCacheWithBounds:(CGRect)bounds
+                               contentRect:(CGRect)contentRect
+                            fontDescriptor:(UIFontDescriptor *)fontDescriptor
+                            paragraphStyle:(NSMutableParagraphStyle *)paragraphStyle
+                             comfortMargin:(CGFloat)comfortMargin
+                              riverPadding:(CGFloat)riverPadding
+                            hasCachedImage:(BOOL)hasCachedImage {
+    StoryTextLayoutRequest *request = [[StoryTextLayoutRequest alloc]
+        initWithTitle:cell.storyTitle ?: @"" preview:cell.storyContent ?: @""
+        contentWidth:contentRect.size.width boundsHeight:bounds.size.height
+        fontPointSize:fontDescriptor.pointSize textSize:cell.textSize shortTitles:cell.isShort
+        river:cell.isRiverOrSocial comfortMargin:comfortMargin riverPadding:riverPadding
+        hasImage:hasCachedImage paragraphStyle:paragraphStyle];
+    if ([self.cachedRegularLayoutKey isEqual:request]) return;
+    self.cachedRegularLayoutKey = request;
+
+    StoryTextLayout *layout = [cell.storyTextLayoutCache cachedLayoutForRequest:request];
+    if (!layout) {
+        // FeedDetailTableCell.m preserves immediate text on cold misses or when scrolling outruns prefetch.
+        layout = [request measure];
+        [cell.storyTextLayoutCache cacheLayout:layout forRequest:request];
+    }
+    self.cachedRegularTitleSize = layout.titleSize;
+    self.cachedRegularContentSize = layout.previewSize;
+    self.cachedRegularContentGap = layout.contentGap;
+}
+
+- (UIColor *)clusterTierBadgeColorForTier:(NSString *)clusterTier {
+    NSString *normalizedTier = [StoryClusterDisplayDecision normalizedClusterTierValue:clusterTier];
+    if ([normalizedTier isEqualToString:@"title"]) {
+        return UIColorFromLightSepiaMediumDarkRGB(0x5A8C6A, 0x6E865F, 0x7DC99A, 0x7DC99A);
+    }
+
+    return UIColorFromLightSepiaMediumDarkRGB(0xA88246, 0x9B7540, 0xD2A76B, 0xD2A76B);
+}
+
 - (void)drawRect:(CGRect)r {
     if (!cell) {
         return;
     }
     
     BOOL isHighlighted = cell.highlighted || cell.selected;
+#if TARGET_OS_MACCATALYST
+    // FeedDetailTableCell.m keeps read text consistent without changing cached title and preview metrics.
+    UIColor *readTextColor = UIColorFromLightSepiaMediumDarkRGB(0xB8B8B8, 0xB8B8B8, 0xA0A0A0, 0x707070);
+    UIColor *headingTextColor = cell.isRead ? readTextColor : (isHighlighted ?
+        UIColorFromLightDarkRGB(0x686868, 0xA0A0A0) :
+        UIColorFromLightSepiaMediumDarkRGB(0x111111, 0x333333, 0xD0D0D0, 0xCCCCCC));
+#endif
     CGFloat riverPadding = -10;
     CGFloat riverPreview = 4;
     
@@ -186,6 +372,220 @@ static UIFont *indicatorFont = nil;
     }
 
     CGContextRef context = UIGraphicsGetCurrentContext();
+    if (cell.isClusterStory) {
+        NSString *spacing = [[NSUserDefaults standardUserDefaults] objectForKey:@"feed_list_spacing"];
+        BOOL isComfortable = ![spacing isEqualToString:@"compact"];
+        CGFloat comfortMargin = isComfortable ? 4 : 0;
+        UIColor *backgroundColor = isHighlighted ?
+            UIColorFromLightSepiaMediumDarkRGB(0xFFFDEF, 0xEEE0CE, 0x303A40, 0x303030) :
+            UIColorFromLightSepiaMediumDarkRGB(0xF4F4F4, 0xF3E2CB, 0x4F4F4F, 0x000000);
+        UIColor *clusterBackgroundColor = isHighlighted ?
+            UIColorFromLightSepiaMediumDarkRGB(0xEEF5FD, 0xE7D8C6, 0x38424B, 0x1A1F23) :
+            UIColorFromLightSepiaMediumDarkRGB(0xE8F0F8, 0xECDEC9, 0x363C43, 0x101418);
+        [backgroundColor set];
+        CGContextFillRect(context, r);
+
+        CGFloat clusterIndent = 18.0 + (isHighlighted ? 2.0 : 0);
+        CGFloat trailingInset = 10.0;
+        CGFloat verticalInset = 0.0;
+        CGRect clusterRect = CGRectMake(clusterIndent,
+                                        verticalInset,
+                                        MAX(r.size.width - clusterIndent - trailingInset, 40.0),
+                                        MAX(r.size.height - (verticalInset * 2.0), 1.0));
+        // FeedDetailTableCell.m lays out related rows with left-to-right coordinates and mirrors each frame within
+        // the row when the story list is right to left.
+        BOOL rightToLeft = self.nb_isRightToLeft;
+        UIBezierPath *clusterPath = [UIBezierPath bezierPathWithRoundedRect:[self nb_directionalRect:clusterRect within:r]
+                                                               cornerRadius:(isComfortable ? 8.0 : 6.0)];
+        [clusterBackgroundColor setFill];
+        [clusterPath fill];
+        CGContextSaveGState(context);
+        [clusterPath addClip];
+
+        UIFontDescriptor *fontDescriptor = [cell fontDescriptorUsingPreferredSize:UIFontTextStyleCaption1];
+        UIFont *titleFont = [UIFont fontWithName:@"WhitneySSm-Medium" size:MAX(fontDescriptor.pointSize - 1, 11)];
+        UIFont *dateFont = [UIFont fontWithName:@"WhitneySSm-Medium" size:10];
+        UIColor *titleColor = cell.isRead ?
+            UIColorFromLightSepiaMediumDarkRGB(0x585858, 0x585858, 0x989898, 0x888888) :
+            UIColorFromLightSepiaMediumDarkRGB(0x202020, 0x333333, 0xD8D8D8, 0xD0D0D0);
+        UIColor *metaColor = cell.isRead ?
+            UIColorFromLightSepiaMediumDarkRGB(0x9A9A9A, 0x8B7B6B, 0x7F7F7F, 0x707070) :
+            UIColorFromLightSepiaMediumDarkRGB(0x808080, 0x8B7B6B, 0xA0A0A0, 0x8F8F8F);
+        if (isHighlighted) {
+            titleColor = UIColorFromLightSepiaMediumDarkRGB(0x444444, 0x444444, 0xC6C6C6, 0xBCBCBC);
+            metaColor = UIColorFromLightSepiaMediumDarkRGB(0x707070, 0x8B7B6B, 0x8F8F8F, 0x808080);
+        }
+#if TARGET_OS_MACCATALYST
+        if (cell.isRead) {
+            titleColor = readTextColor;
+            metaColor = readTextColor;
+        }
+#endif
+
+        NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle defaultParagraphStyle] mutableCopy];
+        paragraphStyle.lineBreakMode = NSLineBreakByTruncatingTail;
+        if (rightToLeft) {
+            paragraphStyle.alignment = NSTextAlignmentRight;
+        }
+
+        CGFloat feedBarOffset = CGRectGetMinX(clusterRect) + 2.0;
+        // FeedDetailTableCell.m draws the feed color bars on the leading edge of the related row.
+        CGFloat feedBarDirection = rightToLeft ? -1.0 : 1.0;
+        feedBarOffset = [self nb_directionalX:feedBarOffset within:r];
+        CGContextSetStrokeColorWithColor(context, cell.feedColorBarTopBorder.CGColor);
+        CGContextSetAlpha(context, cell.isRead ? 0.15 : 1.0);
+        CGContextSetLineWidth(context, 4.0f);
+        CGContextBeginPath(context);
+        CGContextMoveToPoint(context, feedBarOffset, CGRectGetMinY(clusterRect));
+        CGContextAddLineToPoint(context, feedBarOffset, CGRectGetMaxY(clusterRect));
+        CGContextStrokePath(context);
+
+        CGContextSetStrokeColorWithColor(context, cell.feedColorBar.CGColor);
+        CGContextBeginPath(context);
+        CGContextMoveToPoint(context, feedBarOffset + 4.0f * feedBarDirection, CGRectGetMinY(clusterRect));
+        CGContextAddLineToPoint(context, feedBarOffset + 4.0f * feedBarDirection, CGRectGetMaxY(clusterRect));
+        CGContextStrokePath(context);
+        CGContextSetAlpha(context, 1.0);
+
+        CGFloat contentY = CGRectGetMinY(clusterRect) + comfortMargin;
+        CGFloat contentHeight = CGRectGetHeight(clusterRect) - comfortMargin * 2;
+        NSString *indicatorImageName = [StoryClusterDisplayDecision indicatorImageNameForScore:cell.storyScore];
+        UIImage *indicatorImage = [UIImage imageNamed:indicatorImageName];
+        CGFloat indicatorSize = cell.storyScore == 0 ? 10.0 : 12.0;
+        CGFloat indicatorX = CGRectGetMinX(clusterRect) + 11.0;
+        CGFloat indicatorY = contentY + (contentHeight - indicatorSize) / 2.0;
+        [indicatorImage drawInRect:[self nb_directionalRect:CGRectMake(indicatorX, indicatorY, indicatorSize, indicatorSize) within:r]
+                         blendMode:0
+                             alpha:(cell.isRead ? 0.15 : 1.0)];
+
+        UIImage *favicon = [cell roundedSiteFaviconImage];
+        CGFloat faviconY = contentY + (contentHeight - 16.0) / 2.0;
+        [favicon drawInRect:[self nb_directionalRect:CGRectMake(CGRectGetMinX(clusterRect) + 26.0, faviconY, 16.0, 16.0) within:r]
+                  blendMode:0
+                      alpha:(cell.isRead ? 0.4f : 1.0f)];
+
+        NSString *dateText = cell.storyDate ?: @"";
+        CGSize dateSize = [dateText sizeWithAttributes:@{NSFontAttributeName: dateFont}];
+#if TARGET_OS_MACCATALYST
+        // FeedDetailTableCell.m preserves the existing related-row date allocation and adjacent image/badge positions.
+        dateFont = [UIFont fontWithName:@"WhitneySSm-Book" size:10];
+#endif
+        CGFloat rightPadding = 12.0;
+        CGFloat dateX = CGRectGetMaxX(clusterRect) - rightPadding - dateSize.width;
+        CGFloat titleRightEdge = dateX - 8.0;
+        CGRect imageFrame = CGRectZero;
+        BOOL hasCachedImage = NO;
+
+        id cachedImage = [appDelegate cachedImageForStoryHash:cell.storyHash];
+        if (cachedImage && cachedImage != [NSNull null]) {
+            imageFrame = CGRectMake(dateX - 30.0, contentY + (contentHeight - 24.0) / 2.0, 24.0, 24.0);
+            hasCachedImage = YES;
+            titleRightEdge = CGRectGetMinX(imageFrame) - 8.0;
+
+            CGContextSaveGState(context);
+            CGRect drawnImageFrame = [self nb_directionalRect:imageFrame within:r];
+            [[UIBezierPath bezierPathWithRoundedRect:drawnImageFrame cornerRadius:4] addClip];
+            UIImage *cachedStoryImage = (UIImage *)cachedImage;
+            CGFloat aspect = cachedStoryImage.size.width / cachedStoryImage.size.height;
+            CGRect drawingFrame = imageFrame;
+            if (imageFrame.size.width / aspect > imageFrame.size.height) {
+                CGFloat height = imageFrame.size.width / aspect;
+                drawingFrame = CGRectMake(imageFrame.origin.x,
+                                          imageFrame.origin.y + ((imageFrame.size.height - height) / 2.0),
+                                          imageFrame.size.width,
+                                          height);
+            } else {
+                CGFloat width = imageFrame.size.height * aspect;
+                drawingFrame = CGRectMake(imageFrame.origin.x + ((imageFrame.size.width - width) / 2.0),
+                                          imageFrame.origin.y,
+                                          width,
+                                          imageFrame.size.height);
+            }
+
+            CGContextClipToRect(context, drawnImageFrame);
+            [cachedStoryImage drawInRect:[self nb_directionalRect:drawingFrame within:r] blendMode:kCGBlendModeNormal alpha:(cell.isRead ? 0.55 : 1.0)];
+            CGContextRestoreGState(context);
+        }
+
+        CGFloat titleX = CGRectGetMinX(clusterRect) + 50.0;
+        CGRect badgeFrame = CGRectZero;
+        NSString *badgeText = [[StoryClusterDisplayDecision clusterTierBadgeTextForValue:cell.clusterTier]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (badgeText.length) {
+            UIFont *badgeFont = [UIFont fontWithName:@"WhitneySSm-Medium" size:9];
+            if (!badgeFont) {
+                badgeFont = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+            }
+            NSDictionary *badgeAttributes = @{
+                NSFontAttributeName: badgeFont,
+                NSKernAttributeName: @0.45
+            };
+            CGSize badgeTextSize = [badgeText sizeWithAttributes:badgeAttributes];
+            CGFloat badgeWidth = ceil(badgeTextSize.width) + 14.0;
+            CGFloat badgeHeight = 16.0;
+            CGFloat badgeMaxX = hasCachedImage ? CGRectGetMinX(imageFrame) - 6.0 : dateX - 8.0;
+            CGFloat minimumTitleWidth = 48.0;
+            if ((badgeMaxX - badgeWidth) - titleX >= minimumTitleWidth) {
+                badgeFrame = CGRectMake(badgeMaxX - badgeWidth,
+                                        contentY + (contentHeight - badgeHeight) / 2.0,
+                                        badgeWidth,
+                                        badgeHeight);
+                titleRightEdge = CGRectGetMinX(badgeFrame) - 8.0;
+            }
+        }
+
+        CGRect titleFrame = CGRectMake(titleX,
+                                       contentY + (contentHeight - titleFont.lineHeight) / 2.0 - 1.0,
+                                       MAX(titleRightEdge - titleX, 40.0),
+                                       ceil(titleFont.lineHeight));
+        [cell.storyTitle drawWithRect:[self nb_directionalRect:titleFrame within:r]
+                              options:NSStringDrawingTruncatesLastVisibleLine|NSStringDrawingUsesLineFragmentOrigin
+                           attributes:@{NSFontAttributeName: titleFont,
+                                        NSForegroundColorAttributeName: titleColor,
+                                        NSParagraphStyleAttributeName: paragraphStyle}
+                              context:nil];
+
+        if (!CGRectIsEmpty(badgeFrame)) {
+            UIColor *badgeColor = [[self clusterTierBadgeColorForTier:cell.clusterTier]
+                                   colorWithAlphaComponent:(cell.isRead ? 0.45 : 1.0)];
+            badgeFrame = [self nb_directionalRect:badgeFrame within:r];
+            UIBezierPath *badgePath = [UIBezierPath bezierPathWithRoundedRect:badgeFrame
+                                                                 cornerRadius:(CGRectGetHeight(badgeFrame) / 2.0)];
+            CGContextSaveGState(context);
+            CGContextSetStrokeColorWithColor(context, badgeColor.CGColor);
+            CGContextSetLineWidth(context, 1.0);
+            [badgePath stroke];
+
+            UIFont *badgeFont = [UIFont fontWithName:@"WhitneySSm-Medium" size:9];
+            if (!badgeFont) {
+                badgeFont = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+            }
+            NSDictionary *badgeAttributes = @{
+                NSFontAttributeName: badgeFont,
+                NSForegroundColorAttributeName: badgeColor,
+                NSKernAttributeName: @0.45
+            };
+            CGSize badgeTextSize = [badgeText sizeWithAttributes:badgeAttributes];
+            CGRect badgeTextFrame = CGRectMake(CGRectGetMidX(badgeFrame) - (badgeTextSize.width / 2.0),
+                                               CGRectGetMidY(badgeFrame) - (badgeFont.lineHeight / 2.0) - 0.5,
+                                               badgeTextSize.width,
+                                               ceil(badgeFont.lineHeight));
+            [badgeText drawInRect:badgeTextFrame withAttributes:badgeAttributes];
+            CGContextRestoreGState(context);
+        }
+
+        CGRect dateFrame = CGRectMake(dateX,
+                                      contentY + (contentHeight - dateFont.lineHeight) / 2.0,
+                                      dateSize.width,
+                                      ceil(dateFont.lineHeight));
+        [dateText drawInRect:[self nb_directionalRect:dateFrame within:r]
+              withAttributes:@{NSFontAttributeName: dateFont,
+                               NSForegroundColorAttributeName: metaColor}];
+
+        CGContextRestoreGState(context);
+
+        return;
+    }
     
     NSString *preview = [[NSUserDefaults standardUserDefaults] stringForKey:@"story_list_preview_images_size"];
     BOOL isPreviewShown = ![preview isEqualToString:@"none"];
@@ -224,12 +624,23 @@ static UIFont *indicatorFont = nil;
     CGRect dateRect = rect;
     
     UIColor *backgroundColor;
-    backgroundColor = isHighlighted ?
-                      UIColorFromLightSepiaMediumDarkRGB(0xFFFDEF, 0xEEE0CE, 0x303A40, 0x303030) : UIColorFromLightSepiaMediumDarkRGB(0xF4F4F4, 0xF3E2CB, 0x4F4F4F, 0x101010);
+    if (cell.isDailyBriefingSummary) {
+        backgroundColor = isHighlighted ?
+            UIColorFromLightSepiaMediumDarkRGB(0xDCEAF8, 0xE9DCCB, 0x38414A, 0x30363E) :
+            UIColorFromLightSepiaMediumDarkRGB(0xEAF3FC, 0xF1E6D7, 0x30363E, 0x232830);
+    } else {
+        backgroundColor = isHighlighted ?
+            UIColorFromLightSepiaMediumDarkRGB(0xFFFDEF, 0xEEE0CE, 0x303A40, 0x303030) :
+            UIColorFromLightSepiaMediumDarkRGB(0xF4F4F4, 0xF3E2CB, 0x4F4F4F, 0x000000);
+    }
     [backgroundColor set];
     
     CGContextFillRect(context, r);
     
+    // FeedDetailTableCell.m lays out story rows with left-to-right coordinates and mirrors each frame within the
+    // row when the story list is right to left, so the feed bar, indicator and favicon lead and the thumbnail trails.
+    BOOL rightToLeft = self.nb_isRightToLeft;
+    BOOL hasCachedImageForLayout = NO;
     if (cell.storyHash && isPreviewShown) {
         CGRect imageFrame = CGRectMake(r.size.width - imageWidth - previewHorizMargin, topMargin,
                                        imageWidth, imageHeight);
@@ -246,15 +657,17 @@ static UIFont *indicatorFont = nil;
             }
         }
         
-        UIImage *cachedImage = (UIImage *)appDelegate.cachedStoryImages[cell.storyHash];
+        UIImage *cachedImage = [appDelegate cachedImageForStoryHash:cell.storyHash];
         
         if (cachedImage && ![cachedImage isKindOfClass:[NSNull class]]) {
+            hasCachedImageForLayout = YES;
 //            NSLog(@"Found cached image: %@", cell.storyTitle);
             CGContextRef context = UIGraphicsGetCurrentContext();
             CGContextSaveGState(context);
+            CGRect drawnImageFrame = [self nb_directionalRect:imageFrame within:r];
             
             if (isSmall) {
-                [[UIBezierPath bezierPathWithRoundedRect:imageFrame cornerRadius:8] addClip];
+                [[UIBezierPath bezierPathWithRoundedRect:drawnImageFrame cornerRadius:8] addClip];
             }
             
             CGFloat alpha = 1.0f;
@@ -277,9 +690,11 @@ static UIFont *indicatorFont = nil;
                 drawingFrame = CGRectMake(imageFrame.origin.x + ((imageFrame.size.width - width) / 2), imageFrame.origin.y, width, imageFrame.size.height);
             }
             
-            CGContextClipToRect(context, imageFrame);
+            CGContextClipToRect(context, drawnImageFrame);
             
-            [cachedImage drawInRect:drawingFrame blendMode:0 alpha:alpha];
+            CFTimeInterval imageDrawStarted = [ReaderPerformance start];
+            [cachedImage drawInRect:[self nb_directionalRect:drawingFrame within:r] blendMode:0 alpha:alpha];
+            if (imageDrawStarted > 0) [ReaderPerformance finish:@"story.thumbnail.draw" since:imageDrawStarted];
             
             if (!isLeft) {
                 rect.size.width -= imageFrame.size.width;
@@ -304,6 +719,13 @@ static UIFont *indicatorFont = nil;
     paragraphStyle.lineBreakMode = NSLineBreakByWordWrapping;
     paragraphStyle.alignment = NSTextAlignmentLeft;
     paragraphStyle.lineHeightMultiple = 0.95f;
+    // FeedDetailTableCell.m measures with the left-aligned style FeedDetailObjCViewController.m prefetches and
+    // aligns only when drawing: a right-to-left list keeps the feed name on the leading edge and lets the
+    // title and preview align by their own script.
+    NSMutableParagraphStyle *leadingParagraphStyle = [paragraphStyle mutableCopy];
+    leadingParagraphStyle.alignment = self.nb_leadingTextAlignment;
+    NSMutableParagraphStyle *contentParagraphStyle = [paragraphStyle mutableCopy];
+    contentParagraphStyle.alignment = self.nb_contentTextAlignment;
     
     if (cell.isRiverOrSocial) {
         if (cell.isRead) {
@@ -317,23 +739,22 @@ static UIFont *indicatorFont = nil;
         if (isHighlighted) {
             textColor = UIColorFromLightSepiaMediumDarkRGB(0x686868, 0x686868, 0xA0A0A0, 0x808080);
         }
+#if TARGET_OS_MACCATALYST
+        textColor = headingTextColor;
+#endif
         
         NSInteger siteTitleY = (20 + comfortMargin - font.pointSize/2)/2;
-        [cell.siteTitle drawInRect:CGRectMake(leftMargin - feedOffset + 24, siteTitleY, rect.size.width - 20, 20)
+        [cell.siteTitle drawInRect:[self nb_directionalRect:CGRectMake(leftMargin - feedOffset + 24, siteTitleY, rect.size.width - 20, 20) within:r]
                     withAttributes:@{NSFontAttributeName: font,
                                      NSForegroundColorAttributeName: textColor,
-                                     NSParagraphStyleAttributeName: paragraphStyle}];
+                                     NSParagraphStyleAttributeName: leadingParagraphStyle}];
         
-        // site favicon
-        if (cell.isRead && !cell.hasAlpha) {
-            if (cell.isRiverOrSocial) {
-                cell.siteFavicon = [cell imageByApplyingAlpha:cell.siteFavicon withAlpha:0.25];
-            }
-            cell.hasAlpha = YES;
-        }
-        
-        UIImage *siteIcon = [Utilities roundCorneredImage:cell.siteFavicon radius:4 convertToSize:CGSizeMake(16, 16)];
-        [siteIcon drawInRect:CGRectMake(leftMargin - feedOffset, siteTitleY, 16.0, 16.0)];
+        CFTimeInterval faviconDrawStarted = [ReaderPerformance start];
+        UIImage *siteIcon = [cell roundedSiteFaviconImage];
+        [siteIcon drawInRect:[self nb_directionalRect:CGRectMake(leftMargin - feedOffset, siteTitleY, 16.0, 16.0) within:r]
+                   blendMode:0
+                       alpha:(cell.isRead ? 0.25f : 1.0f)];
+        if (faviconDrawStarted > 0) [ReaderPerformance finish:@"story.favicon.draw" since:faviconDrawStarted];
     }
     
     // story title
@@ -347,39 +768,53 @@ static UIFont *indicatorFont = nil;
     if (isHighlighted) {
         textColor = UIColorFromLightDarkRGB(0x686868, 0xA0A0A0);
     }
-    CGFloat boundingRows = cell.isShort ? 1.5 : 4;
-    if (!cell.isShort && (self.cell.textSize == FeedDetailTextSizeMedium || self.cell.textSize == FeedDetailTextSizeLong)) {
-        boundingRows = MIN(((r.size.height - 24) / font.pointSize) - 2, 4);
-    }
-    CGSize theSize = [cell.storyTitle
-                      boundingRectWithSize:CGSizeMake(rect.size.width, font.pointSize * boundingRows)
-                      options:NSStringDrawingTruncatesLastVisibleLine|NSStringDrawingUsesLineFragmentOrigin
-                      attributes:@{NSFontAttributeName: font,
-                                   NSParagraphStyleAttributeName: paragraphStyle}
-                      context:nil].size;
+#if TARGET_OS_MACCATALYST
+    textColor = headingTextColor;
+#endif
+    [self updateRegularLayoutCacheWithBounds:r
+                                 contentRect:rect
+                              fontDescriptor:fontDescriptor
+                              paragraphStyle:paragraphStyle
+                               comfortMargin:comfortMargin
+                                riverPadding:riverPadding
+                              hasCachedImage:hasCachedImageForLayout];
+
+    CGSize theSize = self.cachedRegularTitleSize;
+    CGFloat contentGap = self.cachedRegularContentGap;
+
     int storyTitleY = 14 + riverPadding;
     if (cell.isShort) {
         storyTitleY = 14 + riverPadding - (theSize.height/font.pointSize*2);
     }
+    if (cell.storyContent && cell.storyContent.length > 0) {
+        CGFloat topEdge = cell.isRiverOrSocial ? riverPadding : 0;
+        storyTitleY = (int)(topEdge + contentGap);
+    } else if (!cell.storyContent && cell.isRiverOrSocial) {
+        CGFloat dateY = r.size.height - 18 - comfortMargin;
+        CGFloat centeredY = riverPadding + (dateY - riverPadding - theSize.height) / 2;
+        storyTitleY = (int)MAX(centeredY, riverPadding);
+    }
     int storyTitleX = leftMargin;
     if (cell.isSaved) {
         UIImage *savedIcon = [UIImage imageNamed:@"saved-stories"];
-        [savedIcon drawInRect:CGRectMake(storyTitleX, storyTitleY - 1, 16, 16) blendMode:0 alpha:1];
+        [savedIcon drawInRect:[self nb_directionalRect:CGRectMake(storyTitleX, storyTitleY - 1, 16, 16) within:r] blendMode:0 alpha:1];
         storyTitleX += 22;
     }
     if (cell.isShared) {
         UIImage *savedIcon = [UIImage imageNamed:@"menu_icn_share"];
-        [savedIcon drawInRect:CGRectMake(storyTitleX, storyTitleY - 1, 16, 16) blendMode:0 alpha:1];
+        [savedIcon drawInRect:[self nb_directionalRect:CGRectMake(storyTitleX, storyTitleY - 1, 16, 16) within:r] blendMode:0 alpha:1];
         storyTitleX += 22;
     }
     CGRect storyTitleFrame = CGRectMake(storyTitleX, storyTitleY,
                                         rect.size.width - storyTitleX + leftMargin, theSize.height);
-    [cell.storyTitle drawWithRect:storyTitleFrame
+    CFTimeInterval titleDrawStarted = [ReaderPerformance start];
+    [cell.storyTitle drawWithRect:[self nb_directionalRect:storyTitleFrame within:r]
                           options:NSStringDrawingTruncatesLastVisibleLine|NSStringDrawingUsesLineFragmentOrigin
                        attributes:@{NSFontAttributeName: font,
                                     NSForegroundColorAttributeName: textColor,
-                                    NSParagraphStyleAttributeName: paragraphStyle}
+                                    NSParagraphStyleAttributeName: contentParagraphStyle}
                           context:nil];
+    if (titleDrawStarted > 0) [ReaderPerformance finish:@"story.title.draw" since:titleDrawStarted];
     
 //    CGContextStrokeRect(context, storyTitleFrame);
     
@@ -399,39 +834,23 @@ static UIFont *indicatorFont = nil;
     }
     
     if (cell.storyContent) {
+        CGSize contentSize = self.cachedRegularContentSize;
+
+        // Equal spacing: center content between title bottom and date
         CGFloat bottomOfTitle = storyTitleY + theSize.height;
-        int storyContentWidth = rect.size.width;
-        CGFloat boundingRows = cell.isShort ? 1.5 : 3;
-        
-        if (!cell.isShort && (self.cell.textSize == FeedDetailTextSizeMedium || self.cell.textSize == FeedDetailTextSizeLong)) {
-            boundingRows = (r.size.height - 30 - comfortMargin - CGRectGetMaxY(storyTitleFrame)) / font.pointSize;
-        }
-        
-        CGSize contentSize = [cell.storyContent
-                              boundingRectWithSize:CGSizeMake(storyContentWidth, font.pointSize * boundingRows)
-                              options:NSStringDrawingTruncatesLastVisibleLine|NSStringDrawingUsesLineFragmentOrigin
-                              attributes:@{NSFontAttributeName: font,
-                                           NSParagraphStyleAttributeName: paragraphStyle}
-                              context:nil].size;
-        CGFloat textRows = contentSize.height / font.pointSize;
-        int storyContentY = r.size.height - 16 - comfortMargin - 4 - ((font.pointSize * textRows + font.lineHeight) + contentSize.height) / 2;
-        if (cell.isShort) {
-            storyContentY = r.size.height - 10 - comfortMargin - 4 - ((font.pointSize + font.lineHeight) + contentSize.height)/2;
-        }
-        
-        if (storyContentY - bottomOfTitle > 20) {
-            storyContentY -= font.pointSize;
-            contentSize.height += font.lineHeight;
-        }
-        
+        CGFloat dateY = r.size.height - 18 - comfortMargin;
+        int storyContentY = (int)(bottomOfTitle + (dateY - bottomOfTitle - contentSize.height) / 2);
+
+        CFTimeInterval previewDrawStarted = [ReaderPerformance start];
         [cell.storyContent
-         drawWithRect:CGRectMake(storyTitleX, storyContentY,
-                                 rect.size.width - storyTitleX + leftMargin, contentSize.height)
+         drawWithRect:[self nb_directionalRect:CGRectMake(storyTitleX, storyContentY,
+                                                          rect.size.width - storyTitleX + leftMargin, contentSize.height) within:r]
          options:NSStringDrawingTruncatesLastVisibleLine|NSStringDrawingUsesLineFragmentOrigin
          attributes:@{NSFontAttributeName: font,
                       NSForegroundColorAttributeName: textColor,
-                      NSParagraphStyleAttributeName: paragraphStyle}
+                      NSParagraphStyleAttributeName: contentParagraphStyle}
          context:nil];
+        if (previewDrawStarted > 0) [ReaderPerformance finish:@"story.preview.draw" since:previewDrawStarted];
         
 //        CGContextStrokeRect(context, CGRectMake(storyTitleX, storyContentY,
 //                                                rect.size.width - storyTitleX + leftMargin, contentSize.height));
@@ -440,37 +859,42 @@ static UIFont *indicatorFont = nil;
     // story date
     int storyAuthorDateY = r.size.height - 18 - comfortMargin;
     
-    if (cell.isRead) {
-        font = [UIFont fontWithName:@"WhitneySSm-Medium" size:11];
-    } else {
-        font = [UIFont fontWithName:@"WhitneySSm-Medium" size:11];
-    }
+#if TARGET_OS_MACCATALYST
+    font = [UIFont fontWithName:@"WhitneySSm-Book" size:11];
+#else
+    font = [UIFont fontWithName:@"WhitneySSm-Medium" size:11];
+#endif
     // Story author and date
-    NSString *date = [Utilities formatShortDateFromTimestamp:cell.storyTimestamp];
+    NSString *date = cell.storyDate ?: [Utilities formatShortDateFromTimestamp:cell.storyTimestamp];
     NSString *author = cell.storyAuthor.length > 0 ? [NSString stringWithFormat:@" · %@", cell.storyAuthor] : @"";
     paragraphStyle.alignment = NSTextAlignmentLeft;
+    // FeedDetailTableCell.m orders the date before the author in the interface's direction.
+    leadingParagraphStyle.baseWritingDirection = self.nb_interfaceWritingDirection;
     [[NSString stringWithFormat:@"%@%@", date, author]
-     drawInRect:CGRectMake(leftMargin, storyAuthorDateY, dateRect.size.width - 12, 15.0)
+     drawInRect:[self nb_directionalRect:CGRectMake(leftMargin, storyAuthorDateY, dateRect.size.width - 12, 15.0) within:r]
      withAttributes:@{NSFontAttributeName: font,
                       NSForegroundColorAttributeName: textColor,
-                      NSParagraphStyleAttributeName: paragraphStyle}];
+                      NSParagraphStyleAttributeName: rightToLeft ? leadingParagraphStyle : paragraphStyle}];
     
     // feed bar
     CGFloat feedBarOffset = isHighlighted ? 2 : 0;
+    // FeedDetailTableCell.m draws the feed color bars on the leading edge.
+    CGFloat outerFeedBarX = [self nb_directionalX:2.0f + feedBarOffset within:r];
+    CGFloat innerFeedBarX = [self nb_directionalX:6.0f + feedBarOffset within:r];
     CGContextSetStrokeColor(context, CGColorGetComponents([cell.feedColorBarTopBorder CGColor]));
     if (cell.isRead) {
         CGContextSetAlpha(context, 0.15);
     }
     CGContextSetLineWidth(context, 4.0f);
     CGContextBeginPath(context);
-    CGContextMoveToPoint(context, 2.0f + feedBarOffset, 0);
-    CGContextAddLineToPoint(context, 2.0f + feedBarOffset, cell.frame.size.height);
+    CGContextMoveToPoint(context, outerFeedBarX, 0);
+    CGContextAddLineToPoint(context, outerFeedBarX, cell.frame.size.height);
     CGContextStrokePath(context);
     
     CGContextSetStrokeColor(context, CGColorGetComponents([cell.feedColorBar CGColor]));
     CGContextBeginPath(context);
-    CGContextMoveToPoint(context, 6.0f + feedBarOffset, 0);
-    CGContextAddLineToPoint(context, 6.0 + feedBarOffset, cell.frame.size.height);
+    CGContextMoveToPoint(context, innerFeedBarX, 0);
+    CGContextAddLineToPoint(context, innerFeedBarX, cell.frame.size.height);
     CGContextStrokePath(context);
     
     // reset for borders
@@ -512,16 +936,6 @@ static UIFont *indicatorFont = nil;
         CGContextAddPath(context, path.CGPath);
         CGContextDrawPath(context, kCGPathStroke);
         CGContextRestoreGState(context);
-    } else {
-        // top border
-        CGContextSetLineWidth(context, 1.0f);
-        
-        CGContextSetStrokeColor(context, CGColorGetComponents([white CGColor]));
-        
-        CGContextBeginPath(context);
-        CGContextMoveToPoint(context, 0.0f, 0.5f);
-        CGContextAddLineToPoint(context, cell.bounds.size.width, 0.5f);
-        CGContextStrokePath(context);
     }
     
     // story indicator
@@ -529,6 +943,7 @@ static UIFont *indicatorFont = nil;
     CGFloat storyIndicatorX = storyIndicatorBase + (isHighlighted ? 2 : 0);
     CGFloat storyIndicatorY = storyTitleFrame.origin.y + (fontDescriptor.pointSize / 2);
     
+    CFTimeInterval indicatorDrawStarted = [ReaderPerformance start];
     UIImage *unreadIcon;
     CGFloat size = 12;
     if (cell.storyScore == -1) {
@@ -540,7 +955,8 @@ static UIFont *indicatorFont = nil;
         size = 10;
     }
     
-    [unreadIcon drawInRect:CGRectMake(storyIndicatorX, storyIndicatorY - (size / 2) + 1, size, size) blendMode:0 alpha:(cell.isRead ? .15 : 1)];
+    [unreadIcon drawInRect:[self nb_directionalRect:CGRectMake(storyIndicatorX, storyIndicatorY - (size / 2) + 1, size, size) within:r] blendMode:0 alpha:(cell.isRead ? .15 : 1)];
+    if (indicatorDrawStarted > 0) [ReaderPerformance finish:@"story.indicator.draw" since:indicatorDrawStarted];
 }
 
 @end

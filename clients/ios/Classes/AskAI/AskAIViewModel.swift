@@ -15,7 +15,7 @@ class AskAIViewModel: ObservableObject {
     // MARK: - Published Properties
 
     @Published var conversation: AskAIConversation
-    @Published var selectedModel: AskAIProvider = .opus
+    @Published var selectedModel: AskAIProvider = .anthropic
     @Published var selectedSummarizeType: AskAIQuestionType = .bullets
     @Published var customQuestion: String = ""
     @Published var isRecording: Bool = false
@@ -42,13 +42,12 @@ class AskAIViewModel: ObservableObject {
     init(story: [String: Any]) {
         self.story = story
         let storyHash = story["story_hash"] as? String ?? ""
-        let storyTitle = story["story_title"] as? String ?? ""
+        let storyTitle = ((story["story_title"] as? String ?? "") as NSString).decodingHTMLEntities() ?? ""
 
         self.conversation = AskAIConversation(storyHash: storyHash, storyTitle: storyTitle)
 
-        // Load saved model preference
-        if let savedModel = UserDefaults.standard.string(forKey: "askAIModel"),
-           let model = AskAIProvider(rawValue: savedModel) {
+        // Load saved model preference (maps legacy keys like "opus" to vendor keys)
+        if let model = AskAIProvider.fromSavedValue(UserDefaults.standard.string(forKey: "askAIModel")) {
             self.selectedModel = model
         }
 
@@ -193,6 +192,12 @@ class AskAIViewModel: ObservableObject {
         conversation.questionText = customQuestion
         conversation.questionId = "custom"
         conversation.model = selectedModel  // Use the currently selected model
+
+        // Add follow-up question to conversation history before sending (matches web behavior)
+        conversation.conversationHistory.append(
+            AskAIMessage(role: "user", content: customQuestion)
+        )
+
         customQuestion = ""
 
         // Save model preference
@@ -424,12 +429,7 @@ class AskAIViewModel: ObservableObject {
         )
         conversation.completedBlocks.append(block)
 
-        // Preserve conversation context for follow-ups
-        if !questionText.isEmpty {
-            conversation.conversationHistory.append(
-                AskAIMessage(role: "user", content: questionText)
-            )
-        }
+        // Preserve conversation context for follow-ups (only assistant; user messages are added in sendFollowUp before sending)
         if !responseText.isEmpty {
             conversation.conversationHistory.append(
                 AskAIMessage(role: "assistant", content: responseText)
@@ -503,11 +503,6 @@ class AskAIViewModel: ObservableObject {
                         isFollowUp: isFollowUp
                     )
                     self.conversation.completedBlocks.append(block)
-                    if !questionText.isEmpty {
-                        self.conversation.conversationHistory.append(
-                            AskAIMessage(role: "user", content: questionText)
-                        )
-                    }
                     if !responseText.isEmpty {
                         self.conversation.conversationHistory.append(
                             AskAIMessage(role: "assistant", content: responseText)

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    style="?selectorFolderBackground"
+    style="?selectorTopLevelBackground"
     android:layout_width="match_parent"
     android:layout_height="wrap_content">
 
@@ -8,21 +8,32 @@
         android:id="@+id/row_everything_icon"
         android:layout_width="19dp"
         android:layout_height="19dp"
-        android:layout_alignParentLeft="true"
+        android:layout_alignParentStart="true"
         android:layout_centerVertical="true"
-        android:layout_marginLeft="12dp"
-        android:layout_marginRight="12dp"
+        android:layout_marginStart="12dp"
+        android:layout_marginEnd="12dp"
         android:contentDescription="@string/description_row_folder_icon"
         android:src="@drawable/ic_all_stories" />
 
     <TextView
         android:id="@+id/row_foldername"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
         android:layout_centerVertical="true"
-        android:layout_toRightOf="@id/row_everything_icon"
+        android:layout_toEndOf="@id/row_everything_icon"
+        android:layout_toStartOf="@id/row_folder_indicator"
         android:text="@string/all_stories_title"
-        android:textStyle="bold"
         android:letterSpacing="@dimen/extra_letter_spacing" />
+
+    <ImageView
+        android:id="@+id/row_folder_indicator"
+        android:layout_width="26dp"
+        android:layout_height="22dp"
+        android:layout_alignParentEnd="true"
+        android:layout_centerVertical="true"
+        android:layout_marginEnd="4dp"
+        android:paddingStart="6dp"
+        android:paddingEnd="8dp"
+        android:src="@drawable/ic_arrow_down" />
 
 </RelativeLayout>

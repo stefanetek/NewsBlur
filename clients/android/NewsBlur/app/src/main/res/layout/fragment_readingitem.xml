@@ -30,9 +30,11 @@
 
             <TextView
                 android:id="@+id/reading_feed_title"
+                android:textDirection="firstStrong"
+                android:textAlignment="viewStart"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_gravity="center_vertical"
+                android:layout_gravity="center_vertical|start"
                 android:layout_marginStart="40dp"
                 android:ellipsize="end"
                 android:lines="1"
@@ -60,17 +62,19 @@
                     style="?rowItemHeaderBackground"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:paddingBottom="16dp"
-                    android:paddingStart="6dp">
+                    android:paddingBottom="8dp"
+                    android:paddingStart="6dp"
+                    android:paddingEnd="0dp">
 
                     <ImageButton
                         android:id="@+id/story_context_menu_button"
                         style="?android:attr/actionOverflowButtonStyle"
                         android:layout_width="34dp"
                         android:layout_height="34dp"
-                        android:layout_alignParentRight="true"
+                        android:layout_alignParentEnd="true"
                         android:layout_margin="5dp"
-                        android:contentDescription="@string/description_menu" />
+                        android:contentDescription="@string/description_menu"
+                        android:visibility="gone" />
 
                     <androidx.appcompat.widget.AppCompatImageView
                         android:id="@+id/reading_item_unread_icon"
@@ -85,12 +89,13 @@
 
                     <TextView
                         android:id="@+id/reading_item_title"
+                        android:textDirection="firstStrong"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginLeft="16dp"
+                        android:layout_marginStart="16dp"
                         android:layout_marginTop="10dp"
-                        android:layout_marginRight="16dp"
-                        android:layout_toLeftOf="@id/story_context_menu_button"
+                        android:layout_marginEnd="16dp"
+                        android:layout_toStartOf="@id/story_context_menu_button"
                         android:textSize="17sp" />
 
                     <TextView
@@ -99,18 +104,20 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_below="@id/reading_item_title"
-                        android:layout_alignLeft="@id/reading_item_title"
+                        android:layout_alignStart="@id/reading_item_title"
                         android:layout_marginTop="8dp"
-                        android:layout_marginRight="12dp"
+                        android:layout_marginEnd="12dp"
                         android:textSize="12sp" />
 
                     <TextView
                         android:id="@+id/reading_item_authors"
+                        android:textDirection="firstStrong"
+                        android:textAlignment="viewStart"
                         style="?readingItemMetadata"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_alignTop="@id/reading_item_date"
-                        android:layout_toRightOf="@id/reading_item_date"
+                        android:layout_toEndOf="@id/reading_item_date"
                         android:maxLines="1"
                         android:minWidth="80dp"
                         android:textSize="12sp"
@@ -122,7 +129,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_below="@id/reading_item_date"
-                        android:layout_alignLeft="@id/reading_item_title"
+                        android:layout_alignStart="@id/reading_item_title"
                         android:drawablePadding="4dp"
                         android:gravity="center_vertical"
                         android:paddingTop="8dp"
@@ -137,7 +144,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_below="@id/reading_story_changes"
-                        android:layout_alignLeft="@id/reading_item_title"
+                        android:layout_alignStart="@id/reading_item_title"
                         android:layout_marginTop="8dp"
                         app:chipSpacingHorizontal="6dp"
                         app:chipSpacingVertical="6dp" />
@@ -148,7 +155,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_below="@+id/reading_item_tags"
-                        android:layout_alignLeft="@id/reading_item_tags"
+                        android:layout_alignStart="@id/reading_item_tags"
                         android:layout_marginTop="8dp"
                         android:drawablePadding="2dp"
                         android:gravity="center_vertical"
@@ -161,7 +168,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_below="@id/reading_item_saved_timestamp"
-                        android:layout_alignLeft="@id/reading_item_title"
+                        android:layout_alignStart="@id/reading_item_title"
                         android:layout_marginTop="8dp"
                         android:visibility="gone"
                         app:chipSpacingHorizontal="6dp"
@@ -204,13 +211,65 @@
                     android:textStyle="italic"
                     android:visibility="gone" />
 
-                <com.newsblur.view.NewsblurWebview
+                <com.newsblur.web.NewsblurWebview
                     android:id="@+id/reading_webview"
                     style="?readingBackground"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
                     android:scrollbars="none" />
+
+                <View
+                    android:id="@+id/reading_story_cluster_divider"
+                    style="?android:divider"
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginTop="24dp"
+                    android:visibility="gone" />
+
+                <LinearLayout
+                    android:id="@+id/reading_story_cluster_container"
+                    style="?readingBackground"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:paddingTop="16dp"
+                    android:paddingStart="0dp"
+                    android:paddingEnd="12dp"
+                    android:visibility="gone">
+
+                    <TextView
+                        android:id="@+id/reading_story_cluster_title"
+                        android:textDirection="firstStrong"
+                        android:textAlignment="viewStart"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:textAllCaps="true"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:letterSpacing="0.05"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="0dp"
+                        android:paddingBottom="4dp" />
+
+                    <LinearLayout
+                        android:id="@+id/reading_story_cluster_list"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:orientation="vertical" />
+
+                    <TextView
+                        android:id="@+id/reading_story_cluster_more"
+                        style="?readingItemMetadata"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="16dp"
+                        android:layout_marginTop="8dp"
+                        android:textStyle="bold"
+                        android:visibility="gone" />
+
+                </LinearLayout>
 
                 <include layout="@layout/reading_item_actions" />
 

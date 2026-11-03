@@ -1,9 +1,11 @@
 package com.newsblur.network.domain;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
@@ -13,6 +15,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.newsblur.domain.CustomIcon;
 import com.newsblur.domain.Feed;
 import com.newsblur.domain.Folder;
 import com.newsblur.domain.SavedSearch;
@@ -32,13 +35,22 @@ public class FeedFolderResponse {
 	public Set<SocialFeed> socialFeeds;
     public Set<StarredCount> starredCounts;
     public Set<SavedSearch> savedSearches;
+    public Map<String, CustomIcon> folderIcons;
+    public Map<String, CustomIcon> feedIcons;
 	
 	public boolean isAuthenticated;
     public boolean isPremium;
     public boolean isArchive;
+    public boolean isPro;
     public long premiumExpire;
     public boolean isStaff;
 	public int starredCount;
+    public Boolean storyClustering;
+    public String clusterMode;
+    public boolean clusterMarkRead;
+    public String language = "auto";
+    /** FeedFolderResponse.java keeps the raw preferences for ListenPreferences.kt's lenient parsing. */
+    public JsonObject preferences;
 
     public String shareExtToken;
 	
@@ -48,6 +60,8 @@ public class FeedFolderResponse {
 		JsonObject asJsonObject = JsonParser.parseString(json).getAsJsonObject();
 
         this.isAuthenticated = asJsonObject.get("authenticated").getAsBoolean();
+        com.newsblur.network.FolderPath.setSupported(asJsonObject.has("folder_paths_supported") &&
+                asJsonObject.get("folder_paths_supported").getAsBoolean());
         if (asJsonObject.has("is_staff")) {
             this.isStaff = asJsonObject.get("is_staff").getAsBoolean();
         }
@@ -60,8 +74,28 @@ public class FeedFolderResponse {
             JsonObject profile = (JsonObject) userProfile;
             this.isPremium = profile.get("is_premium").getAsBoolean();
             this.premiumExpire = profile.get("premium_expire").getAsLong();
-            if (asJsonObject.has("is_archive")) {
+            if (profile.has("is_archive")) {
                 this.isArchive = profile.get("is_archive").getAsBoolean();
+            }
+            if (profile.has("is_pro")) {
+                this.isPro = profile.get("is_pro").getAsBoolean();
+            }
+            if (profile.has("preferences")) {
+                JsonObject preferences = parsePreferences(profile.get("preferences"));
+                this.preferences = preferences;
+                if (preferences != null && preferences.has("language") && !preferences.get("language").isJsonNull()) {
+                    this.language = preferences.get("language").getAsString();
+                }
+                if (preferences != null && preferences.has("story_clustering")) {
+                    this.storyClustering = preferences.get("story_clustering").getAsBoolean();
+                }
+                if (preferences != null && preferences.has("cluster_mode")) {
+                    this.clusterMode = preferences.get("cluster_mode").getAsString();
+                }
+                if (preferences != null && preferences.has("cluster_mark_read") &&
+                        !preferences.get("cluster_mark_read").isJsonNull()) {
+                    this.clusterMarkRead = preferences.get("cluster_mark_read").getAsBoolean();
+                }
             }
         }
 
@@ -131,8 +165,58 @@ public class FeedFolderResponse {
             }
         }
 
+        // Parse custom folder icons
+        folderIcons = new HashMap<>();
+        JsonElement folderIconsElement = asJsonObject.get("folder_icons");
+        if (folderIconsElement != null && folderIconsElement.isJsonObject()) {
+            JsonObject folderIconsObj = folderIconsElement.getAsJsonObject();
+            for (Entry<String, JsonElement> entry : folderIconsObj.entrySet()) {
+                CustomIcon icon = gson.fromJson(entry.getValue(), CustomIcon.class);
+                if (icon != null && icon.isValid()) {
+                    folderIcons.put(entry.getKey(), icon);
+                }
+            }
+        }
+
+        // Parse custom feed icons
+        feedIcons = new HashMap<>();
+        JsonElement feedIconsElement = asJsonObject.get("feed_icons");
+        if (feedIconsElement != null && feedIconsElement.isJsonObject()) {
+            JsonObject feedIconsObj = feedIconsElement.getAsJsonObject();
+            for (Entry<String, JsonElement> entry : feedIconsObj.entrySet()) {
+                CustomIcon icon = gson.fromJson(entry.getValue(), CustomIcon.class);
+                if (icon != null && icon.isValid()) {
+                    feedIcons.put(entry.getKey(), icon);
+                }
+            }
+        }
+
         parseTime = System.currentTimeMillis() - startTime;
+        com.newsblur.network.FolderPath.setFolders(folders);
 	}
+
+    private JsonObject parsePreferences(JsonElement preferencesElement) {
+        if (preferencesElement == null || preferencesElement.isJsonNull()) {
+            return null;
+        }
+
+        if (preferencesElement.isJsonObject()) {
+            return preferencesElement.getAsJsonObject();
+        }
+
+        if (preferencesElement.isJsonPrimitive() && preferencesElement.getAsJsonPrimitive().isString()) {
+            try {
+                JsonElement parsedElement = JsonParser.parseString(preferencesElement.getAsString());
+                if (parsedElement != null && parsedElement.isJsonObject()) {
+                    return parsedElement.getAsJsonObject();
+                }
+            } catch (Exception e) {
+                Log.w(this.getClass().getName(), "Could not parse user preferences JSON", e);
+            }
+        }
+
+        return null;
+    }
 	
 	/**
      * Parses a folder, which is a list of feeds and/or more folders.

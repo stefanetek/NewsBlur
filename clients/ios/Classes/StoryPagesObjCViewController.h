@@ -13,6 +13,9 @@
 #import "NBNotifier.h"
 
 @class StoryDetailViewController;
+@class StoryTraverseBar;
+@class StoryToolbar;
+@class StoryToolbarScrollHandler;
 
 @interface StoryPagesObjCViewController : BaseViewController
 <UIScrollViewDelegate, UIPopoverControllerDelegate, UIPopoverPresentationControllerDelegate, UIGestureRecognizerDelegate> {
@@ -21,7 +24,6 @@
     UIButton *buttonNext;
     UIButton *buttonText;
     UIBarButtonItem *markReadBarButton;
-    UIBarButtonItem *separatorBarButton2;
     UIActivityIndicatorView *loadingIndicator;
     UIBarButtonItem *buttonBack;
     UIView *traverseView;
@@ -63,10 +65,6 @@
 @property (nonatomic) IBOutlet UIBarButtonItem *buttonAction;
 @property (nonatomic) IBOutlet UIView *bottomSize;
 @property (nonatomic) IBOutlet NSLayoutConstraint *bottomSizeHeightConstraint;
-@property (nonatomic) IBOutlet UIBarButtonItem * spacerBarButton;
-@property (nonatomic) IBOutlet UIBarButtonItem * spacer2BarButton;
-@property (nonatomic) IBOutlet UIBarButtonItem * spacer3BarButton;
-@property (nonatomic) IBOutlet UIBarButtonItem * separatorBarButton;
 @property (nonatomic) IBOutlet UIView *traverseView;
 @property (nonatomic) IBOutlet UIView *progressView;
 @property (nonatomic) IBOutlet UIView *progressViewContainer;
@@ -81,6 +79,8 @@
 @property (nonatomic) NSTimeInterval autoscrollSpeed;
 @property (readwrite) BOOL traversePinned;
 @property (readwrite) BOOL traverseFloating;
+@property (nonatomic, readonly) CGFloat traverseBottomGap;
+@property (nonatomic, strong) StoryTraverseBar *traverseBar;
 @property (readwrite) CGFloat inTouchMove;
 @property (assign) BOOL isDraggingScrollview;
 @property (assign) BOOL isAnimatedIntoPlace;
@@ -90,36 +90,63 @@
 @property (nonatomic) NSInteger scrollingToPage;
 @property (nonatomic, readonly) BOOL shouldHideStatusBar;
 @property (nonatomic, readonly) BOOL isNavigationBarHidden;
+@property (nonatomic, readonly) CGFloat navigationBarFadeAlpha;
 @property (nonatomic, readonly) BOOL allowFullscreen;
+@property (nonatomic, readonly) BOOL useCustomToolbar;
+@property (nonatomic, readonly) BOOL usesVerticalReaderToolbar;
+@property (nonatomic, readonly) UIBarButtonItem *settingsPresentationBarButton;
+@property (nonatomic, readonly) BOOL retainsDuoSourceArticle;
 @property (nonatomic) BOOL forceNavigationBarShown;
 @property (nonatomic) BOOL currentlyTogglingNavigationBar;
 @property (nonatomic, readonly) BOOL isHorizontal;
+@property (nonatomic, strong) UIPanGestureRecognizer *fullScreenPopGesture;
 @property (nonatomic) BOOL temporarilyMarkedUnread;
+@property (nonatomic) CGFloat navBarFadeAccumulator;
+@property (nonatomic) CGFloat traverseFadeAccumulator;
+@property (nonatomic, strong) StoryToolbar *storyToolbar;
+@property (nonatomic, strong) StoryToolbarScrollHandler *toolbarScrollHandler;
 
 - (void)resizeScrollView;
+- (BOOL)hasHiddenReaderAncestor;
 - (void)applyNewIndex:(NSInteger)newIndex pageController:(StoryDetailViewController *)pageController;
+- (void)applyNewIndex:(NSInteger)newIndex pageController:(StoryDetailViewController *)pageController supressRedraw:(BOOL)suppressRedraw;
 - (void)layoutForInterfaceOrientation:(UIInterfaceOrientation)interfaceOrientation;
 - (void)updateStatusBarState;
 - (void)setNavigationBarHidden:(BOOL)hide;
 - (void)setNavigationBarHidden:(BOOL)hide alsoTraverse:(BOOL)alsoTraverse;
+- (void)setNavigationBarFadeAlpha:(CGFloat)alpha;
+- (void)setToolbarOffset:(CGFloat)offset;
+- (BOOL)isCustomToolbarActive;
+- (CGFloat)topInsetForNavigationBarAlpha:(CGFloat)alpha;
+- (void)updateUITestTraverseFadeProbe;
 
 //- (void)transitionFromFeedDetail;
 - (void)resetPages;
 - (void)hidePages;
 - (void)refreshPages;
 - (void)reorientPages;
+- (void)preserveCurrentPageAtLocation:(NSInteger)location;
 - (void)refreshHeaders;
 - (void)setStoryFromScroll;
 - (void)setStoryFromScroll:(BOOL)force;
 - (void)advanceToNextUnread;
 - (void)updatePageWithActiveStory:(NSInteger)location updateFeedDetail:(BOOL)updateFeedDetail;
 - (void)animateIntoPlace:(BOOL)animated;
+- (BOOL)shouldOpenReaderImmediately;
+- (void)preparePageForPresentation:(NSInteger)pageIndex completion:(void (^)(NSInteger location))completion;
+- (void)preparePageForPresentation:(NSInteger)pageIndex animated:(BOOL)animated completion:(void (^)(NSInteger location))completion;
+- (void)preparePageForPresentation:(NSInteger)pageIndex animated:(BOOL)animated openReaderImmediately:(BOOL)openImmediately completion:(void (^)(NSInteger location))completion;
+- (void)cancelPendingStoryPresentation;
+- (void)storyDetailReadyForPresentation:(StoryDetailViewController *)page;
+- (void)storyDetailCouldNotPrepareForPresentation:(StoryDetailViewController *)page;
+- (BOOL)deferStoryRedrawDuringSelection:(StoryDetailViewController *)page;
 - (void)changePage:(NSInteger)pageIndex;
 - (void)changePage:(NSInteger)pageIndex animated:(BOOL)animated;
 
 - (void)setNextPreviousButtons;
 - (void)setTextButton;
 - (void)setTextButton:(StoryDetailViewController *)storyViewController;
+- (void)updateStoryTitleNavigationButtons;
 - (void)subscribeToBlurblog;
 
 - (IBAction)toggleFontSize:(id)sender;
@@ -130,6 +157,8 @@
 - (void)changedAutoscroll;
 - (void)changedScrollOrientation;
 - (void)updateStoriesTheme;
+- (void)updateStoriesDirection;
+- (void)updateReaderDirection;
 - (void)showShareHUD:(NSString *)msg;
 - (void)showFetchingTextNotifier;
 - (void)hideNotifier;
@@ -149,6 +178,7 @@
 - (IBAction)autoscrollFaster:(UIButton *)sender;
 
 - (IBAction)openSendToDialog:(id)sender;
+- (void)openStoryTrainerFromKeyboard:(id)sender;
 - (IBAction)doNextUnreadStory:(id)sender;
 - (IBAction)doPreviousStory:(id)sender;
 - (void)changeToNextPage:(id)sender;

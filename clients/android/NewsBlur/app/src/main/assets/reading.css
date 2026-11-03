@@ -1,12 +1,12 @@
 html {
     overflow: hidden;
 }
+
 body {
     overflow: hidden;
     line-height: 1.5em;
     width: auto;
     max-width: 100%;
-    /* note that even with 0 margins, most Android WebViews still have a thin margin that cannot be removed */
     margin: 0px !important;
     padding: 12px !important;
 }
@@ -19,8 +19,13 @@ body {
 }
 
 .NB-story .NB-large-image {
-    margin-left: -12px !important;
-    max-width: calc(100% + 24px) !important;
+    display: block !important;
+    box-sizing: border-box;
+    width: 100vw !important;
+    max-width: 100vw !important;
+    /* reading.css pulls a full-width photo to the story's start edge, the right edge in right-to-left text. */
+    margin-inline-start: var(--NB-image-offset, 0px) !important;
+    margin-inline-end: 0 !important;
     height: auto !important;
     margin-bottom: 8px !important;
 }
@@ -32,25 +37,97 @@ body {
 
 p, div, table {
     clear: both;
-	line-height: 1.5em;
+    line-height: 1.5em;
 }
 
 p, a, table, video, embed, object, iframe, div, figure, dl, dt, center {
-    /* virtually all story content wants to be the wrong size for our viewport, so try to fit them horizontally, as we
-       can only scroll in vertical. however, do not auto-set height for these, as they tend to ratio down to something
-       tiny before dynamic content is done loading. these types will resize well, but exclude images, which distort. */
-	width: auto !important;
+    width: auto !important;
     max-width: 100% !important;
     margin: 0px !important;
     min-width: 0px !important;
 }
 
 img {
-    /* in addition to the tweaks for other media, set image height to auto, so aspect ratios are correct */
-	width: auto !important;
+    width: auto !important;
     max-width: 100% !important;
     height: auto !important;
     max-height: none !important;
+}
+
+/* reading.css: a tapped photo zooms into StoryImageViewer.kt, which takes its opening frame
+   from the page, so the tap highlight would tint the photo through the whole zoom. The linked
+   photo rule stands alone because a WebView older than Chromium 105 can't parse :has() and
+   would drop the plain img rule along with it. */
+.NB-story img {
+    -webkit-tap-highlight-color: transparent;
+}
+
+.NB-story a:has(img) {
+    -webkit-tap-highlight-color: transparent;
+}
+
+.NB-story img.NB-briefing-section-icon {
+    display: inline-block !important;
+    width: 1em !important;
+    max-width: 1em !important;
+    height: 1em !important;
+    max-height: 1em !important;
+    margin: 0 0.3em 0 0 !important;
+    vertical-align: -0.1em !important;
+}
+
+.NB-story img.NB-briefing-inline-favicon {
+    display: inline-block !important;
+    width: 16px !important;
+    max-width: 16px !important;
+    height: 16px !important;
+    max-height: 16px !important;
+    margin: 4px 4px 0 0 !important;
+    border-radius: 2px !important;
+    vertical-align: top !important;
+}
+
+.NB-story img.NB-classifier-icon-like,
+.NB-story img.NB-classifier-icon-dislike,
+.NB-story img.NB-classifier-icon-dislike-inner {
+    display: inline-block !important;
+    width: 10px !important;
+    max-width: 10px !important;
+    height: 10px !important;
+    max-height: 10px !important;
+    margin: 0 0 0 4px !important;
+    margin-top: -2px !important;
+    vertical-align: middle !important;
+}
+
+.NB-story img.NB-classifier-icon-like {
+    filter: brightness(0) saturate(100%) invert(39%) sepia(96%) saturate(520%) hue-rotate(80deg) brightness(95%) contrast(87%);
+}
+
+.NB-story img.NB-classifier-icon-dislike {
+    filter: brightness(0) saturate(100%) invert(12%) sepia(96%) saturate(5400%) hue-rotate(358deg) brightness(85%) contrast(120%);
+}
+
+.NB-story img.NB-classifier-icon-dislike-inner {
+    filter: brightness(0) saturate(100%) invert(8%) sepia(96%) saturate(5400%) hue-rotate(358deg) brightness(75%) contrast(120%);
+}
+
+.NB-classifier-highlight-positive {
+    background-color: #d6f0d5;
+    padding: 1px 3px;
+    border-radius: 2px;
+}
+
+.NB-classifier-highlight-negative {
+    background-color: #FFCCCC;
+    padding: 1px 3px;
+    border-radius: 2px;
+}
+
+.NB-classifier-highlight-super-negative {
+    background-color: #E8A0A0;
+    padding: 1px 3px;
+    border-radius: 2px;
 }
 
 p {
@@ -58,12 +135,11 @@ p {
 }
 
 iframe {
-    /* 100% width can cause minor clipping, but iframes tend not to respect the auto/max-100 properties */
-	width: 100% !important;
+    width: 100% !important;
 }
 
 a {
-	text-decoration: none;
+    text-decoration: none;
 }
 
 code {
@@ -71,9 +147,41 @@ code {
 }
 
 pre, blockquote {
-    border-left: 1px solid #C2C5BE;
+    border-inline-start: 1px solid #C2C5BE;
     padding: 0.6em;
     margin: 0.6em;
     word-wrap: break-word !important;
-    white-space: pre-wrap !important;
+    overflow-wrap: break-word !important;
+    white-space: normal !important;
+    text-wrap: pretty;
+}
+
+figure.wp-block-embed,
+.wp-block-embed__wrapper,
+.embed-responsive {
+    position: relative;
+    width: 100%;
+    height: 0;
+    padding-bottom: 56.25%; /* 16:9 aspect ratio */
+    overflow: hidden;
+    margin: 1em 0;
+}
+
+figure iframe,
+.embed-responsive iframe,
+.wp-block-embed__wrapper iframe {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: block;
+}
+
+iframe:not([width]) {
+    width: 100%;
+}
+iframe:not([height]) {
+    height: auto;
 }

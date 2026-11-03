@@ -18,6 +18,7 @@ import android.widget.RemoteViews;
 
 import com.newsblur.R;
 import com.newsblur.network.APIConstants;
+import com.newsblur.view.StoryThumbnailView;
 
 import dagger.hilt.android.internal.managers.FragmentComponentManager;
 
@@ -55,6 +56,21 @@ public class ImageLoader {
     }
 	
     public PhotoToLoad displayImage(String url, ImageView imageView) {
+        // ImageLoader.java shows an icon already in memory at once. A list that rebinds its rows,
+        // like the tablet's feed list swapping its remembered folders for fresh ones, would
+        // otherwise blank every icon for a moment while each one is posted back.
+        if (url != null && !(imageView instanceof StoryThumbnailView)) {
+            String fullUrl = buildUrlIfNeeded(url);
+            Bitmap cached = memoryCache.get(fullUrl);
+            if (cached != null && cached.getHeight() >= minImgHeight) {
+                imageViewMappings.put(imageView, fullUrl);
+                imageView.setVisibility(View.VISIBLE);
+                imageView.setImageBitmap(cached);
+                PhotoToLoad shown = new PhotoToLoad(fullUrl, imageView, imageView.getHeight(), false);
+                shown.cancel = true;
+                return shown;
+            }
+        }
         return displayImage(url, imageView, imageView.getHeight(), false);
     }
 
@@ -213,8 +229,9 @@ public class ImageLoader {
             // ensure this imageview even still wants this image
             if (!isUrlMapped(photoToLoad.imageView, photoToLoad.url)) return;
 
+            boolean hideStoryThumbnail = (photoToLoad.imageView instanceof StoryThumbnailView);
             if ((bitmap == null) || (bitmap.getHeight() < minImgHeight)) {
-                if (hideMissing) {
+                if (hideMissing || hideStoryThumbnail) {
                     photoToLoad.imageView.setVisibility(View.GONE);
                 } else {
                     photoToLoad.imageView.setImageResource(emptyRID);

@@ -15,15 +15,20 @@ class AskAIThemeObserver: ObservableObject {
     @Published var themeVersion: Int = 0
 
     private var observers: [NSObjectProtocol] = []
+    private var effectiveTheme = ThemeManager.shared?.effectiveTheme ?? ThemeStyleLight
 
     init() {
-        // Observe UserDefaults changes for theme-related keys
+        // AskAIView.swift preserves editor identity when unrelated app preferences change.
         let observer = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.themeVersion += 1
+            guard let self else { return }
+            let effectiveTheme = ThemeManager.shared?.effectiveTheme ?? ThemeStyleLight
+            guard effectiveTheme != self.effectiveTheme else { return }
+            self.effectiveTheme = effectiveTheme
+            self.themeVersion += 1
         }
         observers.append(observer)
     }
@@ -134,16 +139,19 @@ struct AskAIView: View {
     // MARK: - Question Selector View
 
     private var questionSelectorView: some View {
-        VStack(spacing: 0) {
-            // Summarize Section
-            summarizeSection
+        ScrollView {
+            VStack(spacing: 0) {
+                // Summarize Section
+                summarizeSection
 
-            // Understand Section
-            understandSection
+                // Understand Section
+                understandSection
 
-            // Custom Question Section
-            customQuestionSection
+                // Custom Question Section
+                customQuestionSection
+            }
         }
+        .padding(.top, 12)
         .background(NewsBlurColors.background)
     }
 
@@ -156,14 +164,34 @@ struct AskAIView: View {
                     .foregroundColor(NewsBlurColors.textSecondary)
                     .frame(width: 18, height: 18)
 
-                Text("Summarize")
+                Text(NBLocalization.text("Summarize"))
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(NewsBlurColors.textPrimary)
 
                 Spacer()
+                
+#if targetEnvironment(macCatalyst)
+                Button(action: {
+                    onDismiss()
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(NewsBlurColors.textSecondary)
+                        .frame(width: 28, height: 28)
+                        .background(NewsBlurColors.cardBackground)
+                        .clipShape(Circle())
+                        .overlay(
+                            Circle()
+                                .stroke(NewsBlurColors.border, lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(NBLocalization.text("Dismiss"))
+                .accessibilityLabel(NBLocalization.text("Dismiss"))
+#endif
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 12)
+            .padding(.vertical, 16)
 
             // Segmented control for Brief/Medium/Detailed
             HStack(spacing: 8) {
@@ -175,7 +203,7 @@ struct AskAIView: View {
             .padding(.vertical, 4)
             .padding(.leading, 28) // Align with text after icon
             .padding(.horizontal, 12)
-            .padding(.bottom, 12)
+            .padding(.bottom, 16)
         }
         .background(NewsBlurColors.cardBackground)
     }
@@ -185,23 +213,23 @@ struct AskAIView: View {
             viewModel.selectedSummarizeType = type
             viewModel.sendQuestion(type)
         }) {
-            VStack(spacing: 4) {
+            VStack(spacing: 6) {
                 // Icon with consistent height
                 summarizeIconView(for: type)
                     .frame(height: 20)
 
                 VStack(spacing: 2) {
                     Text(type.displayTitle)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(NewsBlurColors.textPrimary)
 
                     Text(type.subtitle)
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundColor(NewsBlurColors.textSecondary)
                 }
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
+            .padding(.vertical, 12)
             .padding(.horizontal, 6)
             .background(NewsBlurColors.cardBackground)
             .cornerRadius(4)
@@ -238,6 +266,23 @@ struct AskAIView: View {
 
     private var understandSection: some View {
         VStack(spacing: 0) {
+            // Header row
+            HStack(spacing: 10) {
+                Image(systemName: "lightbulb")
+                    .font(.system(size: 16))
+                    .foregroundColor(NewsBlurColors.textSecondary)
+                    .frame(width: 18, height: 18)
+
+                Text(NBLocalization.text("Understand"))
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(NewsBlurColors.textPrimary)
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 16)
+            .background(NewsBlurColors.background)
+
             ForEach([AskAIQuestionType.context, .people, .arguments, .factcheck], id: \.self) { type in
                 understandButton(type)
             }
@@ -255,14 +300,14 @@ struct AskAIView: View {
                     .frame(width: 18, height: 18)
 
                 Text(type.displayTitle)
-                    .font(.system(size: 13))
+                    .font(.system(size: 14))
                     .foregroundColor(NewsBlurColors.textPrimary)
                     .lineLimit(1)
 
                 Spacer()
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.vertical, 14)
             .background(NewsBlurColors.cardBackground)
         }
         .buttonStyle(PlainButtonStyle())
@@ -291,7 +336,7 @@ struct AskAIView: View {
                 .disabled(viewModel.isTranscribing)
 
                 // Text input
-                TextField("Ask a question...", text: $viewModel.customQuestion)
+                TextField(NBLocalization.text("Ask a question..."), text: $viewModel.customQuestion)
                     .font(.system(size: 13))
                     .foregroundColor(NewsBlurColors.textPrimary)
                     .padding(.horizontal, 12)
@@ -313,7 +358,7 @@ struct AskAIView: View {
                 // Ask button with model selector
                 askButtonMenu
             }
-            .padding(10)
+            .padding(12)
             .background(NewsBlurColors.inputBackground)
 
             if viewModel.isRecording || viewModel.isTranscribing {
@@ -321,7 +366,7 @@ struct AskAIView: View {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: NewsBlurColors.accent))
                         .scaleEffect(0.8)
-                    Text(viewModel.isRecording ? "Recording..." : "Transcribing...")
+                    Text(viewModel.isRecording ? NBLocalization.text("Recording...") : NBLocalization.text("Transcribing..."))
                         .font(.system(size: 12))
                         .foregroundColor(NewsBlurColors.textSecondary)
                 }
@@ -370,7 +415,7 @@ struct AskAIView: View {
                     viewModel.sendQuestion(.custom)
                 }
             }) {
-                Text("Ask")
+                Text(NBLocalization.text("Ask"))
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.white)
                     .padding(.horizontal, 16)
@@ -574,7 +619,7 @@ struct AskAIView: View {
                     HStack {
                         Image(systemName: "star.fill")
                             .font(.system(size: 12))
-                        Text("Upgrade to Premium Archive")
+                        Text(NBLocalization.text("Upgrade to Premium Archive"))
                             .font(.system(size: 13, weight: .medium))
                     }
                     .foregroundColor(.white)
@@ -613,7 +658,7 @@ struct AskAIView: View {
                     HStack {
                         Image(systemName: "star.fill")
                             .font(.system(size: 12))
-                        Text("Upgrade to Premium Archive")
+                        Text(NBLocalization.text("Upgrade to Premium Archive"))
                             .font(.system(size: 13, weight: .medium))
                     }
                     .foregroundColor(.white)
@@ -663,7 +708,7 @@ struct AskAIView: View {
                 }
 
                 // Text input
-                TextField("Follow up...", text: $viewModel.customQuestion)
+                TextField(NBLocalization.text("Follow up..."), text: $viewModel.customQuestion)
                     .font(.system(size: 13))
                     .foregroundColor(NewsBlurColors.textPrimary)
                     .padding(.horizontal, 12)
@@ -716,7 +761,7 @@ struct AskAIView: View {
                     Button(action: {
                         viewModel.reaskWithModel(viewModel.selectedModel)
                     }) {
-                        Text("Re-ask")
+                        Text(NBLocalization.text("Re-ask"))
                             .font(.system(size: 13))
                             .foregroundColor(NewsBlurColors.textPrimary)
                             .padding(.horizontal, 12)
@@ -732,7 +777,7 @@ struct AskAIView: View {
                     Button(action: {
                         viewModel.sendFollowUp()
                     }) {
-                        Text("Send")
+                        Text(NBLocalization.text("Send"))
                             .font(.system(size: 13, weight: .medium))
                             .foregroundColor(.white)
                             .padding(.horizontal, 12)

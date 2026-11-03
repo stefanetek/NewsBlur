@@ -39,6 +39,30 @@ body {
 .NB-story-permalink {
     color: lightgray;
 }
+
+.NB-story-url {
+    background-color: #333333;
+    color: #cccccc;
+}
+
+.NB-story-url.NB-score-1 {
+    background-color: #29442b;
+    color: #cfe8c6;
+}
+
+.NB-story-url.NB-score-1 .NB-story-url-matched {
+    color: #9de58d;
+}
+
+.NB-story-url.NB-score--1 {
+    background-color: #512d31;
+    color: #f0c5c7;
+}
+
+.NB-story-url.NB-score--1 .NB-story-url-matched {
+    color: #ffa3a5;
+}
+
 .NB-story-toggle-changes {
     color: #c6c6c6;
     text-shadow: 0 1px 0 rgba(28, 28, 28, .1);
@@ -118,6 +142,10 @@ a:active {
 .NB-story blockquote {
     border-left-color: #676264;
     background-color: #6c696a;
+}
+/* storyDetailViewMedium.css colors the right-hand quote border of right-to-left story text (storyDetailView.css). */
+html[dir="rtl"] .NB-story blockquote:dir(rtl) {
+    border-right-color: #676264;
 }
 
 .NB-story blockquote p {
@@ -207,9 +235,10 @@ del {
     border-color: rgba(255, 255, 255, .3) rgba(0, 0, 0, .2) rgba(0, 0, 0, .3) rgba(255, 255, 255, .2);
 }
 .NB-button.NB-share-button div {
-    color: rgba(187, 187, 187, 0.6);
-    text-shadow: 0 1px 0 rgba(0, 0, 0, .5);
-    border: 1px solid rgb(255, 255, 255, 0.25);
+    color: rgba(200, 200, 200, 0.6);
+    text-shadow: none;
+    border: 0.5px solid rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.06);
 }
 .NB-button:active div,
 .NB-button.NB-button-active div {
@@ -227,8 +256,13 @@ del {
 
 .NB-button.NB-share-button:active div,
 .NB-button.NB-share-button.NB-button-active div {
-    color: darkgrey;
-    text-shadow: 0 1px 0 rgba(0, 0, 0, .2);
+    color: rgba(200, 200, 200, 0.8);
+    background: rgba(255, 255, 255, 0.12);
+    text-shadow: none;
+}
+/* storyDetailViewMedium.css: a story queued in Listen's Up Next shades its + like an active button. */
+.NB-button.NB-share-button a.NB-listen-queue.NB-listen-queued div {
+    background: rgba(255, 255, 255, 0.12);
 }
 
 /* Story Comments */
@@ -289,4 +323,72 @@ del {
 
 .NB-text-view-premium-only .NB-feed-story-premium-only-divider {
     filter: invert(100%);
+}
+
+.NB-story-cluster-detail {
+    border-top-color: #707070;
+    border-bottom-color: #707070;
+    background-color: #555555;
+}
+
+.NB-story-cluster-detail-header {
+    border-bottom-color: rgba(255, 255, 255, .08);
+}
+
+.NB-story-cluster-detail-title {
+    color: #D0D0D0;
+}
+
+.NB-story-cluster-detail-item,
+.NB-cluster-locked-upsell {
+    color: #F0F0F0;
+    border-top-color: rgba(255, 255, 255, .08);
+}
+
+.NB-story-cluster-detail-item.read {
+    color: #B5B5B5;
+}
+
+.NB-clustering-detail-upgrade-pill {
+    background-color: rgba(162, 200, 248, .18);
+    color: #D8EBFF;
+}
+
+.NB-cluster-detail-date,
+.NB-cluster-locked-text {
+    color: #C6C6C6;
+}
+
+.NB-cluster-tier-badge {
+    color: #D0D0D0;
+}
+
+.NB-cluster-tier-title .NB-cluster-tier-badge {
+    color: #7DC99A;
+}
+
+.NB-cluster-tier-related .NB-cluster-tier-badge {
+    color: #D2A76B;
+}
+
+.NB-cluster-detail-favicon,
+.NB-cluster-detail-image {
+    background-color: rgba(255, 255, 255, .08);
+}
+
+.NB-cluster-locked-upsell {
+    background-color: rgba(255, 255, 255, .04);
+}
+
+/* Listen (Classes/Listen/ListenStoryBridge.swift) */
+.NB-listen-highlight {
+    background-color: rgba(255, 210, 90, 0.14);
+    box-shadow: 0 0 0 5px rgba(255, 210, 90, 0.14);
+}
+span.NB-listen-run.NB-listen-highlight {
+    box-shadow: none;
+}
+.NB-listen-pill {
+    background: rgba(190, 140, 242, 0.2);
+    color: rgba(215, 185, 248, 0.95);
 }

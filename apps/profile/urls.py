@@ -1,8 +1,10 @@
 from django.conf.urls import *
 
 from apps.profile import views
+from apps.profile.language import language_preference
 
 urlpatterns = [
+    url(r"^language/?$", language_preference, name="language-preference"),
     url(r"^get_preferences?/?", views.get_preference),
     url(r"^set_preference/?", views.set_preference),
     url(r"^set_account_settings/?", views.set_account_settings),
@@ -23,26 +25,49 @@ urlpatterns = [
     ),
     url(r"^is_premium/?", views.profile_is_premium, name="profile-is-premium"),
     url(r"^is_premium_archive/?", views.profile_is_premium_archive, name="profile-is-premium-archive"),
+    url(r"^activate_premium_trial/?", views.activate_premium_trial, name="activate-premium-trial"),
     # url(r'^paypal_ipn/?', include('paypal.standard.ipn.urls'), name='paypal-ipn'),
     url(r"^paypal_ipn/?", views.paypal_ipn, name="paypal-ipn"),
     url(r"^paypal_webhooks/?", views.paypal_webhooks, name="paypal-webhooks"),
     url(r"^stripe_form/?", views.stripe_form, name="stripe-form"),
     url(r"^stripe_checkout/?", views.stripe_checkout, name="stripe-checkout"),
+    url(r"^setup_usage_billing/?", views.setup_usage_billing, name="setup-usage-billing"),
+    url(r"^manage_usage_billing/?", views.manage_usage_billing, name="manage-usage-billing"),
+    url(r"^usage_billing_history/?", views.usage_billing_history, name="usage-billing-history"),
+    url(r"^save_usage_billing_limit/?", views.save_usage_billing_limit, name="save-usage-billing-limit"),
     url(r"^activities/?", views.load_activities, name="profile-activities"),
     url(r"^payment_history/?", views.payment_history, name="profile-payment-history"),
+    url(r"^invoice/(?P<payment_id>\d+)/?$", views.invoice, name="profile-invoice"),
     url(r"^cancel_premium/?", views.cancel_premium, name="profile-cancel-premium"),
     url(r"^refund_premium/?", views.refund_premium, name="profile-refund-premium"),
     url(r"^never_expire_premium/?", views.never_expire_premium, name="profile-never-expire-premium"),
     url(r"^upgrade_premium/?", views.upgrade_premium, name="profile-upgrade-premium"),
     url(r"^save_ios_receipt/?", views.save_ios_receipt, name="save-ios-receipt"),
     url(r"^save_android_receipt/?", views.save_android_receipt, name="save-android-receipt"),
+    url(r"^google_play_rtdn/?", views.google_play_rtdn, name="google-play-rtdn"),
     url(r"^update_payment_history/?", views.update_payment_history, name="profile-update-payment-history"),
     url(r"^delete_account/?", views.delete_account, name="profile-delete-account"),
     url(r"^forgot_password_return/?", views.forgot_password_return, name="profile-forgot-password-return"),
     url(r"^forgot_password/?", views.forgot_password, name="profile-forgot-password"),
     url(r"^delete_starred_stories/?", views.delete_starred_stories, name="profile-delete-starred-stories"),
+    url(r"^count_starred_stories/?", views.count_starred_stories, name="profile-count-starred-stories"),
+    url(r"^count_shared_stories/?", views.count_shared_stories, name="profile-count-shared-stories"),
+    url(r"^delete_shared_stories/?", views.delete_shared_stories, name="profile-delete-shared-stories"),
+    url(r"^count_classifiers/?", views.count_classifiers, name="profile-count-classifiers"),
+    url(r"^delete_classifiers/?", views.delete_classifiers, name="profile-delete-classifiers"),
     url(r"^delete_all_sites/?", views.delete_all_sites, name="profile-delete-all-sites"),
+    url(
+        # Usernames can hold spaces and punctuation that \w+ won't match, which made
+        # reverse() raise NoReverseMatch while building unsubscribe links for emails.
+        r"^email_optout/(?P<username>[^/]+)/(?P<secret>\w+)/?$",
+        views.email_optout_token,
+        name="profile-email-optout-token",
+    ),
     url(r"^email_optout/?", views.email_optout, name="profile-email-optout"),
     url(r"^ios_subscription_status/?", views.ios_subscription_status, name="profile-ios-subscription-status"),
+    url(r"^gift_checkout/?", views.gift_checkout, name="gift-checkout"),
+    url(r"^gift_checkout_complete/?", views.gift_checkout_complete, name="gift-checkout-complete"),
+    url(r"^referral_data/?", views.referral_data, name="referral-data"),
+    url(r"^gift_data/?", views.gift_data, name="gift-data"),
     url(r"debug/?", views.trigger_error, name="trigger-error"),
 ]

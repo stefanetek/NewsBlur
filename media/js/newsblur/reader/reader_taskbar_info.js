@@ -7,25 +7,19 @@ NEWSBLUR.Views.ReaderTaskbarInfo = Backbone.View.extend({
     },
 
     render: function () {
-        NEWSBLUR.reader.$s.$story_taskbar.append(this.$el);
+        NEWSBLUR.reader.$s.$story_taskbar.find('.NB-taskbar-view').after(this.$el);
         return this;
     },
 
     center: function (force) {
-        var count_width = this.$el.width();
-        var left_buttons_offset = $('.NB-taskbar-view').outerWidth(true);
-        var right_buttons_offset = $(".NB-taskbar-options-container").position().left;
-        var usable_space = right_buttons_offset - left_buttons_offset;
-        var left = (usable_space / 2) - (count_width / 2) + left_buttons_offset;
-        // console.log(["Taskbar info center", count_width, left, left_buttons_offset, right_buttons_offset, usable_space]);
+        var count_width = this.$el.children().outerWidth(true) || 0;
+        var available_width = this.$el.width();
 
-        if (!force && count_width + 12 > usable_space) {
-            this.$el.hide();
+        if (!force && count_width > 0 && count_width + 12 > available_width) {
+            this.$el.children().hide();
         } else {
-            this.$el.show();
+            this.$el.children().show();
         }
-
-        this.$el.css({ 'left': left });
     },
 
     // =================
@@ -33,7 +27,7 @@ NEWSBLUR.Views.ReaderTaskbarInfo = Backbone.View.extend({
     // =================
 
     show_stories_progress_bar: function (feeds_loading, message) {
-        message = message || "Fetching stories";
+        message = message || gettext("Fetching stories");
         var $progress = $.make('div', { className: 'NB-river-progress' }, [
             $.make('div', { className: 'NB-river-progress-text' }),
             $.make('div', { className: 'NB-river-progress-bar' })
@@ -72,17 +66,17 @@ NEWSBLUR.Views.ReaderTaskbarInfo = Backbone.View.extend({
         NEWSBLUR.app.original_tab_view.iframe_not_busting();
 
         if (!message || message == 'error') {
-            message = "Oh no! <br> There was an error!";
+            message = gettext("Oh no! <br> There was an error!");
         }
 
         if (data && data.status) {
             if (data.status == 502) {
-                message = "NewsBlur is down right now. <br> Try again soon.";
+                message = gettext("NewsBlur is down right now. <br> Try again soon.");
             } else if (data.status == 503) {
-                message = "NewsBlur is in maintenance mode. <br> Try again soon.";
+                message = gettext("NewsBlur is in maintenance mode. <br> Try again soon.");
                 this.show_maintenance_page();
             } else if (data.status == 429) {
-                message = "You're being rate limited.<br> Try again soon, but not too soon.";
+                message = gettext("You're being rate limited.<br> Try again soon, but not too soon.");
             }
             NEWSBLUR.assets.stories.no_more_stories = true;
             NEWSBLUR.app.story_titles.end_loading();

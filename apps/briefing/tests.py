@@ -1,0 +1,2879 @@
+import datetime
+import json as stdlib_json
+from unittest.mock import MagicMock, call, patch
+
+import pytz
+from django.contrib.auth.models import User
+from django.test import TestCase
+from django.test.client import Client
+from django.urls import reverse
+
+from apps.analyzer.models import (
+    MClassifierAuthor,
+    MClassifierFeed,
+    MClassifierTag,
+    MClassifierTitle,
+    ScopedClassifiers,
+)
+from apps.briefing.models import (
+    BRIEFING_SECTION_DEFINITIONS,
+    DEFAULT_SECTIONS,
+    MAX_CUSTOM_SECTIONS,
+    VALID_SECTION_KEYS,
+    MBriefing,
+    MBriefingPreferences,
+)
+from apps.briefing.scoring import (
+    CLASSIFIER_WEIGHTS,
+    _estimate_word_count,
+    _find_clustered_stories,
+    _get_classifier_matches,
+)
+from apps.briefing.summary import (
+    _build_system_prompt,
+    _strip_duplicate_story_links,
+    enforce_exclusive_sections,
+    extract_section_story_hashes,
+    extract_section_summaries,
+    filter_disabled_sections,
+    normalize_section_key,
+    rebuild_summary_from_sections,
+)
+from apps.clustering.models import normalize_title as _normalize_title
+from apps.reader.models import UserSubscription
+from apps.rss_feeds.models import Feed, MStory
+from utils import json_functions as json
+
+
+def _make_sample_html(sections_dict):
+    """
+    Build valid briefing HTML with <h3 data-section="KEY"> tags.
+    sections_dict maps section_key -> list of (story_hash, title) tuples.
+    """
+    parts = []
+    for key, stories in sections_dict.items():
+        parts.append('<h3 data-section="%s">Section %s</h3>' % (key, key))
+        parts.append("<ul>")
+        for story_hash, title in stories:
+            parts.append(
+                '<li><a class="NB-briefing-story-link" data-story-hash="%s">%s</a></li>' % (story_hash, title)
+            )
+        parts.append("</ul>")
+    return '<div class="NB-briefing-summary">%s</div>' % "".join(parts)
+
+
+class BriefingTestCase(TestCase):
+    """Base class with shared setUp/tearDown and factory helpers for briefing tests."""
+
+    _story_counter = 0
+
+    def setUp(self):
+        self.client = Client()
+        self.user = User.objects.create_user(
+            username="brieftest", password="testpass", email="brief@test.com"
+        )
+        self.user.is_staff = True
+        self.user.save()
+        # tests.py: Set profile to archive tier with New York timezone
+        profile = self.user.profile
+        profile.is_archive = True
+        profile.timezone = "America/New_York"
+        profile.save()
+
+        self.client.login(username="brieftest", password="testpass")
+
+        self.feed = Feed.objects.create(
+            feed_address="http://test-feed-1.com/rss",
+            feed_link="http://test-feed-1.com",
+            feed_title="Test Feed 1",
+            fetched_once=True,
+            known_good=True,
+            average_stories_per_month=100,
+        )
+        self.feed2 = Feed.objects.create(
+            feed_address="http://test-feed-2.com/rss",
+            feed_link="http://test-feed-2.com",
+            feed_title="Test Feed 2",
+            fetched_once=True,
+            known_good=True,
+            average_stories_per_month=100,
+        )
+        self.sub = UserSubscription.objects.create(user=self.user, feed=self.feed, active=True)
+        self.sub2 = UserSubscription.objects.create(user=self.user, feed=self.feed2, active=True)
+
+        self.now = datetime.datetime.utcnow()
+        self.period_start = self.now - datetime.timedelta(days=1)
+
+        self.stories = []
+        for i, (feed, title, author, word_count) in enumerate(
+            [
+                (self.feed, "Breaking News About Tech", "Alice", 200),
+                (self.feed, "Sports Update Today", "Bob", 150),
+                (self.feed, "Long Read About Science", "Charlie", 900),
+                (self.feed2, "Breaking News About Tech", "Dave", 180),
+                (self.feed2, "World Economy Report", "Eve", 400),
+                (self.feed2, "Art and Culture Review", "Frank", 300),
+            ]
+        ):
+            story = self.make_story(
+                feed,
+                title,
+                content="word " * word_count,
+                date=self.now - datetime.timedelta(hours=i + 1),
+                author=author,
+            )
+            self.stories.append(story)
+
+    def tearDown(self):
+        MBriefing.objects(user_id=self.user.pk).delete()
+        MBriefingPreferences.objects(user_id=self.user.pk).delete()
+        MStory.objects(story_feed_id__in=[self.feed.pk, self.feed2.pk]).delete()
+        MClassifierFeed.objects(user_id=self.user.pk).delete()
+        MClassifierAuthor.objects(user_id=self.user.pk).delete()
+        MClassifierTag.objects(user_id=self.user.pk).delete()
+        MClassifierTitle.objects(user_id=self.user.pk).delete()
+
+    def make_story(self, feed, title, content="Test content", date=None, author=None, tags=None):
+        BriefingTestCase._story_counter += 1
+        story = MStory(
+            story_feed_id=feed.pk,
+            story_date=date or self.now,
+            story_title=title,
+            story_content=content,
+            story_author_name=author or "TestAuthor",
+            story_permalink="http://test.com/%s" % title.replace(" ", "-").lower(),
+            story_guid="guid-%s-%s-%s"
+            % (feed.pk, title.replace(" ", "-").lower(), BriefingTestCase._story_counter),
+            story_tags=tags or [],
+        )
+        story.save()
+        return story
+
+    def make_scored_stories(self, stories, categories=None):
+        result = []
+        for i, story in enumerate(stories):
+            cat = "top_stories"
+            if categories and i < len(categories):
+                cat = categories[i]
+            result.append(
+                {
+                    "story_hash": story.story_hash,
+                    "score": 1.0 - (i * 0.1),
+                    "is_read": False,
+                    "category": cat,
+                    "content_word_count": len((story.story_content or "").split()),
+                    "classifier_matches": [],
+                }
+            )
+        return result
+
+    def make_briefing(self, summary_html=None, curated_hashes=None, status="complete", **kwargs):
+        defaults = {
+            "user_id": self.user.pk,
+            "briefing_feed_id": self.feed.pk,
+            "summary_story_hash": None,
+            "curated_story_hashes": curated_hashes or [],
+            "briefing_date": kwargs.pop("briefing_date", self.now),
+            "period_start": kwargs.pop("period_start", self.period_start),
+            "generated_at": datetime.datetime.utcnow(),
+            "status": status,
+        }
+        defaults.update(kwargs)
+        briefing = MBriefing(**defaults)
+        briefing.save()
+        return briefing
+
+    def make_prefs(self, **overrides):
+        defaults = {
+            "user_id": self.user.pk,
+            "frequency": "daily",
+            "enabled": True,
+            "story_count": 5,
+            "summary_length": "medium",
+            "summary_style": "bullets",
+        }
+        defaults.update(overrides)
+        try:
+            prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+            for k, v in defaults.items():
+                setattr(prefs, k, v)
+            prefs.save()
+        except MBriefingPreferences.DoesNotExist:
+            prefs = MBriefingPreferences(**defaults)
+            prefs.save()
+        return prefs
+
+
+# ---------------------------------------------------------------------------
+# 1. Test_Summary — apps/briefing/summary.py
+# ---------------------------------------------------------------------------
+
+
+class Test_Summary(TestCase):
+    """Tests for pure functions in apps/briefing/summary.py."""
+
+    # --- normalize_section_key ---
+
+    def test_normalize_exact_match(self):
+        self.assertEqual(normalize_section_key("top_stories"), "top_stories")
+
+    def test_normalize_hyphenated(self):
+        self.assertEqual(normalize_section_key("top-stories"), "top_stories")
+
+    def test_normalize_uppercase(self):
+        self.assertEqual(normalize_section_key("TOP_STORIES"), "top_stories")
+
+    def test_normalize_extra_underscores(self):
+        self.assertEqual(normalize_section_key("top__stories"), "top_stories")
+
+    def test_normalize_leading_trailing(self):
+        self.assertEqual(normalize_section_key("_top_stories_"), "top_stories")
+
+    def test_normalize_fuzzy_no_separator(self):
+        self.assertEqual(normalize_section_key("topstories"), "top_stories")
+
+    def test_normalize_invalid_returns_none(self):
+        self.assertIsNone(normalize_section_key("bogus_key"))
+
+    def test_normalize_empty_returns_none(self):
+        self.assertIsNone(normalize_section_key(""))
+
+    def test_normalize_none_returns_none(self):
+        self.assertIsNone(normalize_section_key(None))
+
+    def test_normalize_custom_keys(self):
+        for i in range(1, 6):
+            self.assertEqual(normalize_section_key("custom_%d" % i), "custom_%d" % i)
+
+    def test_normalize_custom_hyphenated(self):
+        self.assertEqual(normalize_section_key("custom-3"), "custom_3")
+
+    def test_normalize_whitespace(self):
+        self.assertEqual(normalize_section_key("  top_stories  "), "top_stories")
+
+    # --- _build_system_prompt ---
+
+    def test_prompt_default_sections(self):
+        prompt = _build_system_prompt()
+        self.assertIn("top_stories", prompt)
+        self.assertIn("long_read", prompt)
+        self.assertIn("classifier_match", prompt)
+        self.assertIn("follow_up", prompt)
+        self.assertIn("widely_covered", prompt)
+        self.assertNotIn("quick_catchup", prompt)
+        self.assertNotIn("contrarian_views", prompt)
+        self.assertNotIn("emerging_topics", prompt)
+        self.assertNotIn("duplicates", prompt)
+        self.assertNotIn("trending_unread", prompt)
+        self.assertNotIn("trending_global", prompt)
+
+    def test_prompt_all_enabled(self):
+        all_enabled = {s["key"]: True for s in BRIEFING_SECTION_DEFINITIONS}
+        prompt = _build_system_prompt(sections=all_enabled)
+        # tests.py: Check all section prompts appear by display name.
+        for defn in BRIEFING_SECTION_DEFINITIONS:
+            self.assertIn(defn["name"], prompt)
+
+    def test_prompt_none_enabled(self):
+        none_enabled = {s["key"]: False for s in BRIEFING_SECTION_DEFINITIONS}
+        prompt = _build_system_prompt(sections=none_enabled)
+        self.assertIn("Include all stories in a single section", prompt)
+
+    def test_prompt_custom_sections(self):
+        sections = dict(DEFAULT_SECTIONS)
+        sections["custom_1"] = True
+        prompt = _build_system_prompt(sections=sections, custom_section_prompts=["Trump news"])
+        self.assertIn("custom_1", prompt)
+        self.assertIn("Trump news", prompt)
+
+    def test_prompt_custom_disabled(self):
+        sections = dict(DEFAULT_SECTIONS)
+        sections["custom_1"] = False
+        prompt = _build_system_prompt(sections=sections, custom_section_prompts=["Trump news"])
+        self.assertNotIn("custom_1", prompt)
+
+    def test_prompt_length_short(self):
+        prompt = _build_system_prompt(summary_length="short")
+        self.assertIn("Under 300 words", prompt)
+
+    def test_prompt_length_detailed(self):
+        prompt = _build_system_prompt(summary_length="detailed")
+        self.assertIn("Up to 1000 words", prompt)
+
+    def test_prompt_style_editorial(self):
+        prompt = _build_system_prompt(summary_style="editorial")
+        self.assertIn("narrative editorial style", prompt)
+
+    # --- extract_section_summaries ---
+
+    def test_extract_basic(self):
+        html = _make_sample_html(
+            {
+                "top_stories": [("hash1", "Story 1")],
+                "long_read": [("hash2", "Story 2")],
+                "widely_covered": [("hash3", "Story 3")],
+            }
+        )
+        sections = extract_section_summaries(html)
+        self.assertEqual(len(sections), 3)
+        self.assertIn("top_stories", sections)
+        self.assertIn("long_read", sections)
+        self.assertIn("widely_covered", sections)
+        for key, section_html in sections.items():
+            self.assertIn('class="NB-briefing-summary"', section_html)
+
+    def test_extract_empty_html(self):
+        self.assertEqual(extract_section_summaries(""), {})
+
+    def test_extract_none_html(self):
+        self.assertEqual(extract_section_summaries(None), {})
+
+    def test_extract_no_h3_tags(self):
+        self.assertEqual(extract_section_summaries("<p>No sections here</p>"), {})
+
+    def test_extract_normalizes_keys(self):
+        html = '<div class="NB-briefing-summary"><h3 data-section="TOP-STORIES">Test</h3><p>Content</p></div>'
+        sections = extract_section_summaries(html)
+        self.assertIn("top_stories", sections)
+        self.assertNotIn("TOP-STORIES", sections)
+
+    def test_extract_rejects_invalid_keys(self):
+        html = '<div class="NB-briefing-summary"><h3 data-section="bogus_invalid_key">Test</h3><p>Content</p></div>'
+        sections = extract_section_summaries(html)
+        self.assertEqual(len(sections), 0)
+
+    def test_extract_h3_extra_attributes(self):
+        """Regression test: h3 with class before data-section should still parse."""
+        html = (
+            '<div class="NB-briefing-summary">'
+            '<h3 class="some-class" data-section="top_stories">Test</h3>'
+            "<p>Content</p></div>"
+        )
+        sections = extract_section_summaries(html)
+        self.assertIn("top_stories", sections)
+
+    def test_extract_h3_style_before_data_section(self):
+        """Regression test: h3 with style before data-section should still parse."""
+        html = (
+            '<div class="NB-briefing-summary">'
+            '<h3 style="color:red" data-section="long_read">Test</h3>'
+            "<p>Content</p></div>"
+        )
+        sections = extract_section_summaries(html)
+        self.assertIn("long_read", sections)
+
+    # --- extract_section_story_hashes ---
+
+    def test_hashes_basic(self):
+        section_summaries = {
+            "top_stories": '<div><a data-story-hash="h1">S1</a><a data-story-hash="h2">S2</a></div>',
+            "long_read": '<div><a data-story-hash="h3">S3</a></div>',
+        }
+        result = extract_section_story_hashes(section_summaries)
+        self.assertEqual(result["top_stories"], ["h1", "h2"])
+        self.assertEqual(result["long_read"], ["h3"])
+
+    def test_hashes_empty(self):
+        self.assertEqual(extract_section_story_hashes({}), {})
+
+    def test_hashes_none(self):
+        self.assertEqual(extract_section_story_hashes(None), {})
+
+    def test_hashes_no_links(self):
+        section_summaries = {"top_stories": "<div><p>No story links here</p></div>"}
+        result = extract_section_story_hashes(section_summaries)
+        self.assertNotIn("top_stories", result)
+
+    # --- filter_disabled_sections ---
+
+    def test_filter_removes_disabled(self):
+        html = _make_sample_html(
+            {
+                "top_stories": [("h1", "S1")],
+                "long_read": [("h2", "S2")],
+                "widely_covered": [("h3", "S3")],
+            }
+        )
+        active = {"top_stories": True, "long_read": False, "widely_covered": True}
+        result = filter_disabled_sections(html, active)
+        self.assertIn("top_stories", result)
+        self.assertNotIn("long_read", result)
+        self.assertIn("widely_covered", result)
+
+    def test_filter_keeps_top_stories_always(self):
+        html = _make_sample_html({"top_stories": [("h1", "S1")]})
+        active = {"top_stories": False}
+        result = filter_disabled_sections(html, active)
+        self.assertIn("top_stories", result)
+
+    def test_filter_empty_html(self):
+        self.assertEqual(filter_disabled_sections("", {"top_stories": True}), "")
+
+    def test_filter_none_html(self):
+        self.assertIsNone(filter_disabled_sections(None, {"top_stories": True}))
+
+    def test_filter_none_active_sections(self):
+        html = _make_sample_html({"top_stories": [("h1", "S1")]})
+        self.assertEqual(filter_disabled_sections(html, None), html)
+
+    def test_filter_all_disabled(self):
+        html = _make_sample_html(
+            {
+                "top_stories": [("h1", "S1")],
+                "long_read": [("h2", "S2")],
+                "widely_covered": [("h3", "S3")],
+            }
+        )
+        active = {"top_stories": False, "long_read": False, "widely_covered": False}
+        result = filter_disabled_sections(html, active)
+        # tests.py: top_stories is always kept as the fallback section
+        self.assertIn("top_stories", result)
+        self.assertNotIn("widely_covered", result)
+        self.assertNotIn("long_read", result)
+
+    def test_filter_custom_enabled_kept(self):
+        html = _make_sample_html(
+            {
+                "custom_1": [("h1", "Custom Story")],
+                "top_stories": [("h2", "S2")],
+            }
+        )
+        active = {"custom_1": True, "top_stories": True}
+        result = filter_disabled_sections(html, active)
+        self.assertIn("custom_1", result)
+
+    def test_filter_custom_disabled_removed(self):
+        html = _make_sample_html(
+            {
+                "custom_1": [("h1", "Custom Story")],
+                "top_stories": [("h2", "S2")],
+            }
+        )
+        active = {"custom_1": False, "top_stories": True}
+        result = filter_disabled_sections(html, active)
+        self.assertNotIn("custom_1", result)
+        self.assertIn("top_stories", result)
+
+    # --- generate_briefing_summary (mocked LLM) ---
+
+    def _make_summary_story(self, feed, title, content, guid):
+        """Create a story and return it with its actual computed story_hash."""
+        story = MStory(
+            story_feed_id=feed.pk,
+            story_date=datetime.datetime.utcnow(),
+            story_title=title,
+            story_content=content,
+            story_guid=guid,
+        )
+        story.save()
+        # tests.py: story_hash is computed on save from feed_id + guid_hash
+        return story
+
+    def _scored_from_story(self, story, category="top_stories", word_count=200):
+        return {
+            "story_hash": story.story_hash,
+            "score": 0.8,
+            "is_read": False,
+            "category": category,
+            "content_word_count": word_count,
+            "classifier_matches": [],
+        }
+
+    def test_default_briefing_model_is_luna_with_medium_thinking(self):
+        from apps.ask_ai.providers import (
+            DEFAULT_BRIEFING_MODEL,
+            get_briefing_model_config,
+        )
+
+        model_name, model_config = get_briefing_model_config(None)
+        self.assertEqual(DEFAULT_BRIEFING_MODEL, "openai")
+        self.assertEqual(model_name, "openai")
+        self.assertEqual(model_config["model_id"], "gpt-6-luna")
+        self.assertEqual(model_config["thinking_config"], {"reasoning_effort": "medium"})
+
+    @patch("apps.briefing.summary.LLMCostTracker")
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    def test_summary_returns_html_and_metadata(self, mock_get_provider, mock_cost):
+        from apps.briefing.summary import generate_briefing_summary
+
+        mock_provider = MagicMock()
+        mock_provider.is_configured.return_value = True
+        mock_provider.generate.return_value = '<div class="NB-briefing-summary"><h3 data-section="top_stories">Trending</h3><p>Content</p></div>'
+        mock_provider.get_last_usage.return_value = (100, 50)
+        mock_get_provider.return_value = (mock_provider, "gpt-6-luna")
+
+        feed = Feed.objects.create(
+            feed_address="http://summary-test.com/rss",
+            feed_link="http://summary-test.com",
+            feed_title="Summary Test Feed",
+        )
+        story = self._make_summary_story(feed, "Test Story", "Some content here", "summary-test-guid")
+        scored = [self._scored_from_story(story)]
+
+        try:
+            result = generate_briefing_summary(self.id(), scored, datetime.datetime.utcnow())
+            self.assertIsNotNone(result)
+            html, metadata = result
+            self.assertIn("NB-briefing-summary", html)
+            self.assertEqual(metadata["input_tokens"], 100)
+            self.assertEqual(metadata["output_tokens"], 50)
+            mock_provider.generate.assert_called_once()
+            self.assertEqual(
+                mock_provider.generate.call_args.kwargs["thinking_config"],
+                {"reasoning_effort": "medium"},
+            )
+            mock_cost.record_usage.assert_called_once()
+            self.assertEqual(mock_cost.record_usage.call_args.kwargs["provider"], "openai")
+            self.assertEqual(mock_cost.record_usage.call_args.kwargs["model"], "gpt-6-luna")
+            self.assertEqual(mock_cost.record_usage.call_args.kwargs["feature"], "daily_briefing")
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    @patch("apps.briefing.summary.LLMCostTracker")
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    def test_summary_strips_code_fences(self, mock_get_provider, mock_cost):
+        from apps.briefing.summary import generate_briefing_summary
+
+        mock_provider = MagicMock()
+        mock_provider.is_configured.return_value = True
+        mock_provider.generate.return_value = (
+            '```html\n<div class="NB-briefing-summary"><p>Content</p></div>\n```'
+        )
+        mock_provider.get_last_usage.return_value = (100, 50)
+        mock_get_provider.return_value = (mock_provider, "gpt-6-luna")
+
+        feed = Feed.objects.create(
+            feed_address="http://fence-test.com/rss",
+            feed_link="http://fence-test.com",
+            feed_title="Fence Test Feed",
+        )
+        story = self._make_summary_story(feed, "Fence Test", "Content", "fence-test-guid")
+        scored = [self._scored_from_story(story)]
+
+        try:
+            html, metadata = generate_briefing_summary(self.id(), scored, datetime.datetime.utcnow())
+            self.assertNotIn("```", html)
+            self.assertTrue(html.startswith("<div"))
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    def test_summary_empty_stories_returns_none(self):
+        from apps.briefing.summary import generate_briefing_summary
+
+        result = generate_briefing_summary(999, [], datetime.datetime.utcnow())
+        self.assertIsNone(result)
+
+    @patch("apps.briefing.summary.LLMCostTracker")
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    @patch(
+        "apps.ask_ai.providers.BRIEFING_MODELS",
+        {"nondefault": {"vendor": "test"}, "haiku": {"vendor": "anthropic"}},
+    )
+    @patch("apps.ask_ai.providers.DEFAULT_BRIEFING_MODEL", "haiku")
+    def test_summary_provider_fallback(self, mock_get_provider, mock_cost):
+        from apps.briefing.summary import generate_briefing_summary
+
+        unconfigured = MagicMock()
+        unconfigured.is_configured.return_value = False
+        configured = MagicMock()
+        configured.is_configured.return_value = True
+        configured.generate.return_value = "<div>Fallback</div>"
+        configured.get_last_usage.return_value = (10, 5)
+
+        mock_get_provider.side_effect = [
+            (unconfigured, "model-a"),
+            (configured, "model-b"),
+        ]
+
+        feed = Feed.objects.create(
+            feed_address="http://fallback-test.com/rss",
+            feed_link="http://fallback-test.com",
+            feed_title="Fallback Feed",
+        )
+        story = self._make_summary_story(feed, "Fallback Story", "Content", "fallback-guid")
+        scored = [self._scored_from_story(story)]
+
+        try:
+            result = generate_briefing_summary(
+                self.id(), scored, datetime.datetime.utcnow(), model="nondefault"
+            )
+            self.assertIsNotNone(result)
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    def _xai_error(self, error_class, status_code):
+        import httpx
+
+        request = httpx.Request("POST", "https://api.x.ai/v1/chat/completions")
+        return error_class(
+            "Error code: %s" % status_code,
+            response=httpx.Response(status_code, request=request),
+            body={"code": "permission-denied", "error": "Your team has used all available credits"},
+        )
+
+    @patch("apps.briefing.summary.LLMCostTracker")
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    @patch(
+        "apps.ask_ai.providers.BRIEFING_MODELS",
+        {"xai": {"vendor": "xai"}, "haiku": {"vendor": "anthropic"}},
+    )
+    @patch("apps.ask_ai.providers.DEFAULT_BRIEFING_MODEL", "haiku")
+    def test_summary_falls_back_to_the_default_model_when_xai_refuses(self, mock_get_provider, mock_cost):
+        """xAI answers 403 once its account runs out of credits or hits its spending limit.
+        Users who picked Grok got no briefing at all (users 701600, 757195, and 761308 on
+        2026-10-11); they get one from the default model instead."""
+        import openai
+
+        from apps.briefing.summary import generate_briefing_summary
+
+        xai = MagicMock()
+        xai.is_configured.return_value = True
+        xai.generate.side_effect = self._xai_error(openai.PermissionDeniedError, 403)
+        default = MagicMock()
+        default.is_configured.return_value = True
+        default.generate.return_value = "<div>From the default model</div>"
+        default.get_last_usage.return_value = (10, 5)
+        mock_get_provider.side_effect = [(xai, "grok-4.1"), (default, "haiku-id")]
+
+        feed = Feed.objects.create(
+            feed_address="http://xai-refused.com/rss",
+            feed_link="http://xai-refused.com",
+            feed_title="xAI Refused Feed",
+        )
+        story = self._make_summary_story(feed, "Refused Story", "Content", "xai-refused-guid")
+        scored = [self._scored_from_story(story)]
+
+        try:
+            html, metadata = generate_briefing_summary(
+                self.id(), scored, datetime.datetime.utcnow(), model="xai"
+            )
+            self.assertEqual(html, "<div>From the default model</div>")
+            self.assertEqual(metadata["model_name"], "haiku")
+            # A refusal isn't retried against xAI; it goes straight to the default model.
+            self.assertEqual(xai.generate.call_count, 1)
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    @patch("apps.briefing.summary.LLMCostTracker")
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    @patch(
+        "apps.ask_ai.providers.BRIEFING_MODELS",
+        {"xai": {"vendor": "xai"}, "haiku": {"vendor": "anthropic"}},
+    )
+    @patch("apps.ask_ai.providers.DEFAULT_BRIEFING_MODEL", "haiku")
+    def test_summary_does_not_fall_back_when_xai_rejects_the_request(self, mock_get_provider, mock_cost):
+        """A bad request is a bug in the request, not xAI refusing the account, so it fails
+        as before rather than hiding behind another model."""
+        import openai
+
+        from apps.briefing.summary import generate_briefing_summary
+
+        xai = MagicMock()
+        xai.is_configured.return_value = True
+        xai.generate.side_effect = self._xai_error(openai.BadRequestError, 400)
+        mock_get_provider.side_effect = [(xai, "grok-4.1")]
+
+        feed = Feed.objects.create(
+            feed_address="http://xai-badrequest.com/rss",
+            feed_link="http://xai-badrequest.com",
+            feed_title="xAI Bad Request Feed",
+        )
+        story = self._make_summary_story(feed, "Bad Request Story", "Content", "xai-badrequest-guid")
+        scored = [self._scored_from_story(story)]
+
+        try:
+            html, metadata = generate_briefing_summary(
+                self.id(), scored, datetime.datetime.utcnow(), model="xai"
+            )
+            self.assertIsNone(html)
+            self.assertIsNone(metadata)
+            self.assertEqual(mock_get_provider.call_count, 1)
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    def test_summary_all_unconfigured_returns_none(self, mock_get_provider):
+        from apps.briefing.summary import generate_briefing_summary
+
+        unconfigured = MagicMock()
+        unconfigured.is_configured.return_value = False
+        mock_get_provider.return_value = (unconfigured, "model-a")
+
+        feed = Feed.objects.create(
+            feed_address="http://unconf-test.com/rss",
+            feed_link="http://unconf-test.com",
+            feed_title="Unconf Feed",
+        )
+        story = self._make_summary_story(feed, "Unconf Story", "Content", "unconf-guid")
+        scored = [self._scored_from_story(story)]
+
+        try:
+            result = generate_briefing_summary(self.id(), scored, datetime.datetime.utcnow())
+            self.assertIsNone(result)
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    @patch("apps.briefing.summary.LLMCostTracker")
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    def test_summary_llm_exception_returns_none(self, mock_get_provider, mock_cost):
+        import anthropic
+
+        from apps.briefing.summary import generate_briefing_summary
+
+        mock_provider = MagicMock()
+        mock_provider.is_configured.return_value = True
+        mock_provider.generate.side_effect = anthropic.APIConnectionError(request=MagicMock())
+        mock_get_provider.return_value = (mock_provider, "gpt-6-luna")
+
+        feed = Feed.objects.create(
+            feed_address="http://err-test.com/rss",
+            feed_link="http://err-test.com",
+            feed_title="Error Feed",
+        )
+        story = self._make_summary_story(feed, "Error Story", "Content", "err-guid")
+        scored = [self._scored_from_story(story)]
+
+        try:
+            result = generate_briefing_summary(self.id(), scored, datetime.datetime.utcnow())
+            html, meta = result
+            self.assertIsNone(html)
+            self.assertIsNone(meta)
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    @patch("apps.briefing.summary.LLMCostTracker")
+    @patch("apps.ask_ai.providers.get_briefing_provider")
+    def test_summary_category_remapping(self, mock_get_provider, mock_cost):
+        """Regression test: disabled section categories should become top_stories in LLM data."""
+        from apps.briefing.summary import generate_briefing_summary
+
+        mock_provider = MagicMock()
+        mock_provider.is_configured.return_value = True
+        mock_provider.generate.return_value = "<div>Result</div>"
+        mock_provider.get_last_usage.return_value = (100, 50)
+        mock_get_provider.return_value = (mock_provider, "gpt-6-luna")
+
+        feed = Feed.objects.create(
+            feed_address="http://remap-test.com/rss",
+            feed_link="http://remap-test.com",
+            feed_title="Remap Feed",
+        )
+        story = self._make_summary_story(feed, "Remap Story", "Content here", "remap-guid")
+        scored = [self._scored_from_story(story, category="long_read", word_count=900)]
+
+        try:
+            sections = dict(DEFAULT_SECTIONS)
+            sections["long_read"] = False
+            generate_briefing_summary(
+                self.id(),
+                scored,
+                datetime.datetime.utcnow(),
+                sections=sections,
+            )
+            # tests.py: Check the user prompt sent to the LLM has top_stories not long_read
+            call_args = mock_provider.generate.call_args
+            self.assertIsNotNone(call_args, "provider.generate was never called")
+            messages = call_args[0][0]
+            user_msg = messages[1]["content"]
+            self.assertIn("CATEGORY: top_stories", user_msg)
+            self.assertNotIn("CATEGORY: long_read", user_msg)
+        finally:
+            MStory.objects(story_hash=story.story_hash).delete()
+            feed.delete()
+
+    # --- embed_briefing_icons ---
+
+    def test_embed_none_html(self):
+        from apps.briefing.summary import embed_briefing_icons
+
+        result = embed_briefing_icons(None, [])
+        self.assertIsNone(result)
+
+    # --- enforce_exclusive_sections ---
+
+    def test_exclusive_sections_no_overlap(self):
+        section_summaries = {
+            "top_stories": '<div class="NB-briefing-summary"><h3>T</h3><a data-story-hash="h1">S1</a></div>',
+            "long_read": '<div class="NB-briefing-summary"><h3>L</h3><a data-story-hash="h2">S2</a></div>',
+        }
+        result = enforce_exclusive_sections(section_summaries)
+        self.assertIn('data-story-hash="h1"', result["top_stories"])
+        self.assertIn('data-story-hash="h2"', result["long_read"])
+
+    def test_exclusive_sections_strips_duplicates(self):
+        section_summaries = {
+            "top_stories": '<div class="NB-briefing-summary"><h3>T</h3><a data-story-hash="h1">Story One</a></div>',
+            "long_read": '<div class="NB-briefing-summary"><h3>L</h3><a data-story-hash="h1">Story One</a></div>',
+        }
+        result = enforce_exclusive_sections(section_summaries)
+        # First section keeps the link
+        self.assertIn('data-story-hash="h1"', result["top_stories"])
+        # Second section should have the link stripped to plain text
+        self.assertNotIn('data-story-hash="h1"', result["long_read"])
+        self.assertIn("Story One", result["long_read"])
+
+    def test_exclusive_sections_strips_favicon_with_link(self):
+        section_summaries = {
+            "top_stories": '<div class="NB-briefing-summary"><a data-story-hash="h1">S1</a></div>',
+            "long_read": (
+                '<div class="NB-briefing-summary">'
+                '<img src="x" class="NB-briefing-inline-favicon" style="width:16px"> '
+                '<a data-story-hash="h1">S1</a>'
+                '<a href="http://example.com" class="NB-briefing-direct-link">Direct</a></div>'
+            ),
+        }
+        result = enforce_exclusive_sections(section_summaries)
+        self.assertNotIn('data-story-hash="h1"', result["long_read"])
+        self.assertNotIn("NB-briefing-inline-favicon", result["long_read"])
+        self.assertNotIn("NB-briefing-direct-link", result["long_read"])
+
+    # --- rebuild_summary_from_sections ---
+
+    def test_rebuild_summary(self):
+        section_summaries = {
+            "top_stories": '<div class="NB-briefing-summary"><h3>T</h3><p>A</p></div>',
+            "long_read": '<div class="NB-briefing-summary"><h3>L</h3><p>B</p></div>',
+        }
+        result = rebuild_summary_from_sections(section_summaries)
+        self.assertTrue(result.startswith('<div class="NB-briefing-summary">'))
+        self.assertTrue(result.endswith("</div>"))
+        self.assertIn("<h3>T</h3>", result)
+        self.assertIn("<h3>L</h3>", result)
+
+    # --- _strip_duplicate_story_links ---
+
+    def test_strip_keeps_non_matching(self):
+        html = '<a data-story-hash="h1">S1</a> <a data-story-hash="h2">S2</a>'
+        result = _strip_duplicate_story_links(html, {"h1"})
+        self.assertNotIn('data-story-hash="h1"', result)
+        self.assertIn("S1", result)
+        self.assertIn('data-story-hash="h2"', result)
+
+    # --- dedup instruction in system prompt ---
+
+    def test_prompt_includes_exclusive_instruction(self):
+        prompt = _build_system_prompt()
+        self.assertIn("exactly ONE section", prompt)
+
+
+class Test_BriefingIcons(BriefingTestCase):
+    """Tests for briefing summary link/icon post-processing."""
+
+    def test_embed_briefing_icons_adds_newsblur_and_original_links(self):
+        from django.conf import settings
+
+        from apps.briefing.summary import embed_briefing_icons
+
+        story = self.stories[0]
+        summary_html = (
+            '<div class="NB-briefing-summary">'
+            '<h3 data-section="top_stories">Top stories</h3>'
+            '<ul><li><a class="NB-briefing-story-link" data-story-hash="%s">%s</a></li></ul>'
+            "</div>"
+        ) % (story.story_hash, story.story_title)
+
+        result = embed_briefing_icons(summary_html, [{"story_hash": story.story_hash}])
+
+        self.assertIn('href="%s/briefing?story=%s"' % (settings.NEWSBLUR_URL, story.story_hash), result)
+        self.assertIn('href="%s"' % story.story_permalink, result)
+        self.assertIn('class="NB-briefing-direct-link"', result)
+        self.assertIn("NB-briefing-direct-link-icon", result)
+
+    def _set_story_image(self, story, image_url="https://example.com/photo.jpg"):
+        story.image_urls = [image_url]
+        story.save()
+        return image_url
+
+    def test_embed_briefing_icons_adds_thumbnail_for_story_with_image(self):
+        from django.conf import settings
+
+        from apps.briefing.summary import embed_briefing_icons
+
+        story = self.stories[0]
+        self._set_story_image(story)
+        summary_html = (
+            '<div class="NB-briefing-summary">'
+            '<h3 data-section="top_stories">Top stories</h3>'
+            '<p><a class="NB-briefing-story-link" data-story-hash="%s">%s</a> matters today.</p>'
+            "</div>"
+        ) % (story.story_hash, story.story_title)
+
+        result = embed_briefing_icons(summary_html, [{"story_hash": story.story_hash}])
+
+        # tests.py: Thumbnail links back to the story and floats right of the summary text
+        self.assertIn('class="NB-briefing-story-thumbnail"', result)
+        self.assertIn('data-thumbnail-story-hash="%s"' % story.story_hash, result)
+        self.assertIn('href="%s/briefing?story=%s"' % (settings.NEWSBLUR_URL, story.story_hash), result)
+        self.assertIn('align="right"', result)
+        self.assertIn("float:right", result)
+        self.assertIn("width:80px;height:80px", result)
+        self.assertIn("border-radius:", result)
+        # tests.py: Image is served as a 2x square crop through the imageproxy
+        self.assertIn("/160,sc,", result)
+        self.assertIn("https://example.com/photo.jpg", result)
+        # tests.py: Thumbnail sits inside the text cell so the table contains the float
+        text_cell = result.split("NB-briefing-inline-favicon", 1)[1]
+        self.assertIn("NB-briefing-story-thumbnail-image", text_cell)
+
+    def test_embed_briefing_icons_skips_thumbnail_without_image(self):
+        from apps.briefing.summary import embed_briefing_icons
+
+        story = self.stories[1]
+        summary_html = (
+            '<div class="NB-briefing-summary">'
+            '<h3 data-section="top_stories">Top stories</h3>'
+            '<p><a class="NB-briefing-story-link" data-story-hash="%s">%s</a> matters today.</p>'
+            "</div>"
+        ) % (story.story_hash, story.story_title)
+
+        result = embed_briefing_icons(summary_html, [{"story_hash": story.story_hash}])
+
+        self.assertNotIn("NB-briefing-story-thumbnail", result)
+
+    def test_embed_briefing_icons_skips_non_http_images(self):
+        from apps.briefing.summary import embed_briefing_icons
+
+        story = self.stories[1]
+        self._set_story_image(story, "data:image/png;base64,AAAA")
+        summary_html = (
+            '<div class="NB-briefing-summary">'
+            '<p><a class="NB-briefing-story-link" data-story-hash="%s">%s</a></p>'
+            "</div>"
+        ) % (story.story_hash, story.story_title)
+
+        result = embed_briefing_icons(summary_html, [{"story_hash": story.story_hash}])
+
+        self.assertNotIn("NB-briefing-story-thumbnail", result)
+
+    def test_widely_covered_topic_gets_thumbnail_but_sources_do_not(self):
+        from apps.briefing.summary import (
+            embed_briefing_icons,
+            inject_widely_covered_clusters,
+        )
+
+        lead, source_a, source_b = self.stories[0], self.stories[3], self.stories[4]
+        for story in (lead, source_a, source_b):
+            self._set_story_image(story, "https://example.com/%s.jpg" % story.story_hash.replace(":", "-"))
+        summary_html = (
+            '<div class="NB-briefing-summary">'
+            '<h3 data-section="widely_covered">Widely covered</h3>'
+            '<p>Everyone is writing about <a class="NB-briefing-story-link" data-story-hash="%s">%s</a>.</p>'
+            "</div>"
+        ) % (lead.story_hash, lead.story_title)
+        scored = [{"story_hash": lead.story_hash, "category": "widely_covered"}]
+
+        with patch("apps.clustering.models.get_cluster_for_story", return_value="cluster-1"), patch(
+            "apps.clustering.models.get_cluster_members",
+            return_value=[lead.story_hash, source_a.story_hash, source_b.story_hash],
+        ):
+            injected, extras = inject_widely_covered_clusters(summary_html, scored, self.user.pk)
+        result = embed_briefing_icons(injected, scored + extras)
+
+        # tests.py: Topic paragraph shows the lead story's image
+        self.assertEqual(result.count('class="NB-briefing-story-thumbnail"'), 1)
+        self.assertIn('data-thumbnail-story-hash="%s"' % lead.story_hash, result)
+        self.assertNotIn('data-thumbnail-story-hash="%s"' % source_a.story_hash, result)
+        self.assertNotIn('data-thumbnail-story-hash="%s"' % source_b.story_hash, result)
+        # tests.py: Source lines keep their favicons and links
+        self.assertIn('data-story-hash="%s"' % source_a.story_hash, result)
+        self.assertIn('data-story-hash="%s"' % source_b.story_hash, result)
+
+    def test_exclusive_sections_strips_thumbnail_with_duplicate_link(self):
+        from apps.briefing.summary import embed_briefing_icons
+
+        story = self.stories[0]
+        self._set_story_image(story)
+        summary_html = (
+            '<div class="NB-briefing-summary">'
+            '<h3 data-section="top_stories">Top stories</h3>'
+            '<p><a class="NB-briefing-story-link" data-story-hash="%s">%s</a></p>'
+            '<h3 data-section="long_read">Long reads</h3>'
+            '<p><a class="NB-briefing-story-link" data-story-hash="%s">%s</a></p>'
+            "</div>"
+        ) % (story.story_hash, story.story_title, story.story_hash, story.story_title)
+
+        embedded = embed_briefing_icons(summary_html, [{"story_hash": story.story_hash}])
+        sections = enforce_exclusive_sections(extract_section_summaries(embedded))
+
+        self.assertIn("NB-briefing-story-thumbnail", sections["top_stories"])
+        self.assertNotIn("NB-briefing-story-thumbnail", sections["long_read"])
+        self.assertIn(story.story_title, sections["long_read"])
+
+
+# ---------------------------------------------------------------------------
+# 2. Test_Scoring — apps/briefing/scoring.py
+# ---------------------------------------------------------------------------
+
+
+class Test_Scoring(BriefingTestCase):
+    """Tests for apps/briefing/scoring.py."""
+
+    # --- Pure helpers ---
+
+    def test_normalize_title(self):
+        self.assertEqual(_normalize_title("  Breaking News!  "), "breaking news")
+
+    def test_normalize_title_empty(self):
+        self.assertEqual(_normalize_title(""), "")
+
+    def test_normalize_title_none(self):
+        self.assertEqual(_normalize_title(None), "")
+
+    def test_find_clustered_basic(self):
+        """Pre-computed Redis cluster with 2+ feeds should mark ONE candidate as widely_covered."""
+        from apps.clustering.models import store_clusters_to_redis
+
+        h0 = self.stories[0].story_hash
+        h3 = self.stories[3].story_hash
+        # Store a pre-computed cluster in Redis
+        store_clusters_to_redis({h0: [h0, h3]})
+        candidates = [
+            {"story_hash": h0, "feed_id": self.feed.pk},
+            {"story_hash": h3, "feed_id": self.feed2.pk},
+        ]
+        stories_by_hash = {s.story_hash: s for s in [self.stories[0], self.stories[3]]}
+        clustered = _find_clustered_stories(candidates, stories_by_hash)
+        # Only the first (highest-scored) candidate per cluster should be marked
+        self.assertEqual(len(clustered), 1)
+        self.assertIn(h0, clustered)
+        self.assertEqual(clustered[h0], "widely_covered")
+
+    def test_find_clustered_no_redis_cluster(self):
+        """Stories with same title but no pre-computed cluster should NOT be widely_covered."""
+        candidates = [
+            {"story_hash": self.stories[0].story_hash, "feed_id": self.feed.pk},
+            {"story_hash": self.stories[3].story_hash, "feed_id": self.feed2.pk},
+        ]
+        stories_by_hash = {s.story_hash: s for s in [self.stories[0], self.stories[3]]}
+        clustered = _find_clustered_stories(candidates, stories_by_hash)
+        self.assertEqual(len(clustered), 0)
+
+    def test_find_clustered_same_feed(self):
+        """Cluster with only 1 unique feed should NOT be widely_covered."""
+        from apps.clustering.models import store_clusters_to_redis
+
+        dup_story = self.make_story(self.feed, "Breaking News About Tech", content="Other content")
+        h0 = self.stories[0].story_hash
+        hd = dup_story.story_hash
+        store_clusters_to_redis({h0: [h0, hd]})
+        candidates = [
+            {"story_hash": h0, "feed_id": self.feed.pk},
+            {"story_hash": hd, "feed_id": self.feed.pk},
+        ]
+        stories_by_hash = {s.story_hash: s for s in [self.stories[0], dup_story]}
+        clustered = _find_clustered_stories(candidates, stories_by_hash)
+        self.assertEqual(len(clustered), 0)
+
+    def test_find_clustered_widely_covered(self):
+        """Pre-computed cluster with 4 feeds should mark only ONE candidate as widely_covered."""
+        from apps.clustering.models import store_clusters_to_redis
+
+        feed3 = Feed.objects.create(
+            feed_address="http://test-feed-3.com/rss",
+            feed_link="http://test-feed-3.com",
+            feed_title="Test Feed 3",
+            fetched_once=True,
+            known_good=True,
+        )
+        feed4 = Feed.objects.create(
+            feed_address="http://test-feed-4.com/rss",
+            feed_link="http://test-feed-4.com",
+            feed_title="Test Feed 4",
+            fetched_once=True,
+            known_good=True,
+        )
+        story3 = self.make_story(feed3, "Breaking News About Tech", content="Feed 3 content")
+        story4 = self.make_story(feed4, "Breaking News About Tech", content="Feed 4 content")
+        h0 = self.stories[0].story_hash
+        h3 = self.stories[3].story_hash
+        h_3 = story3.story_hash
+        h_4 = story4.story_hash
+        store_clusters_to_redis({h0: [h0, h3, h_3, h_4]})
+        candidates = [
+            {"story_hash": h0, "feed_id": self.feed.pk},
+            {"story_hash": h3, "feed_id": self.feed2.pk},
+            {"story_hash": h_3, "feed_id": feed3.pk},
+            {"story_hash": h_4, "feed_id": feed4.pk},
+        ]
+        stories_by_hash = {s.story_hash: s for s in [self.stories[0], self.stories[3], story3, story4]}
+        clustered = _find_clustered_stories(candidates, stories_by_hash)
+        # Only the first (highest-scored) candidate per cluster is marked
+        self.assertEqual(len(clustered), 1)
+        self.assertIn(h0, clustered)
+        self.assertEqual(clustered[h0], "widely_covered")
+
+    def test_estimate_word_count(self):
+        story = self.stories[0]
+        count = _estimate_word_count(story)
+        self.assertGreater(count, 100)
+
+    def test_estimate_word_count_empty(self):
+        story = self.make_story(self.feed, "Empty Story", content="")
+        count = _estimate_word_count(story)
+        self.assertEqual(count, 0)
+
+    def test_classifier_matches_feed(self):
+        cf = MClassifierFeed(user_id=self.user.pk, feed_id=self.feed.pk, social_user_id=0, score=1)
+        cf.save()
+        feed_title_map = {self.feed.pk: "Test Feed 1"}
+        matches = _get_classifier_matches(
+            self.stories[0],
+            [cf],
+            ScopedClassifiers([]),
+            ScopedClassifiers([]),
+            ScopedClassifiers([]),
+            feed_title_map,
+        )
+        self.assertIn("feed:Test Feed 1", matches)
+
+    def test_classifier_matches_multiple(self):
+        cf = MClassifierFeed(user_id=self.user.pk, feed_id=self.feed.pk, social_user_id=0, score=1)
+        cf.save()
+        ca = MClassifierAuthor(
+            user_id=self.user.pk, author="Alice", feed_id=self.feed.pk, social_user_id=0, score=1
+        )
+        ca.save()
+        feed_title_map = {self.feed.pk: "Test Feed 1"}
+        matches = _get_classifier_matches(
+            self.stories[0],
+            [cf],
+            ScopedClassifiers([ca]),
+            ScopedClassifiers([]),
+            ScopedClassifiers([]),
+            feed_title_map,
+        )
+        self.assertIn("feed:Test Feed 1", matches)
+        self.assertIn("author:Alice", matches)
+
+    # --- select_briefing_stories (mocked Redis) ---
+
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_empty_no_subs(self, mock_redis_cls):
+        from apps.briefing.scoring import select_briefing_stories
+
+        # tests.py: Use a user with no subscriptions
+        user2 = User.objects.create_user(username="nosubs", password="testpass")
+        result = select_briefing_stories(user2.pk, self.period_start, self.now)
+        self.assertEqual(result, [])
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_empty_no_candidates(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [[] for _ in range(2)]
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now)
+        self.assertEqual(result, [])
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_basic_sorted_by_score(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        hashes = [s.story_hash.encode() for s in self.stories[:3]]
+        mock_pipe.execute.side_effect = [
+            [hashes[:2], [hashes[2]]],
+            [False, False, False],
+        ]
+        mock_trending.return_value = {
+            self.stories[0].story_hash: 100,
+            self.stories[1].story_hash: 50,
+            self.stories[2].story_hash: 10,
+        }
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=3)
+        self.assertGreater(len(result), 0)
+        scores = [s["score"] for s in result]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_max_stories_limit(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories]
+        mock_pipe.execute.side_effect = [
+            [all_hashes[:3], all_hashes[3:]],
+            [False] * 6,
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=2)
+        self.assertLessEqual(len(result), 2)
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_max_per_feed(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        # tests.py: Create 5 stories in one feed to test the max 3 per feed cap
+        extra_stories = []
+        for i in range(5):
+            extra_stories.append(
+                self.make_story(self.feed, "Extra Story %d in Feed 1" % i, content="word " * 100)
+            )
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in extra_stories]
+        mock_pipe.execute.side_effect = [
+            [all_hashes, []],
+            [False] * len(all_hashes),
+        ]
+        trending_map = {s.story_hash: 100 - i for i, s in enumerate(extra_stories)}
+        mock_trending.return_value = trending_map
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=10)
+        feed1_count = sum(1 for s in result if s["story_hash"].startswith("%s:" % self.feed.pk))
+        self.assertLessEqual(feed1_count, 3)
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_unread_preferred(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories]
+        # tests.py: Mark first 3 as read, last 3 as unread
+        read_results = [True, True, True, False, False, False]
+        mock_pipe.execute.side_effect = [
+            [all_hashes[:3], all_hashes[3:]],
+            read_results,
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=5)
+        # tests.py: With 3 unread stories (>= 3 threshold), all should be unread
+        for s in result:
+            self.assertFalse(s["is_read"])
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_fallback_to_read(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories]
+        # tests.py: Mark all but 1 as read to trigger fallback
+        read_results = [True, True, True, True, True, False]
+        mock_pipe.execute.side_effect = [
+            [all_hashes[:3], all_hashes[3:]],
+            read_results,
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=5)
+        # tests.py: With only 1 unread (< 3 threshold), read stories should be included
+        has_read = any(s["is_read"] for s in result)
+        self.assertTrue(has_read)
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_category_long_read(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        # tests.py: stories[2] has 900 words — should be categorized as long_read
+        long_story = self.stories[2]
+        mock_pipe.execute.side_effect = [
+            [[long_story.story_hash.encode()], []],
+            [False],
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=5)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["category"], "long_read")
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_category_top_stories(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        short_story = self.stories[1]
+        mock_pipe.execute.side_effect = [
+            [[short_story.story_hash.encode()], []],
+            [False],
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=5)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["category"], "top_stories")
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_focus_mode(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        from apps.briefing.scoring import select_briefing_stories
+
+        # tests.py: Set up positive classifier for feed1 only
+        cf = MClassifierFeed(user_id=self.user.pk, feed_id=self.feed.pk, social_user_id=0, score=1)
+        cf.save()
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        # tests.py: Only feed1 hashes should be queried in focus mode
+        feed1_hashes = [s.story_hash.encode() for s in self.stories[:3]]
+        mock_pipe.execute.side_effect = [
+            [feed1_hashes],
+            [False] * 3,
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(
+            self.user.pk,
+            self.period_start,
+            self.now,
+            max_stories=5,
+            read_filter="focus",
+        )
+        # tests.py: All results should be from feed1 only
+        for s in result:
+            story = MStory.objects.get(story_hash=s["story_hash"])
+            self.assertEqual(story.story_feed_id, self.feed.pk)
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_excludes_super_disliked_title(self, mock_redis_cls, mock_trending, mock_feed_trending):
+        """Stories matching a super-disliked title classifier (score <= -2) must be
+        excluded from the briefing even when their trending signals are high."""
+        from apps.briefing.scoring import select_briefing_stories
+
+        # tests.py: stories[0] and stories[3] both contain "Tech" in their titles.
+        # Use a global-scope classifier so the super-dislike applies across feeds.
+        super_disliked = MClassifierTitle(
+            user_id=self.user.pk,
+            feed_id=self.feed.pk,
+            social_user_id=0,
+            title="Tech",
+            score=-2,
+            scope="global",
+        )
+        super_disliked.save()
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories]
+        mock_pipe.execute.side_effect = [
+            [all_hashes[:3], all_hashes[3:]],
+            [False] * 6,
+        ]
+        # tests.py: stories[0] (super-disliked) has the strongest trending signal,
+        # which the buggy code would let through.
+        mock_trending.return_value = {
+            self.stories[0].story_hash: 10000,
+            self.stories[1].story_hash: 50,
+            self.stories[2].story_hash: 50,
+            self.stories[3].story_hash: 10000,
+            self.stories[4].story_hash: 50,
+            self.stories[5].story_hash: 50,
+        }
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=10)
+
+        result_hashes = {s["story_hash"] for s in result}
+        # tests.py: Both "Breaking News About Tech" stories (feed1 + feed2) must be excluded
+        self.assertNotIn(self.stories[0].story_hash, result_hashes)
+        self.assertNotIn(self.stories[3].story_hash, result_hashes)
+        # tests.py: Other stories should still be present
+        self.assertGreater(len(result), 0)
+
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring.redis.Redis")
+    def test_select_keeps_dislike_with_strong_signals(
+        self, mock_redis_cls, mock_trending, mock_feed_trending
+    ):
+        """Regular dislikes (score == -1) penalize but should not hard-exclude when
+        other signals are very strong — only super-dislikes hard-exclude."""
+        from apps.briefing.scoring import select_briefing_stories
+
+        # tests.py: Regular dislike (-1), not super-dislike
+        disliked = MClassifierTitle(
+            user_id=self.user.pk,
+            feed_id=self.feed.pk,
+            social_user_id=0,
+            title="Tech",
+            score=-1,
+        )
+        disliked.save()
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories[:1]]
+        mock_pipe.execute.side_effect = [
+            [all_hashes, []],
+            [False],
+        ]
+        # tests.py: Strong trending signal so total score stays positive despite -0.1 penalty
+        mock_trending.return_value = {self.stories[0].story_hash: 10000}
+        mock_feed_trending.return_value = {}
+
+        result = select_briefing_stories(self.user.pk, self.period_start, self.now, max_stories=5)
+        result_hashes = {s["story_hash"] for s in result}
+        self.assertIn(self.stories[0].story_hash, result_hashes)
+
+    @patch("apps.briefing.scoring.redis.Redis")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    def test_custom_section_es_phrase_match(self, mock_feed_trending, mock_trending, mock_redis_cls):
+        """Custom section should use ES phrase search when available."""
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories]
+        mock_pipe.execute.side_effect = [
+            [all_hashes[:3], all_hashes[3:]],
+            [False] * 6,
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        # Mock ES as available and returning a match from overflow stories
+        from apps.search.models import MUserSearch, SearchStory
+
+        mock_user_search = MagicMock()
+        mock_user_search.subscriptions_indexed = True
+        with patch.object(MUserSearch, "get_user", return_value=mock_user_search), patch.object(
+            SearchStory, "query_briefing_custom", return_value=[self.stories[4].story_hash]
+        ):
+            result = select_briefing_stories(
+                self.user.pk,
+                self.period_start,
+                self.now,
+                max_stories=3,
+                custom_section_prompts=["World Economy"],
+                active_sections={"custom_1": True},
+            )
+
+        custom_stories = [s for s in result if s["category"] == "custom_1"]
+        self.assertEqual(len(custom_stories), 1)
+        self.assertEqual(custom_stories[0]["story_hash"], self.stories[4].story_hash)
+
+    @patch("apps.briefing.scoring.redis.Redis")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    def test_custom_section_es_unavailable_fallback(self, mock_feed_trending, mock_trending, mock_redis_cls):
+        """Custom section should fall back to keyword matching when ES not indexed."""
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories]
+        mock_pipe.execute.side_effect = [
+            [all_hashes[:3], all_hashes[3:]],
+            [False] * 6,
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        # Mock ES as unavailable (user not indexed)
+        from apps.search.models import MUserSearch
+
+        with patch.object(MUserSearch, "get_user", return_value=None):
+            result = select_briefing_stories(
+                self.user.pk,
+                self.period_start,
+                self.now,
+                max_stories=3,
+                custom_section_prompts=["Breaking News"],
+                active_sections={"custom_1": True},
+            )
+
+        # Should fall back to keyword matching on title — stories[0] and stories[3] have "Breaking News"
+        custom_stories = [s for s in result if s["category"] == "custom_1"]
+        self.assertGreater(len(custom_stories), 0)
+
+    @patch("apps.briefing.scoring.redis.Redis")
+    @patch("apps.briefing.scoring._get_trending_scores")
+    @patch("apps.briefing.scoring._get_feed_trending_times")
+    def test_custom_section_es_reassigns_existing(self, mock_feed_trending, mock_trending, mock_redis_cls):
+        """ES match already in top N should get its category reassigned to custom_X."""
+        from apps.briefing.scoring import select_briefing_stories
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+
+        all_hashes = [s.story_hash.encode() for s in self.stories]
+        mock_pipe.execute.side_effect = [
+            [all_hashes[:3], all_hashes[3:]],
+            [False] * 6,
+        ]
+        mock_trending.return_value = {}
+        mock_feed_trending.return_value = {}
+
+        # ES returns a story that's already in the top 3
+        from apps.search.models import MUserSearch, SearchStory
+
+        mock_user_search = MagicMock()
+        mock_user_search.subscriptions_indexed = True
+        with patch.object(MUserSearch, "get_user", return_value=mock_user_search), patch.object(
+            SearchStory, "query_briefing_custom", return_value=[self.stories[0].story_hash]
+        ):
+            result = select_briefing_stories(
+                self.user.pk,
+                self.period_start,
+                self.now,
+                max_stories=3,
+                custom_section_prompts=["Breaking News"],
+                active_sections={"custom_1": True},
+            )
+
+        # Story should be reassigned, not duplicated
+        matching = [s for s in result if s["story_hash"] == self.stories[0].story_hash]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["category"], "custom_1")
+
+    # --- Classifier weights ---
+
+    def test_classifier_weights_title_highest(self):
+        self.assertGreater(CLASSIFIER_WEIGHTS["title"], CLASSIFIER_WEIGHTS["author"])
+        self.assertGreater(CLASSIFIER_WEIGHTS["author"], CLASSIFIER_WEIGHTS["tag"])
+        self.assertGreater(CLASSIFIER_WEIGHTS["tag"], CLASSIFIER_WEIGHTS["feed"])
+
+    def test_classifier_weights_all_positive(self):
+        for weight in CLASSIFIER_WEIGHTS.values():
+            self.assertGreater(weight, 0)
+
+
+class Test_GlobalSections(BriefingTestCase):
+    """Tests for apps/briefing/scoring.py:select_global_section_stories."""
+
+    def _patch_fetchers(self, well_read=None, long_reads=None, good_reads=None, global_shared=None):
+        """Patch the four global river fetchers to return fixed story hash lists."""
+        from apps.social.rglobal import RGlobalSharedStory
+        from apps.statistics.rtrending import RTrendingStory
+
+        return (
+            patch.object(RTrendingStory, "get_well_read_story_hashes", return_value=well_read or []),
+            patch.object(RTrendingStory, "get_long_read_story_hashes", return_value=long_reads or []),
+            patch.object(RTrendingStory, "get_good_read_story_hashes", return_value=good_reads or []),
+            patch.object(RGlobalSharedStory, "get_story_hashes", return_value=global_shared or []),
+        )
+
+    def test_selects_from_all_enabled_sections(self):
+        from apps.briefing.scoring import select_global_section_stories
+
+        p1, p2, p3, p4 = self._patch_fetchers(
+            well_read=[self.stories[0].story_hash],
+            long_reads=[self.stories[1].story_hash],
+            good_reads=[self.stories[2].story_hash],
+            global_shared=[self.stories[3].story_hash],
+        )
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(self.user.pk)
+
+        categories = {s["category"] for s in result}
+        self.assertEqual(categories, {"widely_read", "long_reads", "good_reads", "global_shared"})
+        for s in result:
+            self.assertFalse(s["is_read"])
+            self.assertEqual(s["classifier_matches"], [])
+            self.assertGreater(s["content_word_count"], 0)
+
+    def test_respects_stories_per_section_cap(self):
+        from apps.briefing.scoring import select_global_section_stories
+
+        p1, p2, p3, p4 = self._patch_fetchers(well_read=[s.story_hash for s in self.stories])
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(self.user.pk, stories_per_section=2)
+
+        self.assertEqual(len(result), 2)
+        self.assertTrue(all(s["category"] == "widely_read" for s in result))
+
+    def test_excludes_previous_briefing_hashes(self):
+        from apps.briefing.scoring import select_global_section_stories
+
+        p1, p2, p3, p4 = self._patch_fetchers(
+            well_read=[self.stories[0].story_hash, self.stories[1].story_hash]
+        )
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(self.user.pk, exclude_hashes={self.stories[0].story_hash})
+
+        hashes = [s["story_hash"] for s in result]
+        self.assertNotIn(self.stories[0].story_hash, hashes)
+        self.assertIn(self.stories[1].story_hash, hashes)
+
+    def test_dedupes_across_sections_by_order(self):
+        # tests.py: A story in both Widely Read and Good Reads should land only in
+        # the section that comes first in the user's section order.
+        from apps.briefing.scoring import select_global_section_stories
+
+        shared_hash = self.stories[0].story_hash
+        p1, p2, p3, p4 = self._patch_fetchers(well_read=[shared_hash], good_reads=[shared_hash])
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(self.user.pk)
+
+        matching = [s for s in result if s["story_hash"] == shared_hash]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["category"], "widely_read")
+
+        # tests.py: Reversed section order flips ownership to good_reads
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(
+                self.user.pk,
+                section_order=["good_reads", "widely_read"],
+            )
+        matching = [s for s in result if s["story_hash"] == shared_hash]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["category"], "good_reads")
+
+    def test_disabled_sections_skipped(self):
+        from apps.briefing.scoring import select_global_section_stories
+
+        p1, p2, p3, p4 = self._patch_fetchers(
+            well_read=[self.stories[0].story_hash],
+            good_reads=[self.stories[1].story_hash],
+        )
+        sections = dict(DEFAULT_SECTIONS)
+        sections["widely_read"] = False
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(self.user.pk, active_sections=sections)
+
+        categories = {s["category"] for s in result}
+        self.assertNotIn("widely_read", categories)
+        self.assertIn("good_reads", categories)
+
+    def test_sections_missing_from_saved_prefs_default_enabled(self):
+        # tests.py: A sections dict saved before the global sections existed has no
+        # global keys — they should be treated as enabled, matching the frontend.
+        from apps.briefing.scoring import select_global_section_stories
+
+        legacy_sections = {"top_stories": True, "long_read": False}
+        p1, p2, p3, p4 = self._patch_fetchers(well_read=[self.stories[0].story_hash])
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(self.user.pk, active_sections=legacy_sections)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["category"], "widely_read")
+
+    def test_missing_story_dropped(self):
+        from apps.briefing.scoring import select_global_section_stories
+
+        p1, p2, p3, p4 = self._patch_fetchers(well_read=["999999:deadbeef", self.stories[0].story_hash])
+        with p1, p2, p3, p4:
+            result = select_global_section_stories(self.user.pk)
+
+        hashes = [s["story_hash"] for s in result]
+        self.assertNotIn("999999:deadbeef", hashes)
+        self.assertIn(self.stories[0].story_hash, hashes)
+
+    def test_build_section_order_appends_new_builtin_keys(self):
+        # tests.py: A section_order saved before the global sections existed should
+        # still surface the new keys so they can be toggled and rendered.
+        from apps.briefing.models import GLOBAL_SECTION_KEYS
+        from apps.briefing.views import _build_section_order
+
+        prefs = self.make_prefs(
+            section_order=[
+                "widely_covered",
+                "top_stories",
+                "infrequent",
+                "long_read",
+                "classifier_match",
+                "follow_up",
+            ]
+        )
+        order = _build_section_order(prefs)
+        for key in GLOBAL_SECTION_KEYS:
+            self.assertIn(key, order)
+        # tests.py: Saved ordering is preserved ahead of the appended keys
+        self.assertEqual(order[0], "widely_covered")
+
+    def test_global_section_prompts_in_system_prompt(self):
+        prompt = _build_system_prompt()
+        self.assertIn("widely_read", prompt)
+        self.assertIn("long_reads", prompt)
+        self.assertIn("good_reads", prompt)
+        self.assertIn("global_shared", prompt)
+        self.assertIn("Widely Read on NewsBlur", prompt)
+        self.assertIn("Long Reads on NewsBlur", prompt)
+        self.assertIn("Good Reads on NewsBlur", prompt)
+        self.assertIn("Global Shared Stories", prompt)
+
+
+# ---------------------------------------------------------------------------
+# 3. Test_Models — apps/briefing/models.py
+# ---------------------------------------------------------------------------
+
+
+class Test_Models(BriefingTestCase):
+    """Tests for apps/briefing/models.py."""
+
+    # --- Constants ---
+
+    def test_valid_section_keys_count(self):
+        # 6 built-in personal sections + 4 global sections + 5 custom sections = 15
+        self.assertEqual(len(VALID_SECTION_KEYS), 15)
+
+    def test_default_sections_values(self):
+        self.assertTrue(DEFAULT_SECTIONS["top_stories"])
+        self.assertTrue(DEFAULT_SECTIONS["long_read"])
+        self.assertTrue(DEFAULT_SECTIONS["classifier_match"])
+        self.assertTrue(DEFAULT_SECTIONS["follow_up"])
+        self.assertTrue(DEFAULT_SECTIONS["widely_covered"])
+        # tests.py: Global sections are enabled by default
+        self.assertTrue(DEFAULT_SECTIONS["widely_read"])
+        self.assertTrue(DEFAULT_SECTIONS["long_reads"])
+        self.assertTrue(DEFAULT_SECTIONS["good_reads"])
+        self.assertTrue(DEFAULT_SECTIONS["global_shared"])
+        self.assertNotIn("quick_catchup", DEFAULT_SECTIONS)
+        self.assertNotIn("contrarian_views", DEFAULT_SECTIONS)
+        self.assertNotIn("emerging_topics", DEFAULT_SECTIONS)
+        self.assertNotIn("duplicates", DEFAULT_SECTIONS)
+        self.assertNotIn("trending_unread", DEFAULT_SECTIONS)
+        self.assertNotIn("trending_global", DEFAULT_SECTIONS)
+
+    def test_max_custom_sections(self):
+        self.assertEqual(MAX_CUSTOM_SECTIONS, 5)
+
+    # --- MBriefing ---
+
+    def test_create_and_retrieve(self):
+        briefing = self.make_briefing(
+            curated_hashes=["h1", "h2"],
+            curated_sections={"top_stories": ["h1", "h2"]},
+            section_summaries={"top_stories": "<div>Summary</div>"},
+        )
+        retrieved = MBriefing.objects.get(id=briefing.id)
+        self.assertEqual(retrieved.user_id, self.user.pk)
+        self.assertEqual(retrieved.curated_story_hashes, ["h1", "h2"])
+        self.assertEqual(retrieved.curated_sections["top_stories"], ["h1", "h2"])
+
+    def test_latest_for_user(self):
+        self.make_briefing(briefing_date=self.now - datetime.timedelta(days=2))
+        self.make_briefing(briefing_date=self.now - datetime.timedelta(days=1))
+        self.make_briefing(briefing_date=self.now, status="failed")
+
+        results = list(MBriefing.latest_for_user(self.user.pk, limit=10))
+        # tests.py: Only "complete" briefings should be returned
+        self.assertEqual(len(results), 2)
+        # tests.py: Should be ordered by date desc
+        self.assertGreater(results[0].briefing_date, results[1].briefing_date)
+
+    def test_latest_for_user_empty(self):
+        results = list(MBriefing.latest_for_user(self.user.pk))
+        self.assertEqual(len(results), 0)
+
+    def test_exists_for_period_true(self):
+        self.make_briefing(briefing_date=self.now)
+        self.assertTrue(
+            MBriefing.exists_for_period(
+                self.user.pk,
+                self.now - datetime.timedelta(hours=1),
+                self.now + datetime.timedelta(hours=1),
+            )
+        )
+
+    def test_exists_for_period_false(self):
+        self.assertFalse(
+            MBriefing.exists_for_period(
+                self.user.pk,
+                self.now - datetime.timedelta(hours=1),
+                self.now + datetime.timedelta(hours=1),
+            )
+        )
+
+    # --- MBriefingPreferences ---
+
+    def test_get_or_create_new(self):
+        prefs = MBriefingPreferences.get_or_create(self.user.pk)
+        self.assertEqual(prefs.user_id, self.user.pk)
+        self.assertEqual(prefs.frequency, "daily")
+
+    def test_get_or_create_existing(self):
+        prefs1 = MBriefingPreferences.get_or_create(self.user.pk)
+        prefs2 = MBriefingPreferences.get_or_create(self.user.pk)
+        self.assertEqual(prefs1.id, prefs2.id)
+
+    def test_default_values(self):
+        prefs = MBriefingPreferences.get_or_create(self.user.pk)
+        self.assertEqual(prefs.frequency, "daily")
+        self.assertTrue(prefs.enabled)
+        self.assertEqual(prefs.story_count, 5)
+
+    # --- ensure_briefing_feed ---
+
+    @patch("apps.briefing.models.redis.Redis")
+    def test_creates_new_feed(self, mock_redis_cls):
+        from apps.briefing.models import ensure_briefing_feed
+
+        mock_redis_cls.return_value = MagicMock()
+        feed = ensure_briefing_feed(self.user)
+        self.assertEqual(feed.feed_address, "daily-briefing:%s" % self.user.pk)
+        self.assertEqual(feed.feed_title, "Daily Briefing")
+
+    @patch("apps.briefing.models.redis.Redis")
+    def test_ensure_briefing_feed_idempotent(self, mock_redis_cls):
+        from apps.briefing.models import ensure_briefing_feed
+
+        mock_redis_cls.return_value = MagicMock()
+        feed1 = ensure_briefing_feed(self.user)
+        feed2 = ensure_briefing_feed(self.user)
+        self.assertEqual(feed1.pk, feed2.pk)
+
+    @patch("apps.briefing.models.redis.Redis")
+    def test_creates_subscription(self, mock_redis_cls):
+        from apps.briefing.models import ensure_briefing_feed
+
+        mock_redis_cls.return_value = MagicMock()
+        feed = ensure_briefing_feed(self.user)
+        self.assertTrue(UserSubscription.objects.filter(user=self.user, feed=feed).exists())
+
+    @patch("apps.briefing.models.redis.Redis")
+    def test_updates_prefs_feed_id(self, mock_redis_cls):
+        from apps.briefing.models import ensure_briefing_feed
+
+        mock_redis_cls.return_value = MagicMock()
+        feed = ensure_briefing_feed(self.user)
+        prefs = MBriefingPreferences.get_or_create(self.user.pk)
+        self.assertEqual(prefs.briefing_feed_id, feed.pk)
+
+    # --- create_briefing_story ---
+
+    @patch("apps.notifications.tasks.QueueNotifications")
+    @patch("apps.notifications.models.MUserFeedNotification")
+    @patch("apps.briefing.models.redis.Redis")
+    def test_creates_new_story_and_briefing(self, mock_redis_cls, mock_notif, mock_queue):
+        from apps.briefing.models import create_briefing_story
+
+        mock_redis_cls.return_value = MagicMock()
+        mock_notif.feed_has_users.return_value = 0
+
+        briefing, story = create_briefing_story(
+            self.feed,
+            self.user,
+            "<div>Summary</div>",
+            self.now,
+            ["h1", "h2"],
+        )
+        self.assertEqual(briefing.status, "complete")
+        self.assertEqual(briefing.curated_story_hashes, ["h1", "h2"])
+        self.assertIn("Daily Briefing", story.story_title)
+        MStory.objects(story_hash=story.story_hash).delete()
+
+    @patch("apps.notifications.tasks.QueueNotifications")
+    @patch("apps.notifications.models.MUserFeedNotification")
+    @patch("apps.briefing.models.redis.Redis")
+    def test_morning_afternoon_evening_titles(self, mock_redis_cls, mock_notif, mock_queue):
+        from apps.briefing.models import create_briefing_story
+
+        mock_redis_cls.return_value = MagicMock()
+        mock_notif.feed_has_users.return_value = 0
+
+        tz = pytz.timezone("America/New_York")
+        # tests.py: Test morning (6 AM ET = 11 AM UTC in winter)
+        morning_utc = (
+            tz.localize(datetime.datetime(2025, 1, 15, 6, 0)).astimezone(pytz.utc).replace(tzinfo=None)
+        )
+        briefing, story = create_briefing_story(self.feed, self.user, "<div>AM</div>", morning_utc, [])
+        self.assertTrue(story.story_title.startswith("Morning"))
+        MStory.objects(story_hash=story.story_hash).delete()
+
+        # tests.py: Test afternoon (2 PM ET = 7 PM UTC in winter)
+        afternoon_utc = (
+            tz.localize(datetime.datetime(2025, 1, 15, 14, 0)).astimezone(pytz.utc).replace(tzinfo=None)
+        )
+        briefing2, story2 = create_briefing_story(self.feed, self.user, "<div>PM</div>", afternoon_utc, [])
+        self.assertTrue(story2.story_title.startswith("Afternoon"))
+        MStory.objects(story_hash=story2.story_hash).delete()
+
+        # tests.py: Test evening (8 PM ET = 1 AM UTC next day in winter)
+        evening_utc = (
+            tz.localize(datetime.datetime(2025, 1, 15, 20, 0)).astimezone(pytz.utc).replace(tzinfo=None)
+        )
+        briefing3, story3 = create_briefing_story(self.feed, self.user, "<div>Eve</div>", evening_utc, [])
+        self.assertTrue(story3.story_title.startswith("Evening"))
+        MStory.objects(story_hash=story3.story_hash).delete()
+
+    @patch("apps.notifications.tasks.QueueNotifications")
+    @patch("apps.notifications.models.MUserFeedNotification")
+    @patch("apps.briefing.models.redis.Redis")
+    def test_sets_needs_unread_recalc(self, mock_redis_cls, mock_notif, mock_queue):
+        from apps.briefing.models import create_briefing_story
+
+        mock_redis_cls.return_value = MagicMock()
+        mock_notif.feed_has_users.return_value = 0
+
+        self.sub.needs_unread_recalc = False
+        self.sub.save()
+
+        create_briefing_story(self.feed, self.user, "<div>S</div>", self.now, [])
+        self.sub.refresh_from_db()
+        self.assertTrue(self.sub.needs_unread_recalc)
+        MStory.objects(story_feed_id=self.feed.pk, story_author_name="NewsBlur").delete()
+
+
+# ---------------------------------------------------------------------------
+# 4. Test_Views — apps/briefing/views.py
+# ---------------------------------------------------------------------------
+
+
+class Test_Views(BriefingTestCase):
+    """Tests for apps/briefing/views.py."""
+
+    # --- load_briefing_stories ---
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_load_accessible_by_non_staff(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = []
+
+        non_staff = User.objects.create_user(username="nostaff", password="testpass")
+        c = Client()
+        c.login(username="nostaff", password="testpass")
+        response = c.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        self.assertIn("briefings", data)
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_load_empty_briefings(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = []
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        self.assertEqual(data["briefings"], [])
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_load_returns_summary_story(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [False]
+
+        story = self.make_story(self.feed, "Briefing Summary", content="<div>Summary content</div>")
+        self.make_briefing(
+            summary_story_hash=story.story_hash, curated_hashes=[story.story_hash], slot="evening"
+        )
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        self.assertEqual(len(data["briefings"]), 1)
+        self.assertIsNotNone(data["briefings"][0]["summary_story"])
+        self.assertEqual(data["briefings"][0]["summary_story"]["story_title"], "Briefing Summary")
+        self.assertEqual(data["briefings"][0]["slot"], "evening")
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_non_premium_truncates(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [False] * 6
+
+        # tests.py: Set user as non-premium
+        profile = self.user.profile
+        profile.is_archive = False
+        profile.is_pro = False
+        profile.save()
+
+        hashes = [s.story_hash for s in self.stories]
+        self.make_briefing(curated_hashes=hashes)
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        self.assertTrue(data["is_preview"])
+        self.assertLessEqual(len(data["briefings"][0]["curated_story_hashes"]), 3)
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_premium_gets_all(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [False] * 7
+
+        hashes = [s.story_hash for s in self.stories]
+        self.make_briefing(curated_hashes=hashes)
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        self.assertFalse(data["is_preview"])
+        self.assertEqual(len(data["briefings"][0]["curated_story_hashes"]), 6)
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_load_hides_story_changes_by_default(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [False]
+
+        story = self.make_story(self.feed, "Story With Changes", content="<p>Old content.</p>")
+        story.story_content = "<p>Updated <ins>new</ins><del>old</del> content.</p>"
+        story.story_latest_content = "<p>Updated new content.</p>"
+        story.save()
+        self.make_briefing(curated_hashes=[story.story_hash])
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        rendered_story = data["briefings"][0]["curated_stories"][0]
+
+        self.assertTrue(rendered_story["has_modifications"])
+        self.assertEqual(rendered_story["story_content"], "<p>Updated new content.</p>")
+        self.assertNotIn("<ins", rendered_story["story_content"])
+        self.assertNotIn("<del", rendered_story["story_content"])
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_normalizes_section_keys(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [False]
+
+        # tests.py: Store legacy hyphenated keys in the briefing
+        self.make_briefing(
+            curated_sections={"top-stories": ["h1"]},
+            section_summaries={"top-stories": "<div>Test</div>"},
+        )
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        b = data["briefings"][0]
+        self.assertIn("top_stories", b["curated_sections"])
+        self.assertNotIn("top-stories", b["curated_sections"])
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_includes_preferences_when_not_enabled(self, mock_redis_cls):
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = []
+
+        # tests.py: Make sure prefs are not enabled and no briefings exist
+        self.make_prefs(enabled=False)
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        self.assertIn("preferences", data)
+        self.assertIn("frequency", data["preferences"])
+
+    @patch("apps.briefing.views.redis.Redis")
+    def test_load_includes_user_profiles_key(self, mock_redis_cls):
+        # tests.py: The client reads data.user_profiles to resolve briefing sharers
+        # and commenters into avatars. The key must always be present (empty is fine).
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [False]
+
+        story = self.make_story(self.feed, "Plain Story")
+        self.make_briefing(curated_hashes=[story.story_hash])
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+        self.assertIn("user_profiles", data)
+        self.assertIsInstance(data["user_profiles"], list)
+
+    @patch("apps.briefing.views.MSharedStory.stories_with_comments_and_profiles")
+    @patch("apps.briefing.views.redis.Redis")
+    def test_load_attaches_social_arrays_to_stories(self, mock_redis_cls, mock_social):
+        # tests.py: Reproduces the render_shares_friends crash. _story_to_dict/format_story
+        # sets the denormalized share_count but never shared_by_friends, so the client read
+        # undefined.length. The endpoint must run stories_with_comments_and_profiles so the
+        # story dict carries shared_by_friends and the response carries the sharer profile.
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_pipe = MagicMock()
+        mock_r.pipeline.return_value = mock_pipe
+        mock_pipe.execute.return_value = [False]
+
+        def fake_attach(stories, user_id, check_all=False):
+            for s in stories:
+                s["shared_by_friends"] = [42]
+                s["friend_shares"] = []
+            return stories, [{"user_id": 42, "username": "sharer"}]
+
+        mock_social.side_effect = fake_attach
+
+        story = self.make_story(self.feed, "Shared Story")
+        self.make_briefing(curated_hashes=[story.story_hash])
+
+        response = self.client.get(reverse("load-briefing-stories"))
+        data = json.decode(response.content)
+
+        rendered_story = data["briefings"][0]["curated_stories"][0]
+        self.assertEqual(rendered_story["shared_by_friends"], [42])
+        self.assertEqual(data["user_profiles"], [{"user_id": 42, "username": "sharer"}])
+
+    # --- briefing_preferences ---
+
+    def test_get_returns_defaults(self):
+        response = self.client.get(reverse("briefing-preferences"))
+        data = json.decode(response.content)
+        self.assertEqual(data["frequency"], "daily")
+        self.assertIn("sections", data)
+
+    def test_post_frequency(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"frequency": "weekly"})
+        data = json.decode(response.content)
+        self.assertEqual(data["frequency"], "weekly")
+
+    def test_post_invalid_frequency_ignored(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"frequency": "hourly"})
+        data = json.decode(response.content)
+        self.assertEqual(data["frequency"], "daily")
+
+    def test_post_preferred_time_morning(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"preferred_time": "morning"})
+        data = json.decode(response.content)
+        self.assertEqual(data["preferred_time"], "morning")
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertEqual(prefs.preferred_time, "08:30")
+
+    def test_post_preferred_time_auto(self):
+        self.make_prefs(preferred_time="08:30")
+        response = self.client.post(reverse("briefing-preferences"), {"preferred_time": "auto"})
+        data = json.decode(response.content)
+        self.assertEqual(data["preferred_time"], "morning")
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertIsNone(prefs.preferred_time)
+
+    def test_post_preferred_time_custom(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"preferred_time": "14:30"})
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertEqual(prefs.preferred_time, "14:30")
+
+    def test_post_enabled(self):
+        self.make_prefs(enabled=False)
+        response = self.client.post(reverse("briefing-preferences"), {"enabled": "true"})
+        data = json.decode(response.content)
+        self.assertTrue(data["enabled"])
+
+    def test_post_enabled_updates_reader_preference(self):
+        self.make_prefs(enabled=False)
+        self.client.post(reverse("briefing-preferences"), {"enabled": "true"})
+
+        self.user.profile.refresh_from_db()
+        preferences = json.decode(self.user.profile.preferences or "{}")
+        self.assertTrue(preferences["briefing_enabled"])
+
+    def test_post_story_count_valid(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"story_count": "10"})
+        data = json.decode(response.content)
+        self.assertEqual(data["story_count"], 10)
+
+    def test_post_story_count_invalid(self):
+        self.make_prefs(story_count=5)
+        response = self.client.post(reverse("briefing-preferences"), {"story_count": "7"})
+        data = json.decode(response.content)
+        self.assertEqual(data["story_count"], 5)
+
+    def test_post_sections_json(self):
+        self.make_prefs()
+        sections = {"top_stories": True, "long_read": False, "bogus_key": True}
+        response = self.client.post(
+            reverse("briefing-preferences"),
+            {"sections": stdlib_json.dumps(sections)},
+        )
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertTrue(prefs.sections["top_stories"])
+        self.assertFalse(prefs.sections["long_read"])
+        self.assertNotIn("bogus_key", prefs.sections)
+
+    def test_post_sections_invalid_json(self):
+        self.make_prefs(sections={"top_stories": True})
+        response = self.client.post(
+            reverse("briefing-preferences"),
+            {"sections": "not-json"},
+        )
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertTrue(prefs.sections["top_stories"])
+
+    def test_post_custom_prompts(self):
+        self.make_prefs()
+        prompts = ["Trump news", "AI developments", "Sports scores"]
+        response = self.client.post(
+            reverse("briefing-preferences"),
+            {"custom_section_prompts": stdlib_json.dumps(prompts)},
+        )
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertEqual(len(prefs.custom_section_prompts), 3)
+        self.assertEqual(prefs.custom_section_prompts[0], "Trump news")
+
+    def test_post_custom_prompts_empty_filtered(self):
+        self.make_prefs()
+        prompts = ["Trump news", "", "  ", "AI developments"]
+        response = self.client.post(
+            reverse("briefing-preferences"),
+            {"custom_section_prompts": stdlib_json.dumps(prompts)},
+        )
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertEqual(len(prefs.custom_section_prompts), 2)
+
+    def test_post_briefing_model_valid(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"briefing_model": "anthropic"})
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertEqual(prefs.briefing_model, "anthropic")
+
+    def test_post_briefing_model_legacy_key_resolves(self):
+        # Legacy keys ("haiku") from older clients resolve to the cheap tier
+        # ("openai"/Luna), not the Sonnet-class "anthropic" chat tier
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"briefing_model": "haiku"})
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertEqual(prefs.briefing_model, "openai")
+
+    def test_post_briefing_model_default_clears(self):
+        self.make_prefs(briefing_model="haiku")
+        response = self.client.post(reverse("briefing-preferences"), {"briefing_model": "default"})
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertIsNone(prefs.briefing_model)
+
+    def test_post_summary_style(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"summary_style": "editorial"})
+        data = json.decode(response.content)
+        self.assertEqual(data["summary_style"], "editorial")
+
+    def test_post_read_filter(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"read_filter": "focus"})
+        data = json.decode(response.content)
+        self.assertEqual(data["read_filter"], "focus")
+
+    def test_post_story_sources_folder(self):
+        self.make_prefs()
+        response = self.client.post(reverse("briefing-preferences"), {"story_sources": "folder:Tech"})
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertEqual(prefs.story_sources, "folder:Tech")
+
+    def test_migrates_focused_story_sources(self):
+        self.make_prefs(story_sources="focused", read_filter="unread")
+        response = self.client.get(reverse("briefing-preferences"))
+        data = json.decode(response.content)
+        self.assertEqual(data["story_sources"], "all")
+        self.assertEqual(data["read_filter"], "focus")
+
+    def test_time_display_mapping(self):
+        self.make_prefs(preferred_time="13:00")
+        response = self.client.get(reverse("briefing-preferences"))
+        data = json.decode(response.content)
+        self.assertEqual(data["preferred_time"], "afternoon")
+
+    # --- generate_briefing ---
+
+    @patch("apps.briefing.views.ensure_briefing_feed")
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    def test_generate_requires_post(self, mock_task, mock_feed):
+        response = self.client.get(reverse("generate-briefing"))
+        data = json.decode(response.content)
+        self.assertEqual(data["code"], -1)
+
+    @patch("apps.briefing.views.ensure_briefing_feed")
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    def test_generate_enables_briefing(self, mock_task, mock_feed):
+        mock_feed.return_value = self.feed
+        self.make_prefs(enabled=False)
+
+        response = self.client.post(reverse("generate-briefing"))
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertTrue(prefs.enabled)
+
+    @patch("apps.briefing.views.ensure_briefing_feed")
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    def test_generate_enables_reader_preference(self, mock_task, mock_feed):
+        mock_feed.return_value = self.feed
+        self.make_prefs(enabled=False)
+
+        self.client.post(reverse("generate-briefing"))
+        self.user.profile.refresh_from_db()
+        preferences = json.decode(self.user.profile.preferences or "{}")
+        self.assertTrue(preferences["briefing_enabled"])
+
+    def test_profile_preference_updates_briefing_enabled(self):
+        self.make_prefs(enabled=True)
+
+        self.client.post("/profile/set_preference", {"briefing_enabled": "false"})
+        prefs = MBriefingPreferences.objects.get(user_id=self.user.pk)
+        self.assertFalse(prefs.enabled)
+
+    @patch("apps.briefing.views.ensure_briefing_feed")
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    def test_generate_dispatches_task(self, mock_task, mock_feed):
+        mock_feed.return_value = self.feed
+        self.make_prefs()
+
+        response = self.client.post(reverse("generate-briefing"))
+        mock_task.delay.assert_called_once_with(self.user.pk, on_demand=True)
+
+    @patch("apps.briefing.views.ensure_briefing_feed")
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    def test_generate_returns_feed_id(self, mock_task, mock_feed):
+        mock_feed.return_value = self.feed
+        self.make_prefs()
+
+        response = self.client.post(reverse("generate-briefing"))
+        data = json.decode(response.content)
+        self.assertEqual(data["briefing_feed_id"], self.feed.pk)
+
+
+# ---------------------------------------------------------------------------
+# 5. Test_Tasks — apps/briefing/tasks.py
+# ---------------------------------------------------------------------------
+
+
+class Test_Tasks(BriefingTestCase):
+    """Tests for apps/briefing/tasks.py."""
+
+    # --- GenerateBriefings ---
+
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    @patch("redis.Redis")
+    def test_generate_all_acquires_lock(self, mock_redis_cls, mock_user_task):
+        from apps.briefing.tasks import GenerateBriefings
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+
+        self.make_prefs(enabled=True)
+        GenerateBriefings()
+        mock_r.set.assert_called_once_with("briefing:generate_all_lock", "1", nx=True, ex=50)
+
+    @patch("redis.Redis")
+    def test_generate_all_skips_if_locked(self, mock_redis_cls):
+        from apps.briefing.tasks import GenerateBriefings
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = False
+
+        GenerateBriefings()
+        # tests.py: If lock is held, nothing else should happen
+
+    @patch("apps.briefing.tasks.datetime")
+    @patch("apps.briefing.models.MBriefing")
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    @patch("redis.Redis")
+    def test_generate_all_dispatches_for_eligible(
+        self, mock_redis_cls, mock_user_task, mock_mbriefing, mock_dt
+    ):
+        import datetime as real_dt
+
+        import pytz
+
+        from apps.briefing.tasks import GenerateBriefings
+
+        # tests.py: Pin to 3 PM ET (20:00 UTC) so the morning slot check always passes
+        fake_utc = real_dt.datetime(2026, 3, 5, 20, 0, 0)
+        mock_dt.datetime.utcnow.return_value = fake_utc
+        mock_dt.datetime.now.side_effect = lambda tz=None: (
+            pytz.utc.localize(fake_utc).astimezone(tz) if tz else fake_utc
+        )
+        mock_dt.datetime.combine = real_dt.datetime.combine
+        mock_dt.timedelta = real_dt.timedelta
+        mock_dt.time = real_dt.time
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_mbriefing.slot_exists.return_value = False
+
+        self.make_prefs(enabled=True)
+        GenerateBriefings()
+        # tasks.py: Now dispatches with slot and local_date kwargs
+        call_args = mock_user_task.delay.call_args
+        self.assertEqual(call_args[0][0], self.user.pk)
+        self.assertIn(call_args[1]["slot"], ("morning", "afternoon", "evening"))
+        self.assertIsNotNone(call_args[1]["local_date"])
+
+    @patch("apps.briefing.tasks.GenerateUserBriefing")
+    @patch("redis.Redis")
+    def test_generate_all_skips_disabled(self, mock_redis_cls, mock_user_task):
+        from apps.briefing.tasks import GenerateBriefings
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+
+        self.make_prefs(enabled=False)
+        GenerateBriefings()
+        mock_user_task.delay.assert_not_called()
+
+    # --- GenerateUserBriefing ---
+
+    @patch("apps.briefing.models.create_briefing_story")
+    @patch("apps.briefing.summary.embed_briefing_icons")
+    @patch("apps.briefing.summary.filter_disabled_sections")
+    @patch("apps.briefing.summary.extract_section_story_hashes")
+    @patch("apps.briefing.summary.extract_section_summaries")
+    @patch("apps.briefing.summary.generate_briefing_summary")
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_full_pipeline(
+        self,
+        mock_redis_cls,
+        mock_feed,
+        mock_select,
+        mock_summary,
+        mock_extract_summaries,
+        mock_extract_hashes,
+        mock_filter,
+        mock_embed,
+        mock_create,
+    ):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+
+        mock_feed.return_value = self.feed
+        mock_select.return_value = self.make_scored_stories(self.stories[:5])
+        mock_summary.return_value = (
+            "<div>Summary</div>",
+            {"display_name": "Haiku", "input_tokens": 100, "output_tokens": 50},
+        )
+        mock_extract_summaries.return_value = {"top_stories": "<div>S</div>"}
+        mock_extract_hashes.return_value = {}
+        mock_filter.return_value = "<div>Filtered</div>"
+        mock_embed.return_value = "<div>Embedded</div>"
+        mock_create.return_value = (MagicMock(), MagicMock(story_hash="test:hash"))
+
+        self.make_prefs(enabled=True)
+        GenerateUserBriefing(self.user.pk)
+
+        mock_select.assert_called_once()
+        mock_summary.assert_called_once()
+        mock_create.assert_called_once()
+
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_too_few_stories(self, mock_redis_cls, mock_feed, mock_select):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+        mock_select.return_value = self.make_scored_stories(self.stories[:2])
+
+        self.make_prefs(enabled=True, frequency="daily")
+        GenerateUserBriefing(self.user.pk)
+        # tests.py: With only 2 stories and daily frequency (min 3), should skip
+
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_twice_daily_lower_threshold(self, mock_redis_cls, mock_feed, mock_select):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+        # tests.py: Only 1 story — should be enough for twice_daily (min 1)
+        mock_select.return_value = self.make_scored_stories(self.stories[:1])
+
+        self.make_prefs(enabled=True, frequency="twice_daily")
+
+        with patch("apps.briefing.summary.generate_briefing_summary") as mock_summary:
+            mock_summary.return_value = (
+                "<div>S</div>",
+                {"display_name": "H", "input_tokens": 10, "output_tokens": 5},
+            )
+            with patch("apps.briefing.summary.extract_section_summaries") as mock_es:
+                mock_es.return_value = {}
+                with patch("apps.briefing.summary.extract_section_story_hashes") as mock_eh:
+                    mock_eh.return_value = {}
+                    with patch("apps.briefing.summary.embed_briefing_icons") as mock_ei:
+                        mock_ei.return_value = "<div>S</div>"
+                        with patch("apps.briefing.models.create_briefing_story") as mock_cs:
+                            mock_cs.return_value = (MagicMock(), MagicMock(story_hash="t:h"))
+                            GenerateUserBriefing(self.user.pk)
+                            mock_summary.assert_called_once()
+
+    @patch("apps.briefing.summary.generate_briefing_summary")
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_summary_failure_exits(self, mock_redis_cls, mock_feed, mock_select, mock_summary):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+        mock_select.return_value = self.make_scored_stories(self.stories[:5])
+        mock_summary.return_value = (None, None)
+
+        self.make_prefs(enabled=True)
+        GenerateUserBriefing(self.user.pk)
+        # tests.py: No briefing should be created if summary fails
+
+    @patch("redis.Redis")
+    def test_user_briefing_acquires_per_user_lock(self, mock_redis_cls):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = False
+
+        GenerateUserBriefing(self.user.pk)
+        mock_r.set.assert_called_once_with("briefing:generate_user:%s" % self.user.pk, "1", nx=True, ex=840)
+
+    @patch("redis.Redis")
+    def test_user_briefing_user_not_found(self, mock_redis_cls):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+
+        # tests.py: Non-existent user ID should exit gracefully
+        GenerateUserBriefing(999999)
+
+    @patch("apps.briefing.models.create_briefing_story")
+    @patch("apps.briefing.summary.embed_briefing_icons")
+    @patch("apps.briefing.summary.extract_section_story_hashes")
+    @patch("apps.briefing.summary.extract_section_summaries")
+    @patch("apps.briefing.summary.filter_disabled_sections")
+    @patch("apps.briefing.summary.generate_briefing_summary")
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_filters_curated_sections(
+        self,
+        mock_redis_cls,
+        mock_feed,
+        mock_select,
+        mock_summary,
+        mock_filter,
+        mock_extract_summaries,
+        mock_extract_hashes,
+        mock_embed,
+        mock_create,
+    ):
+        """Regression test: disabled section keys should be remapped to top_stories in curated_sections."""
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+
+        scored = self.make_scored_stories(
+            self.stories[:3],
+            categories=["long_read", "follow_up", "top_stories"],
+        )
+        mock_select.return_value = scored
+        mock_summary.return_value = (
+            "<div>S</div>",
+            {"display_name": "H", "input_tokens": 10, "output_tokens": 5},
+        )
+        mock_filter.return_value = "<div>Filtered</div>"
+        mock_extract_summaries.return_value = {"top_stories": "<div>T</div>"}
+        mock_extract_hashes.return_value = {}
+        mock_embed.return_value = "<div>Embedded</div>"
+        mock_create.return_value = (MagicMock(), MagicMock(story_hash="test:hash"))
+
+        # tests.py: Disable long_read and follow_up sections
+        sections = dict(DEFAULT_SECTIONS)
+        sections["long_read"] = False
+        sections["follow_up"] = False
+        self.make_prefs(enabled=True, sections=sections)
+
+        GenerateUserBriefing(self.user.pk)
+
+        # tests.py: Check curated_sections passed to create_briefing_story
+        create_args = mock_create.call_args
+        curated_sections = (
+            create_args[1].get("curated_sections") or create_args[0][7]
+            if len(create_args[0]) > 7
+            else create_args[1].get("curated_sections")
+        )
+        # tests.py: long_read and follow_up should NOT be in curated_sections
+        self.assertNotIn("long_read", curated_sections)
+        self.assertNotIn("follow_up", curated_sections)
+        # tests.py: Their stories should be remapped to top_stories
+        self.assertIn("top_stories", curated_sections)
+
+    @patch("apps.briefing.models.create_briefing_story")
+    @patch("apps.briefing.summary.embed_briefing_icons")
+    @patch("apps.briefing.summary.extract_section_story_hashes")
+    @patch("apps.briefing.summary.extract_section_summaries")
+    @patch("apps.briefing.summary.filter_disabled_sections")
+    @patch("apps.briefing.summary.generate_briefing_summary")
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_appends_debug_footer(
+        self,
+        mock_redis_cls,
+        mock_feed,
+        mock_select,
+        mock_summary,
+        mock_filter,
+        mock_extract_summaries,
+        mock_extract_hashes,
+        mock_embed,
+        mock_create,
+    ):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+        mock_select.return_value = self.make_scored_stories(self.stories[:5])
+        mock_summary.return_value = (
+            "<div>S</div>",
+            {"display_name": "Haiku 3.5", "input_tokens": 500, "output_tokens": 200},
+        )
+        mock_extract_summaries.return_value = {}
+        mock_extract_hashes.return_value = {}
+        mock_filter.return_value = "<div>Filtered</div>"
+
+        mock_embed.side_effect = lambda html, stories: html
+        mock_create.return_value = (MagicMock(), MagicMock(story_hash="test:hash"))
+
+        self.make_prefs(enabled=True)
+        GenerateUserBriefing(self.user.pk)
+
+        # tests.py: Debug footer is appended after embed, so check create_briefing_story's 3rd arg (summary_html)
+        create_call = mock_create.call_args
+        html_arg = create_call[0][2]
+        self.assertIn("NB-briefing-debug", html_arg)
+        self.assertIn("Haiku 3.5", html_arg)
+
+    @patch("apps.briefing.models.create_briefing_story")
+    @patch("apps.briefing.summary.embed_briefing_icons")
+    @patch("apps.briefing.summary.extract_section_story_hashes")
+    @patch("apps.briefing.summary.extract_section_summaries")
+    @patch("apps.briefing.summary.filter_disabled_sections")
+    @patch("apps.briefing.summary.generate_briefing_summary")
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_on_demand_deletes_lock(
+        self,
+        mock_redis_cls,
+        mock_feed,
+        mock_select,
+        mock_summary,
+        mock_filter,
+        mock_extract_summaries,
+        mock_extract_hashes,
+        mock_embed,
+        mock_create,
+    ):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+        mock_select.return_value = self.make_scored_stories(self.stories[:5])
+        mock_summary.return_value = (
+            "<div>S</div>",
+            {"display_name": "H", "input_tokens": 10, "output_tokens": 5},
+        )
+        mock_extract_summaries.return_value = {}
+        mock_extract_hashes.return_value = {}
+        mock_filter.return_value = "<div>F</div>"
+        mock_embed.return_value = "<div>E</div>"
+        mock_create.return_value = (MagicMock(), MagicMock(story_hash="test:hash"))
+
+        self.make_prefs(enabled=True)
+        GenerateUserBriefing(self.user.pk, on_demand=True)
+
+        lock_key = "briefing:generate_user:%s" % self.user.pk
+        mock_r.delete.assert_called_with(lock_key)
+
+    @patch("apps.briefing.models.create_briefing_story")
+    @patch("apps.briefing.summary.embed_briefing_icons")
+    @patch("apps.briefing.summary.extract_section_story_hashes")
+    @patch("apps.briefing.summary.extract_section_summaries")
+    @patch("apps.briefing.summary.filter_disabled_sections")
+    @patch("apps.briefing.summary.generate_briefing_summary")
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_scheduled_keeps_lock(
+        self,
+        mock_redis_cls,
+        mock_feed,
+        mock_select,
+        mock_summary,
+        mock_filter,
+        mock_extract_summaries,
+        mock_extract_hashes,
+        mock_embed,
+        mock_create,
+    ):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+        mock_select.return_value = self.make_scored_stories(self.stories[:5])
+        mock_summary.return_value = (
+            "<div>S</div>",
+            {"display_name": "H", "input_tokens": 10, "output_tokens": 5},
+        )
+        mock_extract_summaries.return_value = {}
+        mock_extract_hashes.return_value = {}
+        mock_filter.return_value = "<div>F</div>"
+        mock_embed.return_value = "<div>E</div>"
+        mock_create.return_value = (MagicMock(), MagicMock(story_hash="test:hash"))
+
+        self.make_prefs(enabled=True)
+        GenerateUserBriefing(self.user.pk, on_demand=False)
+
+        mock_r.delete.assert_not_called()
+
+    @patch("apps.briefing.models.create_briefing_story")
+    @patch("apps.briefing.summary.embed_briefing_icons")
+    @patch("apps.briefing.summary.extract_section_story_hashes")
+    @patch("apps.briefing.summary.extract_section_summaries")
+    @patch("apps.briefing.summary.filter_disabled_sections")
+    @patch("apps.briefing.summary.generate_briefing_summary")
+    @patch("apps.briefing.scoring.select_briefing_stories")
+    @patch("apps.briefing.models.ensure_briefing_feed")
+    @patch("redis.Redis")
+    def test_user_briefing_on_demand_publishes_events(
+        self,
+        mock_redis_cls,
+        mock_feed,
+        mock_select,
+        mock_summary,
+        mock_filter,
+        mock_extract_summaries,
+        mock_extract_hashes,
+        mock_embed,
+        mock_create,
+    ):
+        from apps.briefing.tasks import GenerateUserBriefing
+
+        mock_r = MagicMock()
+        mock_redis_cls.return_value = mock_r
+        mock_r.set.return_value = True
+        mock_feed.return_value = self.feed
+        mock_select.return_value = self.make_scored_stories(self.stories[:5])
+        mock_summary.return_value = (
+            "<div>S</div>",
+            {"display_name": "H", "input_tokens": 10, "output_tokens": 5},
+        )
+        mock_extract_summaries.return_value = {}
+        mock_extract_hashes.return_value = {}
+        mock_filter.return_value = "<div>F</div>"
+        mock_embed.return_value = "<div>E</div>"
+        mock_create.return_value = (MagicMock(), MagicMock(story_hash="test:hash"))
+
+        self.make_prefs(enabled=True)
+        GenerateUserBriefing(self.user.pk, on_demand=True)
+
+        # tests.py: Check pubsub events were published
+        publish_calls = [c for c in mock_r.publish.call_args_list]
+        published_messages = [c[0][1] for c in publish_calls]
+        published_types = []
+        for msg in published_messages:
+            if isinstance(msg, str) and msg.startswith("briefing:"):
+                import json as j
+
+                payload = j.loads(msg[len("briefing:") :])
+                published_types.append(payload["type"])
+        self.assertIn("start", published_types)
+        self.assertIn("complete", published_types)
+
+
+# ---------------------------------------------------------------------------

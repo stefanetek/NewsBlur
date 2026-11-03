@@ -1,9 +1,19 @@
+"""Notification models: per-feed and per-classifier notification settings and device token storage.
+
+MUserFeedNotification configures which feeds trigger push notifications and
+at what frequency. MUserClassifierNotification configures which individual
+classifiers (title, author, tag, text, url, and Natural Language AI prompts)
+trigger push notifications. MUserNotificationTokens stores iOS APNS and Android
+push tokens for delivering notifications.
+"""
+
 import datetime
 import enum
 import html
 import os
 import re
 import urllib.parse
+from collections import defaultdict
 
 import mongoengine as mongo
 import redis
@@ -13,6 +23,8 @@ from django.contrib.auth.models import User
 from django.contrib.sites.models import Site
 from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
+from django.utils.text import format_lazy
+from django.utils.translation import pgettext_lazy
 from pyapns_client import (
     APNSClient,
     APNSDeviceException,
@@ -27,6 +39,7 @@ from pyapns_client import (
 from apps.analyzer.models import (
     MClassifierAuthor,
     MClassifierFeed,
+    MClassifierPrompt,
     MClassifierTag,
     MClassifierText,
     MClassifierTitle,
@@ -35,11 +48,24 @@ from apps.analyzer.models import (
 from apps.reader.models import UserSubscription
 
 # from django.utils.html import strip_tags
-from apps.rss_feeds.models import Feed, MStory
+from apps.rss_feeds.models import Feed, MStory, renew_merge_feeds_locks
 from utils import log as logging
 from utils import mongoengine_fields
+from utils.languages import account_translation
 from utils.story_functions import truncate_chars
 from utils.view_functions import is_true
+
+# notifications/models.py names the classifier behind a notification email in the recipient's language, since
+# the email renders after the match is described.
+CLASSIFIER_MATCH_LABELS = {
+    "title": pgettext_lazy("notification email classifier match", "Title"),
+    "author": pgettext_lazy("notification email classifier match", "Author"),
+    "tag": pgettext_lazy("notification email classifier match", "Tag"),
+    "text": pgettext_lazy("notification email classifier match", "Text"),
+    "url": pgettext_lazy("notification email classifier match", "URL"),
+    "prompt": pgettext_lazy("notification email classifier match", "AI text filter"),
+    "image_prompt": pgettext_lazy("notification email classifier match", "AI image filter"),
+}
 
 
 class NotificationFrequency(enum.Enum):
@@ -154,6 +180,47 @@ class MUserFeedNotification(mongo.Document):
         return notifications_by_feed
 
     @classmethod
+    def switch_feed(cls, original_feed_id, duplicate_feed_id):
+        """Migrate notification settings from duplicate feed to original feed."""
+        duplicate_notifications = cls.objects.filter(feed_id=duplicate_feed_id)
+        count = duplicate_notifications.count()
+        if count:
+            logging.info(
+                " ---> Switching %s notification settings from feed %s to %s"
+                % (count, duplicate_feed_id, original_feed_id)
+            )
+            for notification in duplicate_notifications:
+                renew_merge_feeds_locks()
+                # Check if user already has notifications for the original feed
+                try:
+                    existing = cls.objects.get(user_id=notification.user_id, feed_id=original_feed_id)
+                    # Merge notification settings - keep any enabled setting
+                    existing.is_email = existing.is_email or notification.is_email
+                    existing.is_web = existing.is_web or notification.is_web
+                    existing.is_ios = existing.is_ios or notification.is_ios
+                    existing.is_android = existing.is_android or notification.is_android
+                    existing.is_focus = existing.is_focus or notification.is_focus
+                    if notification.frequency and not existing.frequency:
+                        existing.frequency = notification.frequency
+                    if notification.last_notification_date and (
+                        not existing.last_notification_date
+                        or notification.last_notification_date > existing.last_notification_date
+                    ):
+                        existing.last_notification_date = notification.last_notification_date
+                    # Merge iOS tokens
+                    if notification.ios_tokens:
+                        existing_tokens = set(existing.ios_tokens or [])
+                        existing_tokens.update(notification.ios_tokens)
+                        existing.ios_tokens = list(existing_tokens)
+                    existing.save()
+                    notification.delete()
+                except cls.DoesNotExist:
+                    # No existing notification, just update feed_id
+                    notification.feed_id = original_feed_id
+                    notification.save()
+        return count
+
+    @classmethod
     def push_feed_notifications(cls, feed_id, new_stories, force=False):
         feed = Feed.get_by_id(feed_id)
         notifications = MUserFeedNotification.users_for_feed(feed.pk)
@@ -211,7 +278,9 @@ class MUserFeedNotification(mongo.Document):
 
                 story["story_content"] = html.unescape(story["story_content"])
 
-                sent = user_feed_notification.push_story_notification(story, classifiers, usersub)
+                sent = user_feed_notification.push_story_notification(
+                    story, classifiers, usersub, force=force
+                )
                 if sent:
                     sent_count += 1
                     total_sent_count += 1
@@ -277,7 +346,7 @@ class MUserFeedNotification(mongo.Document):
 
         return title, subtitle, body
 
-    def push_story_notification(self, story, classifiers, usersub):
+    def push_story_notification(self, story, classifiers, usersub, force=False):
         story_score = self.story_score(story, classifiers)
         if self.is_focus and story_score <= 0:
             if settings.DEBUG:
@@ -289,16 +358,46 @@ class MUserFeedNotification(mongo.Document):
             return False
 
         user = User.objects.get(pk=self.user_id)
+        channels_to_send = MUserClassifierNotification.claim_story_channels(
+            self.user_id,
+            story["story_hash"],
+            is_email=self.is_email,
+            is_web=self.is_web,
+            is_ios=self.is_ios,
+            is_android=self.is_android,
+            force=force,
+        )
+        if not any(channels_to_send.values()):
+            return False
+
         logging.user(
             user,
             "~FCSending push notification: %s/%s (score: %s)"
             % (story["story_title"][:40], story["story_hash"], story_score),
         )
 
-        self.send_web(story, user)
-        self.send_ios(story, user, usersub)
-        self.send_android(story)
-        self.send_email(story, usersub)
+        original_channels = (self.is_email, self.is_web, self.is_ios, self.is_android)
+        try:
+            self.is_email = channels_to_send.get("email", False)
+            self.is_web = channels_to_send.get("web", False)
+            self.is_ios = channels_to_send.get("ios", False)
+            self.is_android = channels_to_send.get("android", False)
+
+            self.send_web(story, user)
+            self.send_ios(story, user, usersub)
+            self.send_android(story)
+            self.send_email(story, usersub)
+
+            MUserClassifierNotification.mark_story_sent(
+                self.user_id,
+                story["story_hash"],
+                is_email=channels_to_send.get("email", False),
+                is_web=channels_to_send.get("web", False),
+                is_ios=channels_to_send.get("ios", False),
+                is_android=channels_to_send.get("android", False),
+            )
+        finally:
+            self.is_email, self.is_web, self.is_ios, self.is_android = original_channels
 
         return True
 
@@ -371,12 +470,14 @@ class MUserFeedNotification(mongo.Document):
             }
             if image_url:
                 custom_data["image_url"] = image_url
+            if usersub.feed.is_daily_briefing:
+                custom_data["is_daily_briefing"] = True
 
             payload = IOSPayload(
                 alert=alert,
                 custom=custom_data,
                 category="STORY_CATEGORY",
-                mutable_content=image_url is not None,
+                mutable_content=True,
             )
             notification = IOSNotification(payload=payload, topic="com.newsblur.NewsBlur")
 
@@ -414,7 +515,7 @@ class MUserFeedNotification(mongo.Document):
         if not self.is_android:
             return
 
-    def send_email(self, story, usersub):
+    def send_email(self, story, usersub, classifier_match_desc=None):
         if not self.is_email:
             return
 
@@ -434,18 +535,32 @@ class MUserFeedNotification(mongo.Document):
         feed = usersub.feed
         story_content = self.sanitize_story(story["story_content"])
 
+        # models.py: Use briefing.svg icon for daily briefing feeds (no MFeedIcon data)
+        if feed.is_daily_briefing:
+            favicon_url = "https://%s/media/img/icons/nouns/briefing.svg" % (
+                Site.objects.get_current().domain,
+            )
+        else:
+            favicon_url = feed.favicon_url_fqdn
+
         params = {
             "story": story,
             "story_content": story_content,
             "feed": feed,
             "feed_title": usersub.user_title or feed.feed_title,
             "favicon_border": feed.favicon_color,
+            "favicon_url": favicon_url,
+            "classifier_match_desc": classifier_match_desc,
         }
         from_address = "notifications@newsblur.com"
         to_address = "%s <%s>" % (usersub.user.username, usersub.user.email)
-        text = render_to_string("mail/email_story_notification.txt", params)
-        html = render_to_string("mail/email_story_notification.xhtml", params)
-        subject = "%s: %s" % (usersub.user_title or usersub.feed.feed_title, story["story_title"])
+        with account_translation(usersub.user.profile):
+            text = render_to_string("mail/email_story_notification.txt", params)
+            html = render_to_string("mail/email_story_notification.xhtml", params)
+        if feed.is_daily_briefing:
+            subject = story["story_title"]
+        else:
+            subject = "%s: %s" % (usersub.user_title or feed.feed_title, story["story_title"])
         subject = subject.replace("\n", " ")
         msg = EmailMultiAlternatives(
             subject, text, from_email="NewsBlur <%s>" % from_address, to=[to_address]
@@ -503,6 +618,520 @@ class MUserFeedNotification(mongo.Document):
             classifier_tags=classifiers.get("tags", []),
             classifier_texts=classifiers.get("texts", []),
             classifier_feeds=classifiers.get("feeds", []),
+            classifier_urls=classifiers.get("urls", []),
         )
 
         return score
+
+
+class MUserClassifierNotification(mongo.Document):
+    """A user's notification settings for a specific classifier.
+
+    Covers the classic classifiers (title, author, tag, text, url) and the
+    Natural Language AI prompt classifiers (prompt = text classifier,
+    image_prompt = image classifier), where classifier_value holds the prompt
+    text. When a new story matches this classifier, a notification is sent via
+    the selected channels. Premium Archive only. Coexists with per-feed
+    notifications and deduplicates per story+channel via Redis keys.
+    """
+
+    user_id = mongo.IntField()
+    classifier_type = mongo.StringField()  # title, author, tag, text, url, prompt, image_prompt
+    classifier_value = mongo.StringField(max_length=2048)
+    scope = mongo.StringField(default="feed")  # feed, folder, global
+    feed_id = mongo.IntField(default=0)  # non-zero for feed-scoped classifiers
+    folder_name = mongo.StringField(default="")  # non-empty for folder-scoped
+    is_regex = mongo.BooleanField(default=False)  # title, text, url, author only (Pro feature)
+    is_email = mongo.BooleanField(default=False)
+    is_web = mongo.BooleanField(default=False)
+    is_ios = mongo.BooleanField(default=False)
+    is_android = mongo.BooleanField(default=False)
+    last_notification_date = mongo.DateTimeField(default=datetime.datetime.now)
+
+    meta = {
+        "collection": "classifier_notifications",
+        "indexes": [
+            "feed_id",
+            "user_id",
+            ("user_id", "scope"),
+            {
+                "fields": [
+                    "user_id",
+                    "classifier_type",
+                    "classifier_value",
+                    "is_regex",
+                    "scope",
+                    "feed_id",
+                    "folder_name",
+                ],
+                "unique": True,
+            },
+        ],
+        "allow_inheritance": False,
+    }
+
+    def __str__(self):
+        types = []
+        if self.is_email:
+            types.append("email")
+        if self.is_web:
+            types.append("web")
+        if self.is_ios:
+            types.append("ios")
+        if self.is_android:
+            types.append("android")
+        return "User %s: %s/%s (%s/%s) -> %s" % (
+            self.user_id,
+            self.classifier_type,
+            self.classifier_value[:30],
+            self.scope,
+            self.feed_id or self.folder_name or "global",
+            ",".join(types),
+        )
+
+    @property
+    def notification_types(self):
+        types = []
+        if self.is_email:
+            types.append("email")
+        if self.is_web:
+            types.append("web")
+        if self.is_ios:
+            types.append("ios")
+        if self.is_android:
+            types.append("android")
+        return types
+
+    # ------------------------------------------------------------------
+    # Lookup helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def feed_has_users(cls, feed_id):
+        """Check if any classifier notification could fire for stories in this feed."""
+        # Fast path: feed-scoped notifications with this exact feed_id
+        if cls.objects.filter(scope="feed", feed_id=feed_id).limit(1).count():
+            return True
+
+        # Slower path: check if any user with folder/global scoped notifications
+        # is subscribed to this feed. Since classifier notifications are Archive-only,
+        # the count of scoped_user_ids is expected to be very small.
+        scoped_user_ids = list(cls.objects.filter(scope__in=["folder", "global"]).distinct("user_id"))
+        if not scoped_user_ids:
+            return False
+
+        return UserSubscription.objects.filter(feed_id=feed_id, user_id__in=scoped_user_ids).exists()
+
+    @classmethod
+    def for_user(cls, user_id):
+        """Return all classifier notifications for a user, keyed for frontend consumption."""
+        notifications = cls.objects.filter(user_id=user_id)
+        result = {}
+        for notif in notifications:
+            key = "%s:%s:%s:%s:%s:%s" % (
+                notif.classifier_type,
+                notif.classifier_value,
+                "regex" if notif.is_regex else "",
+                notif.scope,
+                notif.feed_id,
+                notif.folder_name,
+            )
+            result[key] = {
+                "classifier_type": notif.classifier_type,
+                "classifier_value": notif.classifier_value,
+                "is_regex": notif.is_regex,
+                "scope": notif.scope,
+                "feed_id": notif.feed_id,
+                "folder_name": notif.folder_name,
+                "notification_types": notif.notification_types,
+            }
+        return result
+
+    # ------------------------------------------------------------------
+    # Dedup helpers (shared between feed and classifier notifications)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def mark_story_sent(
+        cls, user_id, story_hash, is_email=False, is_web=False, is_ios=False, is_android=False
+    ):
+        """Mark channels as sent for a story so notification triggers don't re-send."""
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+        for channel in cls.active_channels(is_email, is_web, is_ios, is_android):
+            r.setex(cls.story_sent_key(user_id, story_hash, channel), cls.story_sent_ttl(), 1)
+
+    @classmethod
+    def active_channels(cls, is_email=False, is_web=False, is_ios=False, is_android=False):
+        channels = []
+        if is_email:
+            channels.append("email")
+        if is_web:
+            channels.append("web")
+        if is_ios:
+            channels.append("ios")
+        if is_android:
+            channels.append("android")
+        return channels
+
+    @classmethod
+    def story_sent_key(cls, user_id, story_hash, channel):
+        return "story_notified:%s:%s:%s" % (user_id, story_hash, channel)
+
+    @classmethod
+    def story_sent_ttl(cls):
+        return 60 * 60 * 24
+
+    @classmethod
+    def story_claim_ttl(cls):
+        return 60 * 15
+
+    @classmethod
+    def claim_story_channels(
+        cls, user_id, story_hash, is_email=False, is_web=False, is_ios=False, is_android=False, force=False
+    ):
+        """Atomically claim story+channel notifications before sending."""
+        channels_to_send = {}
+        for channel in cls.active_channels(is_email, is_web, is_ios, is_android):
+            channels_to_send[channel] = False
+
+        if force:
+            for channel in channels_to_send:
+                channels_to_send[channel] = True
+            return channels_to_send
+
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+        for channel in channels_to_send:
+            key = cls.story_sent_key(user_id, story_hash, channel)
+            channels_to_send[channel] = bool(r.set(key, "sending", nx=True, ex=cls.story_claim_ttl()))
+
+        return channels_to_send
+
+    @classmethod
+    def check_story_sent(cls, user_id, story_hash, channel):
+        """Check if a notification was already sent for this story+channel."""
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+        key = cls.story_sent_key(user_id, story_hash, channel)
+        return r.exists(key)
+
+    # ------------------------------------------------------------------
+    # Classifier matching
+    # ------------------------------------------------------------------
+
+    def applies_to_feed(self, story_feed_id, folder_feed_ids=None):
+        """Whether this notification's scope covers the given feed.
+
+        Args:
+            story_feed_id: The feed_id to test against this notification's scope.
+            folder_feed_ids: Dict of {folder_name: set(feed_ids)} for folder scope.
+        """
+        if self.scope == "feed":
+            return self.feed_id == story_feed_id
+        if self.scope == "folder":
+            if not folder_feed_ids:
+                return False
+            return story_feed_id in folder_feed_ids.get(self.folder_name, set())
+        # scope == "global" always applies
+        return True
+
+    def resolve_prompt_classifier(self):
+        """Resolve the focus MClassifierPrompt this prompt notification refers to.
+
+        Prompt notifications store the prompt text in classifier_value. Only
+        focus prompts can be notified on (notifying about a story that matches a
+        hide prompt is contradictory), so hidden prompts never resolve.
+        Returns the matching MClassifierPrompt, or None.
+        """
+        if self.classifier_type not in ("prompt", "image_prompt"):
+            return None
+
+        query = {
+            "user_id": self.user_id,
+            "prompt": self.classifier_value,
+            "include_images": self.classifier_type == "image_prompt",
+            "classifier_type": "focus",
+        }
+        if self.scope == "feed":
+            query["feed_id"] = self.feed_id
+            query["folder_id"] = ""
+        elif self.scope == "folder":
+            query["feed_id"] = 0
+            query["folder_id"] = self.folder_name
+        else:  # global
+            query["feed_id"] = 0
+            query["folder_id"] = ""
+
+        return MClassifierPrompt.objects(**query).first()
+
+    def matches_story(self, story, story_feed_id, folder_feed_ids=None, prompt_scores=None):
+        """Check if this classifier notification matches a story.
+
+        Args:
+            story: Story dict with standard fields
+            story_feed_id: The feed_id of the story
+            folder_feed_ids: Dict of {folder_name: set(feed_ids)} for scope resolution
+            prompt_scores: Dict of {notification.pk: {story_hash: ai_score}} with
+                cached AI prompt-classifier scores, used to match prompt and
+                image_prompt notifications.
+        """
+        # Check scope applicability
+        if not self.applies_to_feed(story_feed_id, folder_feed_ids):
+            return False
+
+        # Natural Language AI classifiers match via cached LLM scores rather
+        # than text. A focus prompt matches when the AI scored the story a 1.
+        if self.classifier_type in ("prompt", "image_prompt"):
+            if not prompt_scores:
+                return False
+            notif_scores = prompt_scores.get(self.pk) or {}
+            return notif_scores.get(story.get("story_hash")) == 1
+
+        # Check classifier value match
+        if self.is_regex:
+            from apps.analyzer.models import safe_regex_match
+
+        if self.classifier_type == "title":
+            story_title = story.get("story_title", "")
+            if not story_title:
+                return False
+            if self.is_regex:
+                return safe_regex_match(self.classifier_value, story_title)
+            return self.classifier_value.lower() in story_title.lower()
+        elif self.classifier_type == "author":
+            story_authors = story.get("story_authors", "") or ""
+            if self.is_regex:
+                if not story_authors:
+                    return False
+                return safe_regex_match(self.classifier_value, story_authors)
+            return story_authors == self.classifier_value
+        elif self.classifier_type == "tag":
+            return self.classifier_value in (story.get("story_tags") or [])
+        elif self.classifier_type == "text":
+            story_content = story.get("story_content", "")
+            original_text = story.get("original_text", "")
+            combined = story_content + " " + original_text
+            if not combined.strip():
+                return False
+            if self.is_regex:
+                return safe_regex_match(self.classifier_value, combined)
+            return self.classifier_value.lower() in combined.lower()
+        elif self.classifier_type == "url":
+            story_permalink = story.get("story_permalink", "")
+            if not story_permalink:
+                return False
+            if self.is_regex:
+                return safe_regex_match(self.classifier_value, story_permalink)
+            return self.classifier_value.lower() in story_permalink.lower()
+        return False
+
+    # ------------------------------------------------------------------
+    # Notification processing
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def push_classifier_notifications(cls, feed_id, new_stories, force=False):
+        """Process classifier notifications for new stories in a feed."""
+        from apps.reader.models import UserSubscriptionFolders
+
+        feed = Feed.get_by_id(feed_id)
+        if not feed:
+            return 0, 0
+
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+
+        # Get new stories
+        latest_story_hashes = r.zrange("zF:%s" % feed.pk, -1 * new_stories, -1)
+        mstories = MStory.objects.filter(story_hash__in=latest_story_hashes).order_by("-story_date")
+        stories = Feed.format_stories(mstories)
+        if not stories:
+            return 0, 0
+
+        # Collect applicable classifier notifications for this feed
+        # 1. Feed-scoped: direct index lookup
+        feed_scoped = list(cls.objects.filter(scope="feed", feed_id=feed_id))
+
+        # 2. Folder/global-scoped: find users subscribed to this feed who have
+        #    folder or global classifier notifications
+        subscriber_user_ids = list(
+            UserSubscription.objects.filter(feed_id=feed_id).values_list("user_id", flat=True)
+        )
+        scoped_notifs = []
+        if subscriber_user_ids:
+            scoped_notifs = list(
+                cls.objects.filter(
+                    scope__in=["folder", "global"],
+                    user_id__in=subscriber_user_ids,
+                )
+            )
+
+        all_notifs = feed_scoped + scoped_notifs
+        if not all_notifs:
+            return 0, 0
+
+        # Group by user
+        by_user = defaultdict(list)
+        for notif in all_notifs:
+            by_user[notif.user_id].append(notif)
+
+        logging.debug(
+            "   ---> [%-30s] ~FCPushing classifier notifications to ~SB%s users~SN "
+            "for ~FB~SB%s stories" % (feed, len(by_user), new_stories)
+        )
+
+        total_sent_count = 0
+
+        for user_id, user_notifs in by_user.items():
+            try:
+                user = User.objects.get(pk=user_id)
+            except User.DoesNotExist:
+                continue
+
+            # Archive gating
+            if not user.profile.is_archive:
+                continue
+
+            # Skip inactive users
+            months_ago = datetime.datetime.now() - datetime.timedelta(days=90)
+            if user.profile.last_seen_on < months_ago:
+                continue
+
+            # Resolve folder scope
+            folder_feed_ids = None
+            has_folder_scope = any(n.scope == "folder" for n in user_notifs)
+            if has_folder_scope:
+                try:
+                    usf = UserSubscriptionFolders.objects.get(user_id=user_id)
+                    folder_feed_ids = usf.flatten_folders()
+                except UserSubscriptionFolders.DoesNotExist:
+                    pass
+
+            # Get usersub for notification formatting
+            try:
+                usersub = UserSubscription.objects.get(user=user_id, feed=feed_id)
+            except UserSubscription.DoesNotExist:
+                continue
+
+            # Warm AI prompt-classifier score caches and resolve per-notification
+            # scores for any Natural Language (prompt/image_prompt) notifications.
+            # Only consider prompt notifications whose scope covers this feed —
+            # a folder-scoped notification is collected for every feed the user
+            # subscribes to, and warming it elsewhere would run billable AI
+            # scoring for feeds it can never notify on.
+            prompt_scores = {}
+            prompt_notifs = [
+                notif
+                for notif in user_notifs
+                if notif.classifier_type in ("prompt", "image_prompt")
+                and notif.applies_to_feed(feed_id, folder_feed_ids)
+            ]
+            if prompt_notifs:
+                story_hashes = [story["story_hash"] for story in stories]
+                try:
+                    # classify_stories is cache-aware: cheap cache reads when the
+                    # feed fetch already classified these stories, real AI work
+                    # only if that step was skipped or raced ahead of this task.
+                    MClassifierPrompt.classify_stories(user_id, stories, feed_ids=[feed_id])
+                    for notif in prompt_notifs:
+                        prompt = notif.resolve_prompt_classifier()
+                        if not prompt:
+                            continue
+                        prompt_scores[notif.pk] = MClassifierPrompt.get_cached_scores(
+                            user_id, str(prompt.id), feed_id, story_hashes
+                        )
+                except Exception:
+                    logging.debug(
+                        "   ---> [%-30s] ~FRError scoring prompt notifications for user %s" % (feed, user_id)
+                    )
+
+            # Track per-classifier send counts: cap at 3 stories per classifier per update
+            classifier_send_counts = {notif.pk: 0 for notif in user_notifs}
+
+            for story in stories:
+                story["story_content"] = html.unescape(story.get("story_content", ""))
+
+                # Find all matching classifiers for this story (skip classifiers that hit their cap)
+                matched = []
+                for notif in user_notifs:
+                    if classifier_send_counts[notif.pk] >= 3:
+                        continue
+                    if notif.matches_story(story, feed_id, folder_feed_ids, prompt_scores=prompt_scores):
+                        matched.append(notif)
+
+                if not matched:
+                    continue
+
+                # Aggregate channels across all matched classifiers
+                channels = {
+                    "email": any(n.is_email for n in matched),
+                    "web": any(n.is_web for n in matched),
+                    "ios": any(n.is_ios for n in matched),
+                    "android": any(n.is_android for n in matched),
+                }
+
+                # models.py: Claim channels before sending so feed and classifier
+                # notifications cannot race each other into duplicate emails.
+                story_hash = story["story_hash"]
+                channels_to_send = cls.claim_story_channels(
+                    user_id,
+                    story_hash,
+                    is_email=channels["email"],
+                    is_web=channels["web"],
+                    is_ios=channels["ios"],
+                    is_android=channels["android"],
+                    force=force,
+                )
+
+                if not any(channels_to_send.values()):
+                    continue
+
+                # Build match description for notification body
+                match_parts = []
+                for notif in matched:
+                    label = CLASSIFIER_MATCH_LABELS.get(notif.classifier_type, notif.classifier_type)
+                    if notif.classifier_type in ("prompt", "image_prompt"):
+                        value = truncate_chars(notif.classifier_value, 80)
+                    else:
+                        value = notif.classifier_value
+                    match_parts.append(format_lazy("{}: {}", label, value))
+                # Lazy, so send_email's template writes the labels in the recipient's language.
+                match_desc = format_lazy(", ".join(["{}"] * len(match_parts)), *match_parts)
+
+                logging.user(
+                    user,
+                    "~FCSending classifier notification: %s/%s (matched: %s)"
+                    % (story["story_title"][:40], story_hash, str(match_desc)[:60]),
+                )
+
+                # Send notifications using a temporary MUserFeedNotification-like sender
+                # We create a transient instance to reuse the send_* methods
+                sender = MUserFeedNotification(
+                    user_id=user_id,
+                    feed_id=feed_id,
+                    is_email=channels_to_send.get("email", False),
+                    is_web=channels_to_send.get("web", False),
+                    is_ios=channels_to_send.get("ios", False),
+                    is_android=channels_to_send.get("android", False),
+                )
+                sender.send_web(story, user)
+                sender.send_ios(story, user, usersub)
+                sender.send_android(story)
+                sender.send_email(story, usersub, classifier_match_desc=match_desc)
+
+                cls.mark_story_sent(
+                    user_id,
+                    story_hash,
+                    is_email=channels_to_send.get("email", False),
+                    is_web=channels_to_send.get("web", False),
+                    is_ios=channels_to_send.get("ios", False),
+                    is_android=channels_to_send.get("android", False),
+                )
+                total_sent_count += 1
+                for notif in matched:
+                    classifier_send_counts[notif.pk] += 1
+
+                # Update last_notification_date on matched notifications
+                for notif in matched:
+                    if story["story_date"] > notif.last_notification_date:
+                        notif.last_notification_date = story["story_date"]
+                        notif.save()
+
+        return total_sent_count, len(by_user)

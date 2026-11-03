@@ -1,0 +1,648 @@
+//
+//  SyncNotifierView.swift
+//  NewsBlur
+//
+//  Created by Samuel Clay on 2025-01-12.
+//  Copyright (c) 2025 NewsBlur. All rights reserved.
+//
+
+import UIKit
+
+@objc enum SyncNotifierStyle: Int {
+    case offline = 1
+    case loading = 2
+    case syncing = 3
+    case syncingProgress = 4
+    case done = 5
+}
+
+@objcMembers
+class SyncNotifierView: UIView {
+    
+    // MARK: - Properties
+    
+    private let blurView: UIVisualEffectView = {
+        let blur = UIBlurEffect(style: .systemUltraThinMaterialDark)
+        let view = UIVisualEffectView(effect: blur)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }()
+    
+    private let contentView: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = .clear
+        return view
+    }()
+    
+    private let titleLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = UIFont(name: "WhitneySSm-Book", size: 13) ?? .systemFont(ofSize: 13)
+        label.textColor = .white
+        label.layer.shadowColor = UIColor.black.cgColor
+        label.layer.shadowOffset = CGSize(width: 0, height: -0.5)
+        label.layer.shadowOpacity = 0.8
+        label.layer.shadowRadius = 1
+        label.layer.masksToBounds = false
+        label.accessibilityIdentifier = "feed-list-sync-status"
+        return label
+    }()
+    
+    private let accessoryContainer: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }()
+    
+    private let activityIndicator: UIActivityIndicatorView = {
+        let indicator = UIActivityIndicatorView(style: .medium)
+        indicator.translatesAutoresizingMaskIntoConstraints = false
+        indicator.color = .white
+        indicator.hidesWhenStopped = true
+        return indicator
+    }()
+    
+    private let iconImageView: UIImageView = {
+        let imageView = UIImageView()
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.contentMode = .scaleAspectFit
+        imageView.tintColor = .white
+        return imageView
+    }()
+    
+    private let progressBar: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = UIColor(red: 0xD0/255.0, green: 0x50/255.0, blue: 0x46/255.0, alpha: 0.8)
+        view.isHidden = true
+        return view
+    }()
+    
+    private let offlineTintView: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = UIColor(red: 0.4, green: 0.15, blue: 0.1, alpha: 0.4)
+        view.isHidden = true
+        return view
+    }()
+    
+    private let passiveTintView: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        // Lighter overlay to reduce intensity for passive states (downloading, done)
+        view.backgroundColor = UIColor(white: 1.0, alpha: 0.15)
+        view.isHidden = true
+        return view
+    }()
+    
+    private var progressWidthConstraint: NSLayoutConstraint?
+    private var isShowing = false
+    private var pendingHide = false
+    private var pendingShow = false
+    private var pendingShowDuration: TimeInterval = 0
+    private var hideWorkItem: DispatchWorkItem?
+    private var visibilityGeneration = 0
+    
+    private var lastSuperviewBounds: CGRect = .zero
+    // FeedsObjCViewController.m supplies the column because its navigation title view can be narrower.
+    weak var horizontalLayoutView: UIView?
+    // FeedsObjCViewController.m uses the navigation title's actual available space on iPad.
+    weak var accountNameLabel: UILabel? {
+        didSet {
+            titleLabel.font = UIFont(name: "WhitneySSm-Book", size: accountNameLabel == nil ? 13 : 11)
+            activityIndicator.transform = accountNameLabel == nil ? .identity : CGAffineTransform(scaleX: 0.75, y: 0.75)
+            layer.cornerRadius = pillHeight / 2
+            updateFrameInSuperview()
+        }
+    }
+    var isPresentationSuppressed = false {
+        didSet {
+            isHidden = isPresentationSuppressed || !isShowing
+            updateFrameInSuperview()
+        }
+    }
+    
+    var title: String = "" {
+        didSet {
+            titleLabel.text = title
+            titleLabel.accessibilityLabel = title
+        }
+    }
+    
+    var style: SyncNotifierStyle = .loading {
+        didSet {
+            updateStyle()
+        }
+    }
+    
+    // MARK: - Constants
+    
+    private var pillHeight: CGFloat { accountNameLabel == nil ? 28 : 22 }
+    private let horizontalPadding: CGFloat = 10
+    private let iconSize: CGFloat = 16
+    private let animationDuration: TimeInterval = 0.3
+    private let screenEdgePadding: CGFloat = 12
+    
+    // MARK: - Initialization
+    
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setupView()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupView()
+    }
+    
+    @objc convenience init(title: String) {
+        self.init(frame: .zero)
+        self.title = title
+        self.titleLabel.text = title
+        updateFrameInSuperview()
+    }
+    
+    // MARK: - Setup
+    
+    private func setupView() {
+        // Use frame-based layout for outer view positioning (overlay)
+        translatesAutoresizingMaskIntoConstraints = true
+        clipsToBounds = true
+        layer.cornerRadius = pillHeight / 2
+        
+        // Set initial frame (will be repositioned by parent)
+        frame = CGRect(x: 0, y: 0, width: 150, height: pillHeight)
+        
+        // Add blur background
+        addSubview(blurView)
+        
+        // Add tint overlays (hidden by default)
+        blurView.contentView.addSubview(offlineTintView)
+        blurView.contentView.addSubview(passiveTintView)
+        
+        // Add content view on top of blur
+        blurView.contentView.addSubview(contentView)
+        
+        // Add progress bar at bottom
+        addSubview(progressBar)
+        
+        // Add label and accessory container
+        contentView.addSubview(titleLabel)
+        contentView.addSubview(accessoryContainer)
+        
+        // Add spinner and icon to accessory container
+        accessoryContainer.addSubview(activityIndicator)
+        accessoryContainer.addSubview(iconImageView)
+        
+        // Add subtle border
+        layer.borderWidth = 0.5
+        layer.borderColor = UIColor(white: 1.0, alpha: 0.2).cgColor
+        
+        setupConstraints()
+        
+        // Start hidden and off-screen
+        alpha = 0
+        transform = CGAffineTransform(translationX: 100, y: 0)
+    }
+    
+    private func setupConstraints() {
+        NSLayoutConstraint.activate([
+            // Blur view fills the entire view
+            blurView.topAnchor.constraint(equalTo: topAnchor),
+            blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            blurView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            
+            // Offline tint view fills blur content
+            offlineTintView.topAnchor.constraint(equalTo: blurView.contentView.topAnchor),
+            offlineTintView.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor),
+            offlineTintView.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor),
+            offlineTintView.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor),
+            
+            // Passive tint view fills blur content (for lighter passive states)
+            passiveTintView.topAnchor.constraint(equalTo: blurView.contentView.topAnchor),
+            passiveTintView.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor),
+            passiveTintView.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor),
+            passiveTintView.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor),
+            
+            // Content view fills blur content view
+            contentView.topAnchor.constraint(equalTo: blurView.contentView.topAnchor),
+            contentView.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor, constant: horizontalPadding),
+            contentView.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor, constant: -horizontalPadding),
+            contentView.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor),
+            
+            // Progress bar at bottom
+            progressBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            progressBar.bottomAnchor.constraint(equalTo: bottomAnchor),
+            progressBar.heightAnchor.constraint(equalToConstant: 2),
+            
+            // Title label - left side, vertically centered
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            titleLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: accessoryContainer.leadingAnchor, constant: -6),
+            
+            // Accessory container - right side
+            accessoryContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            accessoryContainer.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            accessoryContainer.widthAnchor.constraint(equalToConstant: iconSize),
+            accessoryContainer.heightAnchor.constraint(equalToConstant: iconSize),
+            
+            // Activity indicator centered in accessory container
+            activityIndicator.centerXAnchor.constraint(equalTo: accessoryContainer.centerXAnchor),
+            activityIndicator.centerYAnchor.constraint(equalTo: accessoryContainer.centerYAnchor),
+            
+            // Icon centered in accessory container
+            iconImageView.centerXAnchor.constraint(equalTo: accessoryContainer.centerXAnchor),
+            iconImageView.centerYAnchor.constraint(equalTo: accessoryContainer.centerYAnchor),
+            iconImageView.widthAnchor.constraint(equalToConstant: iconSize),
+            iconImageView.heightAnchor.constraint(equalToConstant: iconSize),
+        ])
+        
+        // Initial progress bar width
+        progressWidthConstraint = progressBar.widthAnchor.constraint(equalToConstant: 0)
+        progressWidthConstraint?.isActive = true
+    }
+    
+    // MARK: - Attachment
+    
+    @objc(attachToView:)
+    func attach(to superview: UIView) {
+        if self.superview !== superview {
+            removeFromSuperview()
+            superview.addSubview(self)
+        }
+        
+        superview.bringSubviewToFront(self)
+        
+        lastSuperviewBounds = superview.bounds
+        updateFrameInSuperview()
+    }
+    
+    // MARK: - Sizing
+    
+    override var intrinsicContentSize: CGSize {
+        let labelWidth = titleLabel.intrinsicContentSize.width
+        let totalWidth = horizontalPadding + labelWidth + 6 + iconSize + horizontalPadding
+        return CGSize(width: totalWidth, height: pillHeight)
+    }
+    
+    private func intrinsicContentSize(for title: String) -> CGSize {
+        let font = titleLabel.font ?? UIFont.systemFont(ofSize: 13)
+        let labelWidth = (title as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+        let totalWidth = horizontalPadding + labelWidth + 6 + iconSize + horizontalPadding
+        return CGSize(width: totalWidth, height: pillHeight)
+    }
+
+    private func visibleContentFrame(in superview: UIView) -> CGRect {
+        let container = horizontalLayoutView ?? superview
+        let safeBounds = superview.convert(container.bounds.inset(by: container.safeAreaInsets), from: container)
+
+        #if targetEnvironment(macCatalyst)
+        // SyncNotifierView.swift uses the sidebar margins supplied by FeedsObjCViewController.m, not the window edge.
+        return safeBounds.insetBy(dx: superview.directionalLayoutMargins.trailing, dy: 0)
+        #else
+        guard let window = window else {
+            return safeBounds.insetBy(dx: screenEdgePadding, dy: 0)
+        }
+
+        let windowSafeBounds = window.bounds
+            .inset(by: window.safeAreaInsets)
+            .insetBy(dx: screenEdgePadding, dy: 0)
+        let windowSafeBoundsInSuperview = superview.convert(windowSafeBounds, from: window)
+        let visibleFrame = safeBounds.intersection(windowSafeBoundsInSuperview)
+
+        if visibleFrame.isNull || visibleFrame.width <= 0 {
+            return safeBounds.insetBy(dx: screenEdgePadding, dy: 0)
+        }
+
+        return visibleFrame
+        #endif
+    }
+
+    // SyncNotifierView.swift slides the overlay in from the trailing screen edge.
+    private var offscreenTransform: CGAffineTransform {
+        let distance = frame.width + 20
+        return CGAffineTransform(translationX: nbIsRightToLeft ? -distance : distance, y: 0)
+    }
+
+    private func frameInSuperview(for size: CGSize) -> CGRect? {
+        guard let superview = superview else { return nil }
+
+        if let accountNameLabel = accountNameLabel, accountNameLabel.superview === superview {
+            // SyncNotifierView.swift shares only the account-name row, leaving unread counts below untouched.
+            // UIKit has already excluded the sidebar button from this title view's bounds.
+            // SyncNotifierView.swift places the pill after the name in reading order, so it sits to the left of
+            // the name in a right-to-left header.
+            let rightToLeft = superview.nbIsRightToLeft
+            let nameFrame = accountNameLabel.frame
+            let availableWidth = rightToLeft ? max(0, nameFrame.maxX - superview.bounds.minX - 4)
+                : max(0, superview.bounds.maxX - nameFrame.minX - 4)
+            let nameWidth = accountNameLabel.intrinsicContentSize.width
+            let gap: CGFloat = 8
+            let showing = (isShowing || pendingShow) && !isPresentationSuppressed
+            let minimumStatusWidth = horizontalPadding * 2 + iconSize + 6
+            let statusWidth = min(size.width, 130, max(0, availableWidth - gap),
+                                  max(minimumStatusWidth, availableWidth - gap - min(nameWidth, 60)))
+            let fittedNameWidth = min(nameWidth, max(0, availableWidth - (showing ? statusWidth + gap : 0)))
+            accountNameLabel.frame.size.width = fittedNameWidth
+            if rightToLeft {
+                // SyncNotifierView.swift keeps a right-to-left name attached to its avatar while it narrows.
+                accountNameLabel.frame.origin.x = nameFrame.maxX - fittedNameWidth
+            }
+            titleLabel.isHidden = statusWidth < horizontalPadding * 2 + iconSize + 20
+            isAccessibilityElement = titleLabel.isHidden
+            accessibilityLabel = titleLabel.isHidden ? title : nil
+            let x = rightToLeft ? accountNameLabel.frame.minX - gap - statusWidth : accountNameLabel.frame.maxX + gap
+            return CGRect(x: x,
+                          y: accountNameLabel.frame.midY - size.height / 2,
+                          width: statusWidth, height: size.height)
+        }
+
+        titleLabel.isHidden = false
+        let visibleFrame = visibleContentFrame(in: superview)
+        let safeBounds = superview.bounds.inset(by: superview.safeAreaInsets)
+        let width = min(size.width, visibleFrame.width)
+        // SyncNotifierView.swift pins the overlay to the trailing edge, which is the left edge right to left.
+        let x = superview.nbIsRightToLeft ? visibleFrame.minX : max(visibleFrame.minX, visibleFrame.maxX - width)
+        let y = safeBounds.minY + (safeBounds.height - size.height) / 2
+
+        return CGRect(x: x, y: y, width: width, height: size.height)
+    }
+
+    private func setFrameInSuperview(for size: CGSize) {
+        guard let newFrame = frameInSuperview(for: size) else { return }
+
+        // SyncNotifierView.swift must not assign frame while its slide transform is active.
+        bounds.size = newFrame.size
+        center = CGPoint(x: newFrame.midX, y: newFrame.midY)
+    }
+    
+    private func updateFrameInSuperview(animated: Bool, duration: TimeInterval, targetSize: CGSize) {
+        if animated {
+            UIView.animate(withDuration: duration) {
+                self.setFrameInSuperview(for: targetSize)
+                self.layoutIfNeeded()
+            }
+        } else {
+            setFrameInSuperview(for: targetSize)
+        }
+    }
+    
+    override func sizeToFit() {
+        let size = intrinsicContentSize
+        bounds.size = size
+    }
+    
+    @objc func updateFrameInSuperview() {
+        updateFrameInSuperview(animated: false, duration: 0, targetSize: intrinsicContentSize)
+    }
+    
+    private func updateFrameInSuperview(animated: Bool, duration: TimeInterval = 0.2) {
+        guard superview != nil else { return }
+        
+        let newSize = intrinsicContentSize
+        if animated {
+            UIView.animate(withDuration: duration) {
+                self.setFrameInSuperview(for: newSize)
+                self.layoutIfNeeded()
+            }
+        } else {
+            setFrameInSuperview(for: newSize)
+        }
+        
+        // Keep the offscreen transform correct if we're hidden/not showing (optional safety)
+        if !isShowing && alpha == 0 {
+            transform = offscreenTransform
+        }
+    }
+    
+    // MARK: - Style Updates
+    
+    private func updateStyle() {
+        // Reset state
+        activityIndicator.stopAnimating()
+        iconImageView.isHidden = true
+        progressBar.isHidden = true
+        offlineTintView.isHidden = true
+        passiveTintView.isHidden = true
+        
+        switch style {
+            case .loading, .syncing:
+                // Active states - full intensity (no tint overlay)
+                activityIndicator.startAnimating()
+                iconImageView.isHidden = true
+                
+            case .syncingProgress:
+                // Passive state - lighter appearance (already has progress bar indicator)
+                activityIndicator.stopAnimating()
+                iconImageView.image = UIImage(named: "g_icn_offline")?.withRenderingMode(.alwaysTemplate)
+                iconImageView.isHidden = false
+                progressBar.isHidden = false
+                passiveTintView.isHidden = false
+                
+            case .offline:
+                activityIndicator.stopAnimating()
+                iconImageView.image = UIImage(named: "g_icn_offline")?.withRenderingMode(.alwaysTemplate)
+                iconImageView.isHidden = false
+                offlineTintView.isHidden = false
+                
+            case .done:
+                // Passive state - lighter appearance
+                activityIndicator.stopAnimating()
+                iconImageView.image = UIImage(named: "checkmark")?.withRenderingMode(.alwaysTemplate)
+                iconImageView.isHidden = false
+                passiveTintView.isHidden = false
+        }
+    }
+    
+    // MARK: - Progress
+    
+    @objc func setProgress(_ progress: CGFloat) {
+        progressWidthConstraint?.isActive = false
+        progressWidthConstraint = progressBar.widthAnchor.constraint(equalTo: widthAnchor, multiplier: progress)
+        progressWidthConstraint?.isActive = true
+        
+        UIView.animate(withDuration: 0.5) {
+            self.layoutIfNeeded()
+        }
+    }
+    
+    // MARK: - Layout
+    
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        
+        guard let superview = superview else { return }
+        
+        if superview.bounds != lastSuperviewBounds {
+            lastSuperviewBounds = superview.bounds
+            updateFrameInSuperview()
+        }
+    }
+    
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            updateFrameInSuperview()
+            superview?.bringSubviewToFront(self)
+            if pendingShow {
+                let duration = pendingShowDuration
+                pendingShow = false
+                showIn(duration)
+                return
+            }
+        }
+        // Execute pending hide when we get a window
+        if window != nil && pendingHide {
+            hide()
+        }
+    }
+    
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        lastSuperviewBounds = superview?.bounds ?? .zero
+        updateFrameInSuperview()
+        superview?.bringSubviewToFront(self)
+    }
+    
+    // MARK: - Show/Hide Animation
+    
+    @objc func show() {
+        showIn(animationDuration)
+    }
+    
+    @objc func showIn(_ duration: TimeInterval) {
+        guard window != nil else {
+            pendingHide = false
+            pendingShow = true
+            pendingShowDuration = duration
+            return
+        }
+        
+        // If already showing, don't animate - just ensure visible
+        if isShowing {
+            return
+        }
+        
+        isShowing = true
+        visibilityGeneration += 1
+        pendingHide = false
+        pendingShow = false
+        isHidden = isPresentationSuppressed
+        
+        // Update frame and z-order before animating
+        updateFrameInSuperview()
+        superview?.bringSubviewToFront(self)
+        
+        // Start off-screen to the right
+        transform = accountNameLabel == nil ? offscreenTransform : .identity
+        alpha = 0
+        
+        UIView.animate(
+            withDuration: duration,
+            delay: 0,
+            usingSpringWithDamping: 0.8,
+            initialSpringVelocity: 0.5,
+            options: [.curveEaseOut]
+        ) {
+            self.alpha = 1
+            self.transform = .identity
+        }
+    }
+    
+    @objc func hide() {
+        hideIn(animationDuration)
+    }
+    
+    @objc func hideNow() {
+        hideIn(0)
+    }
+    
+    @objc func hideIn(_ duration: TimeInterval) {
+        if pendingShow {
+            pendingShow = false
+        }
+        guard isShowing else { return }
+        
+        // If no window yet, mark as pending and it will hide when window is set
+        guard window != nil else {
+            pendingHide = true
+            return
+        }
+        
+        pendingHide = false
+        isShowing = false
+        visibilityGeneration += 1
+        let generation = visibilityGeneration
+        
+        UIView.animate(
+            withDuration: duration,
+            delay: 0,
+            options: [.curveEaseIn]
+        ) {
+            self.alpha = 0
+            self.transform = self.accountNameLabel == nil ? self.offscreenTransform : .identity
+            self.updateFrameInSuperview()
+        } completion: { _ in
+            guard self.visibilityGeneration == generation else { return }
+            self.isHidden = true
+        }
+    }
+    
+    // MARK: - Convenience Methods for ObjC
+    
+    @objc func showWithStyle(_ style: SyncNotifierStyle, title: String) {
+        showWithStyle(style, title: title, progress: 0)
+    }
+    
+    @objc func showWithStyle(_ style: SyncNotifierStyle, title: String, progress: CGFloat) {
+        // Cancel any pending hide timer when showing new content
+        cancelPendingHide()
+        
+        let wasShowing = isShowing
+        
+        self.style = style
+        self.title = title
+        setProgress(progress)
+        
+        if wasShowing {
+            // Already visible - animate the content and size change together
+            let targetSize = intrinsicContentSize(for: title)
+            
+            UIView.animate(withDuration: 0.2) {
+                self.style = style
+                self.title = title
+                self.setFrameInSuperview(for: targetSize)
+                self.layoutIfNeeded()
+            }
+        } else {
+            // Not visible - animate in
+            self.style = style
+            self.title = title
+            show()
+        }
+    }
+    
+    // MARK: - Delayed Hide
+    
+    /// Cancels any pending hide timer
+    private func cancelPendingHide() {
+        hideWorkItem?.cancel()
+        hideWorkItem = nil
+    }
+    
+    /// Hides the notifier after a delay, canceling any previously scheduled hide
+    @objc func hideAfter(_ delay: TimeInterval) {
+        // Cancel any existing pending hide
+        cancelPendingHide()
+        
+        // Create new work item for delayed hide
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.hide()
+        }
+        hideWorkItem = workItem
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+}

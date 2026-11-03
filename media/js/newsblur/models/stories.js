@@ -79,7 +79,8 @@ NEWSBLUR.Models.Story = Backbone.Model.extend({
             var url = this.get('image_urls')[index];
             if (window.location.protocol == 'https:' &&
                 _.str.startsWith(url, "http://")) {
-                var secure_url = this.get('secure_image_urls')[url];
+                var secure_urls = this.get('secure_image_urls');
+                var secure_url = secure_urls && secure_urls[url];
                 if (secure_url) url = secure_url;
             }
             return url;
@@ -119,6 +120,24 @@ NEWSBLUR.Models.Story = Backbone.Model.extend({
         return highlights;
     },
 
+    // stories.js keeps NewsBlur's English date style; other languages use the browser's Intl formats.
+    uses_english_dates: function () {
+        return (document.documentElement.lang || 'en').indexOf('en') === 0;
+    },
+
+    localized_date_parts: function (date) {
+        // Latin digits match the server's dates and Inflector.commas counts.
+        var language = document.documentElement.lang + '-u-nu-latn';
+        // The locale's own clock convention applies unless the reader chose 24-hour time.
+        var hour12 = NEWSBLUR.assets.preference('dateformat') == "24" ? false : undefined;
+        return {
+            time: date.toLocaleTimeString(language, { hour: 'numeric', minute: '2-digit', hour12: hour12 }),
+            short_date: date.toLocaleDateString(language, { day: 'numeric', month: 'short', year: 'numeric' }),
+            date: date.toLocaleDateString(language, { day: 'numeric', month: 'long', year: 'numeric' }),
+            weekday: date.toLocaleDateString(language, { weekday: 'long' })
+        };
+    },
+
     formatted_short_date: function () {
         var timestamp = this.get('story_timestamp');
         var dateformat = NEWSBLUR.assets.preference('dateformat');
@@ -138,6 +157,17 @@ NEWSBLUR.Models.Story = Backbone.Model.extend({
             return midnight_tomorrow(midnight, -1);
         };
         var midnight = midnight_today();
+        if (!this.uses_english_dates()) {
+            var parts = this.localized_date_parts(date);
+            if (date > midnight_tomorrow(midnight) && date < midnight_tomorrow(midnight, 2)) {
+                return interpolate(gettext("Tomorrow, %(time)s"), parts, true);
+            } else if (date > midnight && date <= midnight_tomorrow(midnight)) {
+                return parts.time;
+            } else if (date > midnight_yesterday(midnight) && date <= midnight) {
+                return interpolate(gettext("Yesterday, %(time)s"), parts, true);
+            }
+            return interpolate(gettext("%(date)s, %(time)s"), { date: parts.short_date, time: parts.time }, true);
+        }
         var time = date.format(dateformat == "24" ? "H:i" : "g:ia");
 
         if (date > midnight) {
@@ -184,6 +214,17 @@ NEWSBLUR.Models.Story = Backbone.Model.extend({
             return month;
         };
         var midnight = midnight_today();
+        if (!this.uses_english_dates()) {
+            var parts = this.localized_date_parts(date);
+            if (date > midnight_tomorrow(midnight) && date < midnight_tomorrow(midnight, 2)) {
+                return interpolate(gettext("Tomorrow, %(date)s %(time)s"), parts, true);
+            } else if (date > midnight && date <= midnight_tomorrow(midnight)) {
+                return interpolate(gettext("Today, %(date)s %(time)s"), parts, true);
+            } else if (date > midnight_yesterday(midnight) && date <= midnight) {
+                return interpolate(gettext("Yesterday, %(date)s %(time)s"), parts, true);
+            }
+            return interpolate(gettext("%(weekday)s, %(date)s %(time)s"), parts, true);
+        }
         var time = date.format(dateformat == "24" ? "H:i" : "g:ia");
         if (date > midnight) {
             if (date > midnight_tomorrow(midnight)) {
@@ -356,6 +397,16 @@ NEWSBLUR.Models.Story = Backbone.Model.extend({
         }, [])));
 
         return all_tags;
+    },
+
+    has_cluster: function () {
+        var cluster = this.get('cluster_stories');
+        return cluster && cluster.length > 0;
+    },
+
+    cluster_count: function () {
+        var cluster = this.get('cluster_stories');
+        return cluster ? cluster.length + 1 : 1;
     }
 
 });
@@ -401,7 +452,7 @@ NEWSBLUR.Collections.Stories = Backbone.Collection.extend({
             delay = 0;
         } else if (options.force) {
             delay = 0;
-        } else if (delay == -1) {
+        } else if (delay == -1 || delay == -2) {
             return;
         }
 
@@ -432,12 +483,31 @@ NEWSBLUR.Collections.Stories = Backbone.Collection.extend({
         var story = this.get_by_story_hash(story_hash);
         if (!story) return;
         story.set('read_status', 1);
+        this.sync_briefing_read_status(story_hash, 1);
     },
 
     mark_unread_pubsub: function (story_hash) {
         var story = this.get_by_story_hash(story_hash);
         if (!story) return;
         story.set('read_status', 0);
+        this.sync_briefing_read_status(story_hash, 0);
+    },
+
+    // stories.js: Keep briefing_data in sync with read_status changes so
+    // that any re-render of the briefing view preserves the current state.
+    sync_briefing_read_status: function (story_hash, read_status) {
+        var data = NEWSBLUR.assets.briefing_data;
+        if (!data || !data.briefings) return;
+        _.each(data.briefings, function (briefing) {
+            if (briefing.summary_story && briefing.summary_story.story_hash == story_hash) {
+                briefing.summary_story.read_status = read_status;
+            }
+            _.each(briefing.curated_stories || [], function (s) {
+                if (s.story_hash == story_hash) {
+                    s.read_status = read_status;
+                }
+            });
+        });
     },
 
     mark_unread: function (story, options) {
@@ -733,6 +803,8 @@ NEWSBLUR.Collections.Stories = Backbone.Collection.extend({
             if (!selected_story.get('read_status')) {
                 this.mark_read(selected_story);
             }
+        } else {
+            clearTimeout(this.read_story_delay);
         }
     }
 

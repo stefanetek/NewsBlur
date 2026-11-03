@@ -1,50 +1,80 @@
 package com.newsblur.fragment
 
-import android.content.Context
-import android.content.DialogInterface
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.icu.text.MessageFormat
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import android.text.TextUtils
 import android.util.Log
 import android.view.ContextMenu
 import android.view.ContextMenu.ContextMenuInfo
 import android.view.LayoutInflater
+import android.view.Menu
 import android.view.MenuItem
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView.HitTestResult
-import androidx.appcompat.app.AlertDialog
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.RelativeLayout
+import android.widget.TextView
+import androidx.annotation.DrawableRes
+import androidx.annotation.StringRes
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.ContextCompat
+import androidx.core.view.doOnNextLayout
+import androidx.core.view.doOnPreDraw
 import androidx.core.view.isVisible
 import androidx.fragment.app.DialogFragment
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
-import com.google.android.material.button.MaterialButton
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.webkit.WebViewAssetLoader
 import com.google.android.material.chip.Chip
+import com.google.android.material.snackbar.Snackbar
 import com.newsblur.R
 import com.newsblur.activity.FeedItemsList
 import com.newsblur.activity.Reading
+import com.newsblur.askai.AskAiBottomSheetFragment
 import com.newsblur.database.BlurDatabaseHelper
 import com.newsblur.databinding.FragmentReadingitemBinding
 import com.newsblur.databinding.ReadingItemActionsBinding
+import com.newsblur.delegate.ReadingStoryMenuPopup
+import com.newsblur.design.ListenPalette
 import com.newsblur.di.IconLoader
 import com.newsblur.di.StoryImageCache
 import com.newsblur.domain.Classifier
+import com.newsblur.domain.CustomIcon
 import com.newsblur.domain.Story
-import com.newsblur.domain.UserDetails
+import com.newsblur.image.StoryImageViewerHost
 import com.newsblur.keyboard.KeyboardManager
-import com.newsblur.network.APIManager
+import com.newsblur.listen.ListenManager
+import com.newsblur.listen.ListenPhase
+import com.newsblur.listen.ListenStoryFollower
+import com.newsblur.listen.ListenUiState
+import com.newsblur.network.APIConstants.NULL_STORY_TEXT
+import com.newsblur.network.StoryApi
+import com.newsblur.preference.ListenPreferences
+import com.newsblur.preference.PrefsRepo
+import com.newsblur.repository.StoryRepository
 import com.newsblur.service.NbSyncManager.UPDATE_INTEL
 import com.newsblur.service.NbSyncManager.UPDATE_SOCIAL
 import com.newsblur.service.NbSyncManager.UPDATE_STORY
 import com.newsblur.service.NbSyncManager.UPDATE_TEXT
-import com.newsblur.service.OriginalTextService
+import com.newsblur.util.AppConstants
+import com.newsblur.util.AppConstants.READING_BASE_URL
+import com.newsblur.util.BidiText
+import com.newsblur.util.CustomIconRenderer
 import com.newsblur.util.DefaultFeedView
+import com.newsblur.util.EdgeToEdgeUtil.applyReaderFooterInsetTo
 import com.newsblur.util.FeedSet
 import com.newsblur.util.FeedUtils
 import com.newsblur.util.FileCache
@@ -52,22 +82,47 @@ import com.newsblur.util.Font
 import com.newsblur.util.ImageLoader
 import com.newsblur.util.MarkStoryReadBehavior
 import com.newsblur.util.PrefConstants.ThemeValue
-import com.newsblur.util.PrefsUtils
 import com.newsblur.util.ReadingTextSize
+import com.newsblur.util.StoryButton
+import com.newsblur.util.StoryButtonLayout
 import com.newsblur.util.StoryChangesState
+import com.newsblur.util.StoryClusterBadgeViewBinder
+import com.newsblur.util.StoryClusterDisplayDecision
+import com.newsblur.util.StoryClusterNavigationDecision
+import com.newsblur.util.StoryClusterNavigationTarget
+import com.newsblur.util.StoryClusterThemeStyle
+import com.newsblur.util.StorySplitView
+import com.newsblur.util.StoryUtil
 import com.newsblur.util.StoryUtils
 import com.newsblur.util.UIUtils
 import com.newsblur.util.executeAsyncTask
+import com.newsblur.view.ReadingScrollView
+import com.newsblur.view.StoryThumbnailView
+import com.newsblur.viewModel.ReadingItemViewModel
+import com.newsblur.web.NewsblurWebview
+import com.newsblur.web.WebviewActionType
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.regex.Pattern
 import javax.inject.Inject
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @AndroidEntryPoint
-class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
-
+class ReadingItemFragment :
+    NbFragment(),
+    PopupMenu.OnMenuItemClickListener,
+    ReadingScrollView.ScrollChangeListener {
     @Inject
-    lateinit var apiManager: APIManager
+    lateinit var storyApi: StoryApi
 
     @Inject
     lateinit var dbHelper: BlurDatabaseHelper
@@ -76,12 +131,48 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
     lateinit var feedUtils: FeedUtils
 
     @Inject
+    lateinit var storyRepository: StoryRepository
+
+    @Inject
     @IconLoader
     lateinit var iconLoader: ImageLoader
 
     @Inject
     @StoryImageCache
     lateinit var storyImageCache: FileCache
+
+    @Inject
+    @com.newsblur.di.ImageOkHttpClient
+    lateinit var imageViewerClient: okhttp3.OkHttpClient
+
+    private var storyImageViewer: com.newsblur.image.StoryImageViewer? = null
+    private var clearBottomInsetListener: Runnable? = null
+
+    // When a photo started opening on StoryImageViewerHost.kt, which holds off a second tap until the host shows it.
+    private var storyImageHostLaunchedAt = 0L
+
+    // The StoryImageViewerHost.kt hand-off this reader is waiting on, if any.
+    private var storyImageHostToken: String? = null
+
+    @Inject
+    lateinit var prefsRepo: PrefsRepo
+
+    @Inject
+    lateinit var assetLoader: WebViewAssetLoader
+
+    @Inject
+    lateinit var listenManager: ListenManager
+
+    @Inject
+    lateinit var listenPreferences: ListenPreferences
+
+    // ReadingItemFragment.kt follows Listen through this story: highlights, gentle scrolling, paragraph taps.
+    private var listenFollower: ListenStoryFollower? = null
+    private var lastStoryButtonRows: List<List<Int>>? = null
+    private var listenRowSize = 0
+    private var scrollTouching = false
+    private var listenShowedText = false
+    private var lastScrollTouchAt = 0L
 
     @JvmField
     var story: Story? = null
@@ -95,9 +186,10 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
     private var faviconText: String? = null
     private var classifier: Classifier? = null
     private var displayFeedDetails = false
-    private var user: UserDetails? = null
+    private var userId: String? = null
+    private var enableHighlights = false
 
-    var selectedViewMode: DefaultFeedView? = null
+    var selectedViewMode: DefaultFeedView = DefaultFeedView.STORY
         private set
 
     private var textViewUnavailable = false
@@ -108,30 +200,65 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
 
     /** The text-mode story HTML, as retrieved via the secondary original text API.  */
     private var originalText: String? = null
-    private var imageAltTexts: HashMap<String, String>? = null
-    private var imageUrlRemaps: HashMap<String, String>? = null
     private var sourceUserId: String? = null
-    private var contentHash = 0
+    private val documentRenderer = LatestReaderRender<ReaderHtmlRequest, PreparedReaderDocument>()
+    private var lastMetadataSnapshot: ReaderMetadataSnapshot? = null
+    private var lastClusterSnapshot: ReaderClusterSnapshot? = null
+    private var lastSocialSnapshot: List<Any?>? = null
+    private val storyHighlights = mutableSetOf<String>()
+    private var hasCompletedInitialStoryRender = false
+    private val clusterThumbnailLoader by lazy(
+        LazyThreadSafetyMode.NONE,
+    ) { ImageLoader.asThumbnailLoader(requireContext(), storyImageCache) }
 
     // these three flags are progressively set by async callbacks and unioned
     // to set isLoadFinished, when we trigger any final UI tricks.
     private var isContentLoadFinished = false
-    private var isWebLoadFinished = false
     private var isSocialLoadFinished = false
-    private var isLoadFinished = false
+    private val isWebLoadFinished = AtomicBoolean(false)
+    private var isWebVisualStateReady = false
+    private var nativeHeaderStoryHash: String? = null
+    private val articleReveal = ReaderArticleReveal {
+        syncStoryLoadingUi()
+        story?.storyHash?.let { hash ->
+            (activity as? Reading)?.let { reading ->
+                reading.onReaderArticleVisible(hash)
+                reading.onReaderPageVisualReady(hash)
+            }
+        }
+    }
+    private val isLoadFinished = AtomicBoolean(false)
     private var savedScrollPosRel = 0f
-    private val webViewContentMutex = Any()
+    private var savedScrollPosPx = 0
+    private var hasSavedScrollPosition = false
+    private var preferAbsoluteScrollRestore = false
+    private var isWebViewReleasedForBackground = false
+    private var isRestoringReleasedWebView = false
+    private var readingWebview: NewsblurWebview? = null
+    private var hasWebViewContent = false
+    private var readingWebviewParent: ViewGroup? = null
+    private var readingWebviewLayoutParams: ViewGroup.LayoutParams? = null
+    private var readingWebviewIndex = -1
+    private var readerAnchorCaptureRunnable: Runnable? = null
+    private var readerAnchorCaptureGeneration = 0L
+    private var readerAnchorCapturedScrollY: Int? = null
+    private var configurationChangeGeneration = 0L
+    private var pendingConfigurationChangeRestore: ConfigurationChangeScrollSource? = null
 
     private lateinit var binding: FragmentReadingitemBinding
     private lateinit var readingItemActionsBinding: ReadingItemActionsBinding
 
-
     private lateinit var markStoryReadBehavior: MarkStoryReadBehavior
     private var sampledQueue: SampledQueue? = null
 
+    private lateinit var viewModel: ReadingItemViewModel
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        story = requireArguments().getSerializable("story") as Story?
+        viewModel = ViewModelProvider(this)[ReadingItemViewModel::class.java]
+
+        val restoredFromBundle = story == null
+        if (restoredFromBundle) story = requireArguments().getSerializable("story") as Story?
 
         displayFeedDetails = requireArguments().getBoolean("displayFeedDetails")
         feedIconUrl = requireArguments().getString("faviconUrl")
@@ -143,26 +270,132 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         classifier = requireArguments().getSerializable("classifier") as Classifier?
         sourceUserId = requireArguments().getString("sourceUserId")
 
-        user = PrefsUtils.getUserDetails(requireContext())
-        markStoryReadBehavior = PrefsUtils.getMarkStoryReadBehavior(requireContext())
+        userId = prefsRepo.getUserDetails().id
+        enableHighlights = prefsRepo.getIsPremium() || prefsRepo.getIsArchive()
+        markStoryReadBehavior = prefsRepo.getMarkStoryReadBehavior()
 
-        if (markStoryReadBehavior == MarkStoryReadBehavior.IMMEDIATELY) {
+        if (markStoryReadBehavior.getDelayMillis() == 0L) {
             sampledQueue = SampledQueue(250, 5)
         }
         if (savedInstanceState != null) {
             savedScrollPosRel = savedInstanceState.getFloat(BUNDLE_SCROLL_POS_REL)
+            savedScrollPosPx = savedInstanceState.getInt(BUNDLE_SCROLL_POS_PX)
+            preferAbsoluteScrollRestore = savedInstanceState.getBoolean(BUNDLE_SCROLL_POS_PREFER_ABSOLUTE)
             // we can't actually use the saved scroll position until the webview finishes loading
+        } else {
+            savedScrollPosRel = requireArguments().getFloat(ARG_INITIAL_SCROLL_POS_REL)
+        }
+        hasSavedScrollPosition = savedScrollPosRel > 0f || savedScrollPosPx > 0
+
+        story?.let { storyHighlights.addAll(it.highlights) }
+        if (restoredFromBundle) {
+            story?.let { bundledStory ->
+                lifecycleScope.launch {
+                    val clusters = withContext(Dispatchers.IO) { dbHelper.getStoryClusterStories(bundledStory.storyHash) }
+                    applyRestoredClusterMetadata(bundledStory, clusters)
+                }
+            }
         }
     }
 
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
+    private fun applyRestoredClusterMetadata(bundledStory: Story, clusters: Array<Story.ClusterStory>) {
+        // ReadingAdapter.kt may have delivered a newer full Story while the database query was running.
+        if (story !== bundledStory) return
+        bundledStory.clusterStories = clusters
+        if (view != null) setupItemMetadata()
+    }
+
+    override fun onSaveInstanceState(savedInstanceState: Bundle) {
+        super.onSaveInstanceState(savedInstanceState)
+        if (!::binding.isInitialized) return
+
         val heightm = binding.readingScrollview.getChildAt(0).measuredHeight
         val pos = binding.readingScrollview.scrollY
-        outState.putFloat(BUNDLE_SCROLL_POS_REL, pos.toFloat() / heightm)
+        savedInstanceState.putFloat(BUNDLE_SCROLL_POS_REL, pos.toFloat() / heightm)
+        savedInstanceState.putInt(BUNDLE_SCROLL_POS_PX, pos)
+        savedInstanceState.putBoolean(BUNDLE_SCROLL_POS_PREFER_ABSOLUTE, true)
+    }
+
+    fun currentScrollPosRel(): Float? {
+        if (!::binding.isInitialized || binding.readingScrollview.childCount == 0) {
+            return null
+        }
+
+        val contentHeight = binding.readingScrollview.getChildAt(0).measuredHeight
+        if (contentHeight <= 0) {
+            return null
+        }
+
+        return binding.readingScrollview.scrollY.toFloat() / contentHeight
+    }
+
+    private fun captureCurrentScrollPosition(
+        preferAbsoluteRestore: Boolean,
+        reason: String,
+    ): Boolean {
+        val scrollPosRel = currentScrollPosRel() ?: return false
+        savedScrollPosRel = scrollPosRel
+        savedScrollPosPx = binding.readingScrollview.scrollY
+        hasSavedScrollPosition = true
+        preferAbsoluteScrollRestore = preferAbsoluteRestore
+        logReaderRestore(
+            "capture reason=$reason px=$savedScrollPosPx rel=$savedScrollPosRel " +
+                "height=${binding.readingScrollview.getChildAt(0).measuredHeight} preferAbs=$preferAbsoluteRestore " +
+                "state=${lifecycle.currentState}",
+        )
+        return true
+    }
+
+    fun prepareForConfigurationChange(): Float {
+        val scrollView = binding.readingScrollview
+        val oldScrollY = scrollView.scrollY
+        val oldContentHeight = scrollView.getChildAt(0).measuredHeight
+        val oldWebView = readingWebview
+        val oldWebViewWidth = oldWebView?.width ?: 0
+        val oldWebViewHeight = oldWebView?.height ?: 0
+        val previousRestore = pendingConfigurationChangeRestore
+        val hasCurrentReaderAnchor =
+            shouldUseReaderAnchorForConfigurationChange(
+                previousRestoreHasAnchor =
+                    previousRestore?.hasReaderAnchor == true &&
+                        previousRestore.webView === oldWebView,
+                anchorCapturedScrollY = readerAnchorCapturedScrollY,
+                currentScrollY = oldScrollY,
+            )
+
+        configurationChangeGeneration++
+        invalidateReaderAnchorCapture()
+        if (captureCurrentScrollPosition(preferAbsoluteRestore = false, reason = "configuration")) {
+            val restore =
+                ConfigurationChangeScrollSource(
+                    generation = configurationChangeGeneration,
+                    scrollY = previousRestore?.scrollY ?: oldScrollY,
+                    contentHeight = previousRestore?.contentHeight ?: oldContentHeight,
+                    webView = oldWebView,
+                    webViewWidth = oldWebViewWidth,
+                    webViewHeight = oldWebViewHeight,
+                    hasReaderAnchor = hasCurrentReaderAnchor,
+                )
+            pendingConfigurationChangeRestore = restore
+            scrollView.doOnNextLayout {
+                scheduleConfigurationChangeScrollRestore(restore)
+            }
+        } else {
+            pendingConfigurationChangeRestore = null
+        }
+        return savedScrollPosRel
     }
 
     override fun onDestroyView() {
+        clearBottomInsetListener?.run()
+        clearBottomInsetListener = null
+        // A photo host that never started must not keep this fragment, its WebView, or the preview alive.
+        storyImageHostToken?.let(StoryImageViewerHost::cancelPending)
+        storyImageHostToken = null
+        storyImageHostLaunchedAt = 0L
+        cancelPendingConfigurationChangeRestore()
+        invalidateReaderAnchorCapture()
+        destroyReadingWebviewForBackground()
         sampledQueue?.close()
         super.onDestroyView()
     }
@@ -170,92 +403,175 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
     // WebViews don't automatically pause content like audio and video when they lose focus.  Chain our own
     // state into the webview so it behaves.
     override fun onPause() {
-        binding.readingWebview.onPause()
+        articleReveal.pause()
+        if (::binding.isInitialized) {
+            enableProgress(false)
+            captureCurrentScrollPosition(preferAbsoluteRestore = true, reason = "pause")
+        }
+        readingWebview?.onPause()
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
-        reloadStoryContent()
-        binding.readingWebview.onResume()
+        val shouldReloadStoryContent =
+            shouldReloadStoryContentOnResume(
+                isWebViewReleasedForBackground = isWebViewReleasedForBackground,
+                hasCompletedInitialStoryRender = hasCompletedInitialStoryRender,
+                hasWebViewContent = hasWebViewContent,
+            )
+        logReaderRestore(
+            "onResume released=$isWebViewReleasedForBackground completed=$hasCompletedInitialStoryRender " +
+                "hasContent=$hasWebViewContent reload=$shouldReloadStoryContent savedPx=$savedScrollPosPx " +
+                "savedRel=$savedScrollPosRel hasSaved=$hasSavedScrollPosition preferAbs=$preferAbsoluteScrollRestore",
+        )
+        isRestoringReleasedWebView = isWebViewReleasedForBackground
+        if (shouldReloadStoryContent) {
+            documentRenderer.clear()
+            resetStoryRenderState()
+            reloadStoryContent()
+        }
+        syncStoryLoadingUi()
+        updateStoryButtons()
+        ensureReadingWebview().resumeTimers()
+        ensureReadingWebview().onResume()
+        articleReveal.resume()
+        story?.storyHash?.let { (activity as? Reading)?.onReaderPageNativeReady(it) }
     }
 
-    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?,
+    ): View {
         binding = FragmentReadingitemBinding.inflate(inflater, container, false)
         readingItemActionsBinding = ReadingItemActionsBinding.bind(binding.root)
+        lastMetadataSnapshot = null
+        nativeHeaderStoryHash = null
+        lastClusterSnapshot = null
+        lastSocialSnapshot = null
 
         val readingActivity = requireActivity() as Reading
         fs = readingActivity.fs
+        readingWebview = binding.readingWebview
+        hasWebViewContent = false
+        readingWebviewParent = binding.readingWebview.parent as? ViewGroup
+        readingWebviewLayoutParams = binding.readingWebview.layoutParams
+        readingWebviewIndex = readingWebviewParent?.indexOfChild(binding.readingWebview) ?: -1
 
-        selectedViewMode = PrefsUtils.getDefaultViewModeForFeed(readingActivity, story!!.feedId)
+        selectedViewMode = prefsRepo.getDefaultViewModeForFeed(story!!.feedId)
 
-        registerForContextMenu(binding.readingWebview)
-        binding.readingWebview.setCustomViewLayout(binding.customViewContainer)
-        binding.readingWebview.setWebviewWrapperLayout(binding.readingContainer)
-        binding.readingWebview.setBackgroundColor(Color.TRANSPARENT)
-        binding.readingWebview.fragment = this
-        binding.readingWebview.activity = readingActivity
+        configureReadingWebview(binding.readingWebview, readingActivity)
 
         setupItemMetadata()
-        updateTrainButton()
         updateShareButton()
         updateSaveButton()
+        updateStoryButtons()
         updateMarkStoryReadState()
         setupItemCommentsAndShares()
+        syncStoryLoadingUi()
 
         binding.readingScrollview.registerScrollChangeListener(readingActivity)
+        binding.readingScrollview.registerScrollChangeListener(this)
+        binding.readingScrollview.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                cancelPendingConfigurationChangeRestore()
+            }
+            // Listen's follow-along doesn't scroll the story while the reader is moving it.
+            scrollTouching = event.actionMasked != MotionEvent.ACTION_UP && event.actionMasked != MotionEvent.ACTION_CANCEL
+            lastScrollTouchAt = SystemClock.uptimeMillis()
+            false
+        }
+        listenFollower =
+            ListenStoryFollower(
+                storyHash = { story?.storyHash },
+                webView = { readingWebview },
+                scrollView = binding.readingScrollview,
+                titleView = binding.readingItemTitle,
+                theme = prefsRepo.getResolvedTheme(requireContext()),
+                isUserScrolling = { scrollTouching || SystemClock.uptimeMillis() - lastScrollTouchAt < LISTEN_SCROLL_QUIET_MS },
+                onParagraphTapped = { hash, paragraph -> listenManager.seekToParagraph(hash, paragraph) },
+            )
+        styleListenPreviewPill()
 
         return binding.root
     }
 
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+    override fun onViewCreated(
+        view: View,
+        savedInstanceState: Bundle?,
+    ) {
         super.onViewCreated(view, savedInstanceState)
-        binding.storyContextMenuButton.setOnClickListener { onClickMenuButton() }
-        readingItemActionsBinding.markReadStoryButton.setOnClickListener { switchMarkStoryReadState() }
+        clearBottomInsetListener = view.applyReaderFooterInsetTo(readingItemActionsBinding.readerTraversalFooter)
+        view.doOnPreDraw {
+            story?.storyHash?.let { (activity as? Reading)?.onReaderPageNativeReady(it) }
+        }
+
         readingItemActionsBinding.trainStoryButton.setOnClickListener { openStoryTrainer() }
         readingItemActionsBinding.saveStoryButton.setOnClickListener { switchStorySavedState() }
         readingItemActionsBinding.shareStoryButton.setOnClickListener { openShareDialog() }
-    }
+        readingItemActionsBinding.askAiStoryButton.setOnClickListener { openAskAiDialog() }
+        readingItemActionsBinding.listenStoryButton.setOnClickListener { listenToStory() }
+        readingItemActionsBinding.listenQueueButton.setOnClickListener { toggleUpNext() }
 
-    override fun onCreateContextMenu(menu: ContextMenu, v: View, menuInfo: ContextMenuInfo?) {
-        val result = binding.readingWebview.hitTestResult
-        if (result.type == HitTestResult.IMAGE_TYPE ||
-                result.type == HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
-            // if the long-pressed item was an image, see if we can pop up a little dialogue
-            // that presents the alt text.  Note that images wrapped in links tend to get detected
-            // as anchors, not images, and may not point to the corresponding image URL.
-            var imageURL = result.extra
-            imageURL = imageURL!!.replace("file://", "")
-            val mappedURL = imageUrlRemaps!![imageURL]
-            val finalURL: String = mappedURL ?: imageURL
-            val altText = imageAltTexts!![finalURL]
-            val builder = AlertDialog.Builder(requireActivity())
-            builder.setTitle(finalURL)
-            if (altText != null) {
-                builder.setMessage(UIUtils.fromHtml(altText))
-            } else {
-                builder.setMessage(finalURL)
+        viewLifecycleOwner.lifecycleScope.launch {
+            // STARTED, not RESUMED, so the pages beside the current one keep their Listen buttons current too.
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    // ListenUiState changes on every 200ms tick; the button only changes on these three values.
+                    listenManager.state
+                        .map(::listenButtonLook)
+                        .distinctUntilChanged()
+                        .collect(::applyListenButtonLook)
+                }
+                combine(listenManager.state, listenPreferences.settings) { state, settings -> state to settings.highlight }
+                    .collect { (state, highlight) ->
+                        showListenTextIfNeeded(state)
+                        listenFollower?.onStateChanged(state, highlight)
+                    }
             }
-            var actionRID = R.string.alert_dialog_openlink
-            if (result.type == HitTestResult.IMAGE_TYPE || result.type == HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
-                actionRID = R.string.alert_dialog_openimage
-            }
-            builder.setPositiveButton(actionRID, object : DialogInterface.OnClickListener {
-                override fun onClick(dialog: DialogInterface, id: Int) {
-                    val i = Intent(Intent.ACTION_VIEW)
-                    i.data = Uri.parse(finalURL)
-                    try {
-                        startActivity(i)
-                    } catch (e: Exception) {
-                        Log.wtf(this.javaClass.name, "device cannot open URLs")
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                launch {
+                    viewModel.readingPayload.collect {
+                        handleReadingItemState(it)
                     }
                 }
-            })
-            builder.setNegativeButton(R.string.alert_dialog_done) { _, _ ->
-                // do nothing
+                launch {
+                    viewModel.storyHighlightsUpdate.collect {
+                        handleStoryHighlightsUpdate(it)
+                    }
+                }
             }
-            builder.show()
-        } else if (result.type == HitTestResult.SRC_ANCHOR_TYPE) {
+        }
+    }
+
+    override fun scrollChanged(
+        hPos: Int,
+        vPos: Int,
+        currentWidth: Int,
+        currentHeight: Int,
+    ) {
+        if (pendingConfigurationChangeRestore == null) {
+            scheduleReaderAnchorCapture()
+        }
+    }
+
+    override fun onCreateContextMenu(
+        menu: ContextMenu,
+        v: View,
+        menuInfo: ContextMenuInfo?,
+    ) {
+        val result = ensureReadingWebview().hitTestResult
+        if (result.type == HitTestResult.IMAGE_TYPE || result.type == HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+            // A long-pressed story photo opens StoryImageViewer.kt with its title text and Copy,
+            // Save, and Share actions from storyDetailView.js's contextmenu handler, so the native
+            // long-press adds nothing on top of it.
+            return
+        }
+        if (result.type == HitTestResult.SRC_ANCHOR_TYPE) {
             val url = result.extra
             val intent = Intent(Intent.ACTION_SEND)
             intent.type = "text/plain"
@@ -267,29 +583,88 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         }
     }
 
-    private fun onClickMenuButton() {
-        val pm = PopupMenu(requireActivity(), binding.storyContextMenuButton)
-        val menu = pm.menu
-        pm.menuInflater.inflate(R.menu.story_context, menu)
+    private fun handleReadingItemState(readingPayload: ReadingItemViewModel.ReadingPayload) {
+        when (readingPayload) {
+            ReadingItemViewModel.Idle -> return
+            ReadingItemViewModel.NoStoryContent -> {
+                com.newsblur.util.Log
+                    .w(this, "Couldn't find story content for existing story.")
+                activity?.finish()
+            }
+
+            is ReadingItemViewModel.StoryContent -> {
+                storyContent = readingPayload.content
+            }
+
+            is ReadingItemViewModel.StoryOriginalText -> {
+                if (readingPayload.text == NULL_STORY_TEXT) {
+                    textViewUnavailable = true
+                } else {
+                    originalText = readingPayload.text
+                }
+            }
+        }
+        reloadStoryContent()
+    }
+
+    private fun handleStoryHighlightsUpdate(highlights: List<String>) {
+        story?.let {
+            if (storyHighlights == highlights) return@let
+            storyHighlights.clear()
+            storyHighlights.addAll(highlights)
+
+            applyStoryHighlights()
+        }
+    }
+
+    fun showStoryContextMenu(anchor: View) {
+        ReadingStoryMenuPopup(
+            context = requireContext(),
+            prefsRepo = prefsRepo,
+            controller =
+                object : ReadingStoryMenuPopup.Controller {
+                    override fun buildMenuModel(): Menu = buildStoryContextMenu()
+
+                    override fun onMenuItemSelected(itemId: Int): Boolean = onMenuItemClick(buildStoryContextMenu().findItem(itemId))
+                },
+        ).show(anchor)
+    }
+
+    private fun buildStoryContextMenu(): Menu {
+        val popupMenu = PopupMenu(requireActivity(), binding.storyContextMenuButton)
+        val menu = popupMenu.menu
+        popupMenu.menuInflater.inflate(R.menu.story_context, menu)
 
         menu.findItem(R.id.menu_reading_save).setTitle(if (story!!.starred) R.string.menu_unsave_story else R.string.menu_save_story)
-        if (fs!!.isFilterSaved || fs!!.isAllSaved || fs!!.singleSavedTag != null) menu.findItem(R.id.menu_reading_markunread).isVisible = false
+        val listenState = listenManager.state.value
+        menu.findItem(R.id.menu_reading_listen).setTitle(
+            if (listenState.isStory(story!!.storyHash) && listenState.showsPause) R.string.listen_pause else R.string.menu_listen,
+        )
+        menu.findItem(R.id.menu_reading_up_next).apply {
+            // The story playing can't also wait in Up Next.
+            isVisible = !listenState.isStory(story!!.storyHash)
+            setTitle(if (listenState.isQueued(story!!.storyHash)) R.string.listen_remove_from_up_next else R.string.listen_add_to_up_next)
+        }
+        if (fs!!.isFilterSaved ||
+            fs!!.isAllSaved ||
+            fs!!.singleSavedTag != null
+        ) {
+            menu.findItem(R.id.menu_reading_markunread).isVisible = false
+        }
 
         if (KeyboardManager.hasHardwareKeyboard(requireContext())) {
             menu.findItem(R.id.menu_shortcuts).isVisible = true
         }
 
-        when (PrefsUtils.getSelectedTheme(requireContext())) {
+        when (prefsRepo.getSelectedTheme()) {
             ThemeValue.LIGHT -> menu.findItem(R.id.menu_theme_light).isChecked = true
+            ThemeValue.SEPIA -> menu.findItem(R.id.menu_theme_sepia).isChecked = true
             ThemeValue.DARK -> menu.findItem(R.id.menu_theme_dark).isChecked = true
             ThemeValue.BLACK -> menu.findItem(R.id.menu_theme_black).isChecked = true
             ThemeValue.AUTO -> menu.findItem(R.id.menu_theme_auto).isChecked = true
-            else -> {
-            }
         }
 
-        val readingTextSize = PrefsUtils.getReadingTextSize(requireContext())
-        when (ReadingTextSize.fromSize(readingTextSize)) {
+        when (ReadingTextSize.fromSize(prefsRepo.getReadingTextSize())) {
             ReadingTextSize.XS -> menu.findItem(R.id.menu_text_size_xs).isChecked = true
             ReadingTextSize.S -> menu.findItem(R.id.menu_text_size_s).isChecked = true
             ReadingTextSize.M -> menu.findItem(R.id.menu_text_size_m).isChecked = true
@@ -298,7 +673,7 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
             ReadingTextSize.XXL -> menu.findItem(R.id.menu_text_size_xxl).isChecked = true
         }
 
-        when (Font.getFont(PrefsUtils.getFontString(requireContext()))) {
+        when (Font.getFont(prefsRepo.getFontString())) {
             Font.ANONYMOUS_PRO -> menu.findItem(R.id.menu_font_anonymous).isChecked = true
             Font.CHRONICLE -> menu.findItem(R.id.menu_font_chronicle).isChecked = true
             Font.DEFAULT -> menu.findItem(R.id.menu_font_default).isChecked = true
@@ -309,166 +684,211 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
             Font.ROBOTO -> menu.findItem(R.id.menu_font_roboto).isChecked = true
         }
 
-        pm.setOnMenuItemClickListener(this)
-        pm.show()
+        return menu
     }
 
-    override fun onMenuItemClick(item: MenuItem): Boolean = when (item.itemId) {
-        R.id.menu_reading_original -> {
-            openBrowser()
-            true
-        }
-        R.id.menu_reading_sharenewsblur -> {
-            var sourceUserId: String? = null
-            if (fs!!.singleSocialFeed != null) sourceUserId = fs!!.singleSocialFeed.key
-            val newFragment: DialogFragment = ShareDialogFragment.newInstance(story, sourceUserId)
-            newFragment.show(requireActivity().supportFragmentManager, "dialog")
-            true
-        }
-        R.id.menu_send_story -> {
-            feedUtils.sendStoryUrl(story, requireContext())
-            true
-        }
-        R.id.menu_send_story_full -> {
-            feedUtils.sendStoryFull(story, requireContext())
-            true
-        }
-        R.id.menu_shortcuts -> {
-            showStoryShortcuts()
-            true
-        }
-        R.id.menu_text_size_xs -> {
-            setTextSizeStyle(ReadingTextSize.XS)
-            true
-        }
-        R.id.menu_text_size_s -> {
-            setTextSizeStyle(ReadingTextSize.S)
-            true
-        }
-        R.id.menu_text_size_m -> {
-            setTextSizeStyle(ReadingTextSize.M)
-            true
-        }
-        R.id.menu_text_size_l -> {
-            setTextSizeStyle(ReadingTextSize.L)
-            true
-        }
-        R.id.menu_text_size_xl -> {
-            setTextSizeStyle(ReadingTextSize.XL)
-            true
-        }
-        R.id.menu_text_size_xxl -> {
-            setTextSizeStyle(ReadingTextSize.XXL)
-            true
-        }
-        R.id.menu_font_anonymous -> {
-            setReadingFont(getString(R.string.anonymous_pro_font_prefvalue))
-            true
-        }
-        R.id.menu_font_chronicle -> {
-            setReadingFont(getString(R.string.chronicle_font_prefvalue))
-            true
-        }
-        R.id.menu_font_default -> {
-            setReadingFont(getString(R.string.default_font_prefvalue))
-            true
-        }
-        R.id.menu_font_gotham -> {
-            setReadingFont(getString(R.string.gotham_narrow_font_prefvalue))
-            true
-        }
-        R.id.menu_font_noto_sand -> {
-            setReadingFont(getString(R.string.noto_sans_font_prefvalue))
-            true
-        }
-        R.id.menu_font_noto_serif -> {
-            setReadingFont(getString(R.string.noto_serif_font_prefvalue))
-            true
-        }
-        R.id.menu_font_open_sans -> {
-            setReadingFont(getString(R.string.open_sans_condensed_font_prefvalue))
-            true
-        }
-        R.id.menu_font_roboto -> {
-            setReadingFont(getString(R.string.roboto_font_prefvalue))
-            true
-        }
-        R.id.menu_reading_save -> {
-            if (story!!.starred) {
-                feedUtils.setStorySaved(story!!, false, requireContext(), null)
-            } else {
-                feedUtils.setStorySaved(story!!.storyHash, true, requireContext())
+    override fun onMenuItemClick(item: MenuItem): Boolean =
+        when (item.itemId) {
+            R.id.menu_reading_original -> {
+                openBrowser()
+                true
             }
-            true
-        }
-        R.id.menu_reading_markunread -> {
-            feedUtils.markStoryUnread(story!!, requireContext())
-            true
-        }
-        R.id.menu_theme_auto -> {
-            PrefsUtils.setSelectedTheme(requireContext(), ThemeValue.AUTO)
-            UIUtils.restartActivity(requireActivity())
-            true
-        }
-        R.id.menu_theme_light -> {
-            PrefsUtils.setSelectedTheme(requireContext(), ThemeValue.LIGHT)
-            UIUtils.restartActivity(requireActivity())
-            true
-        }
-        R.id.menu_theme_dark -> {
-            PrefsUtils.setSelectedTheme(requireContext(), ThemeValue.DARK)
-            UIUtils.restartActivity(requireActivity())
-            true
-        }
-        R.id.menu_theme_black -> {
-            PrefsUtils.setSelectedTheme(requireContext(), ThemeValue.BLACK)
-            UIUtils.restartActivity(requireActivity())
-            true
-        }
-        R.id.menu_intel -> {
-            // check against training on feedless stories
-            if (story!!.feedId != "0") {
-                openStoryTrainer()
+
+            R.id.menu_reading_listen -> {
+                listenToStory()
+                true
             }
-            true
-        }
-        R.id.menu_go_to_feed -> {
-            val feed = dbHelper.getFeed(story!!.feedId)
-            feed?.let {
-                val fs = FeedSet.singleFeed(it.feedId)
-                FeedItemsList.startActivity(requireContext(), fs, it, null, null)
+
+            R.id.menu_reading_up_next -> {
+                toggleUpNext()
+                true
             }
-            true
+
+            R.id.menu_reading_sharenewsblur -> {
+                var sourceUserId: String? = null
+                if (fs!!.singleSocialFeed != null) sourceUserId = fs!!.singleSocialFeed.key
+                val newFragment: DialogFragment = ShareDialogFragment.newInstance(story, sourceUserId)
+                newFragment.show(requireActivity().supportFragmentManager, "dialog")
+                true
+            }
+
+            R.id.menu_send_story -> {
+                feedUtils.sendStoryUrl(story, requireContext())
+                true
+            }
+
+            R.id.menu_send_story_full -> {
+                feedUtils.sendStoryFull(story, requireContext())
+                true
+            }
+
+            R.id.menu_shortcuts -> {
+                showStoryShortcuts()
+                true
+            }
+
+            R.id.menu_text_size_xs -> {
+                setTextSizeStyle(ReadingTextSize.XS)
+                true
+            }
+
+            R.id.menu_text_size_s -> {
+                setTextSizeStyle(ReadingTextSize.S)
+                true
+            }
+
+            R.id.menu_text_size_m -> {
+                setTextSizeStyle(ReadingTextSize.M)
+                true
+            }
+
+            R.id.menu_text_size_l -> {
+                setTextSizeStyle(ReadingTextSize.L)
+                true
+            }
+
+            R.id.menu_text_size_xl -> {
+                setTextSizeStyle(ReadingTextSize.XL)
+                true
+            }
+
+            R.id.menu_text_size_xxl -> {
+                setTextSizeStyle(ReadingTextSize.XXL)
+                true
+            }
+
+            R.id.menu_font_anonymous -> {
+                setReadingFont(getString(R.string.anonymous_pro_font_prefvalue))
+                true
+            }
+
+            R.id.menu_font_chronicle -> {
+                setReadingFont(getString(R.string.chronicle_font_prefvalue))
+                true
+            }
+
+            R.id.menu_font_default -> {
+                setReadingFont(getString(R.string.default_font_prefvalue))
+                true
+            }
+
+            R.id.menu_font_gotham -> {
+                setReadingFont(getString(R.string.gotham_narrow_font_prefvalue))
+                true
+            }
+
+            R.id.menu_font_noto_sand -> {
+                setReadingFont(getString(R.string.noto_sans_font_prefvalue))
+                true
+            }
+
+            R.id.menu_font_noto_serif -> {
+                setReadingFont(getString(R.string.noto_serif_font_prefvalue))
+                true
+            }
+
+            R.id.menu_font_open_sans -> {
+                setReadingFont(getString(R.string.open_sans_condensed_font_prefvalue))
+                true
+            }
+
+            R.id.menu_font_roboto -> {
+                setReadingFont(getString(R.string.roboto_font_prefvalue))
+                true
+            }
+
+            R.id.menu_reading_save -> {
+                if (story!!.starred) {
+                    feedUtils.setStorySaved(story!!, false, requireContext(), emptyList(), emptyList())
+                } else {
+                    feedUtils.setStorySaved(story!!, true, requireContext(), emptyList(), emptyList())
+                }
+                true
+            }
+
+            R.id.menu_reading_markunread -> {
+                feedUtils.markStoryUnread(story!!, requireContext())
+                true
+            }
+
+            R.id.menu_theme_auto -> {
+                prefsRepo.setSelectedTheme(ThemeValue.AUTO)
+                true
+            }
+
+            R.id.menu_theme_light -> {
+                prefsRepo.setSelectedTheme(ThemeValue.LIGHT)
+                true
+            }
+
+            R.id.menu_theme_sepia -> {
+                prefsRepo.setSelectedTheme(ThemeValue.SEPIA)
+                true
+            }
+
+            R.id.menu_theme_dark -> {
+                prefsRepo.setSelectedTheme(ThemeValue.DARK)
+                true
+            }
+
+            R.id.menu_theme_black -> {
+                prefsRepo.setSelectedTheme(ThemeValue.BLACK)
+                true
+            }
+
+            R.id.menu_intel -> {
+                // check against training on feedless stories
+                if (story!!.feedId != "0") {
+                    openStoryTrainer()
+                }
+                true
+            }
+
+            R.id.menu_go_to_feed -> {
+                val feed = dbHelper.getFeed(story!!.feedId)
+                feed?.let {
+                    val targetFeedSet = FeedSet.singleFeed(it.feedId)
+                    val folderName = targetFeedFolderName()
+                    feedUtils.currentFolderName =
+                        if (folderName == AppConstants.ROOT_FOLDER) {
+                            null
+                        } else {
+                            folderName
+                        }
+                    FeedItemsList.startActivity(requireContext(), targetFeedSet, it, folderName, null, null)
+                }
+                true
+            }
+
+            else -> {
+                super.onOptionsItemSelected(item)
+            }
         }
-        else -> {
-            super.onOptionsItemSelected(item)
-        }
-    }
 
     fun switchMarkStoryReadState(notifyUser: Boolean = false) {
         story?.let {
-            val msg = if (it.read) {
-                feedUtils.markStoryUnread(it, requireContext())
-                getString(R.string.story_unread)
-            }
-            else {
-                feedUtils.markStoryAsRead(it, requireContext())
-                getString(R.string.story_read)
-            }
+            val msg =
+                if (it.read) {
+                    feedUtils.markStoryUnread(it, requireContext())
+                    getString(R.string.story_unread)
+                } else {
+                    (activity as? Reading)?.markStoryAsRead(it) ?: feedUtils.markStoryAsRead(it, requireContext())
+                    getString(R.string.story_read)
+                }
             if (notifyUser) UIUtils.showSnackBar(binding.root, msg)
         } ?: Log.e(this.javaClass.name, "Error switching null story read state.")
-
     }
 
-    private fun updateMarkStoryReadState() {
-        if (markStoryReadBehavior == MarkStoryReadBehavior.MANUALLY) {
-            readingItemActionsBinding.markReadStoryButton.visibility = View.VISIBLE
-            readingItemActionsBinding.markReadStoryButton.setStoryReadState(requireContext(), story!!.read)
-        } else {
-            readingItemActionsBinding.markReadStoryButton.visibility = View.GONE
+    private fun targetFeedFolderName(): String =
+        when {
+            fs?.isFolder == true -> fs?.folderName ?: AppConstants.ROOT_FOLDER
+            !feedUtils.currentFolderName.isNullOrEmpty() -> feedUtils.currentFolderName!!
+            else -> AppConstants.ROOT_FOLDER
         }
 
-        sampledQueue?.add { updateStoryReadTitleState.invoke() } ?: updateStoryReadTitleState.invoke()
+    private fun updateMarkStoryReadState() {
+        sampledQueue?.add { updateStoryReadTitleState.invoke() }
+            ?: updateStoryReadTitleState.invoke()
     }
 
     fun openStoryTrainer() {
@@ -476,21 +896,190 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         intelFrag.show(requireActivity().supportFragmentManager, StoryIntelTrainerFragment::class.java.name)
     }
 
-    private fun updateTrainButton() {
-        readingItemActionsBinding.trainStoryButton.visibility = if (story!!.feedId == "0") View.GONE else View.VISIBLE
+    /**
+     * Shows the story buttons left on in Settings (synced as show_sideoption prefs): one row, or three over two
+     * when all five are visible (StoryButtons.kt). Training needs a feed, so feedless stories never show Train.
+     */
+    private fun updateStoryButtons() {
+        val currentStory = story ?: return
+        val actions = readingItemActionsBinding
+        val buttons =
+            listOf(
+                StoryButton.TRAIN to actions.trainStoryButton,
+                StoryButton.SAVE to actions.saveStoryButton,
+                StoryButton.SHARE to actions.shareStoryButton,
+                StoryButton.ASK_AI to actions.askAiStoryButton,
+                StoryButton.LISTEN to actions.listenStoryButtonContainer,
+            )
+        val visible =
+            buttons
+                .filter { (button, _) ->
+                    listenPreferences.isStoryButtonVisible(button) && (button != StoryButton.TRAIN || currentStory.feedId != "0")
+                }.map { it.second }
+        val rows = StoryButtonLayout.rows(visible)
+        listenRowSize = rows.firstOrNull { actions.listenStoryButtonContainer in it }?.size ?: 0
+        val signature = rows.map { row -> row.map { it.id } }
+        if (signature == lastStoryButtonRows) return
+        lastStoryButtonRows = signature
+
+        buttons.forEach { (_, view) -> (view.parent as? ViewGroup)?.removeView(view) }
+        val gap = UIUtils.dp2px(requireContext(), 6)
+        val height = UIUtils.dp2px(requireContext(), 38)
+        listOf(actions.storyActionButtonsRow, actions.storyActionButtonsRow2).forEachIndexed { rowIndex, row ->
+            val views = rows.getOrNull(rowIndex).orEmpty()
+            views.forEachIndexed { index, view ->
+                val params =
+                    LinearLayout.LayoutParams(0, height, 1f).apply {
+                        marginStart = if (index == 0) 0 else gap
+                        marginEnd = if (index == views.lastIndex) 0 else gap
+                    }
+                row.addView(view, params)
+            }
+            row.visibility = if (views.isEmpty()) View.GONE else View.VISIBLE
+        }
+        // The Listen cell's width changed, so its label may now fit beside the Up Next button or not.
+        applyListenButtonLook(listenButtonLook(listenManager.state.value))
+    }
+
+    private fun styleListenPreviewPill() {
+        val theme = prefsRepo.getResolvedTheme(requireContext())
+        readingItemActionsBinding.listenStoryPreviewPill.background =
+            GradientDrawable().apply {
+                cornerRadius = UIUtils.dp2px(requireContext(), 999).toFloat()
+                setColor(ListenPalette.previewBackgroundArgb(theme))
+            }
+        readingItemActionsBinding.listenStoryPreviewPill.setTextColor(ListenPalette.previewTextArgb(theme))
+    }
+
+    /** Up Next's small button beside Listen: hidden unless another story is playing. */
+    private enum class UpNextButton { HIDDEN, ADD, QUEUED }
+
+    /**
+     * What this page's Listen button shows, so it's only touched when that changes: Pause or Resume for the story
+     * playing, the 30s preview pill without Archive, and the Up Next button.
+     */
+    private data class ListenButtonLook(
+        @param:StringRes val text: Int,
+        @param:DrawableRes val icon: Int,
+        val showsPreviewPill: Boolean,
+        val upNext: UpNextButton,
+    )
+
+    private fun listenButtonLook(state: ListenUiState): ListenButtonLook {
+        val hash = story?.storyHash
+        val isThisStory = state.isStory(hash)
+        val loaded = isThisStory && (state.phase == ListenPhase.READY || state.isLoading)
+        // The synced profile goes first: Listen's last usage report can predate a change of plan.
+        val archiveTier = isArchiveUser()
+        val upNext =
+            when {
+                !state.isActive || isThisStory -> UpNextButton.HIDDEN
+                state.isQueued(hash) -> UpNextButton.QUEUED
+                else -> UpNextButton.ADD
+            }
+        return when {
+            isThisStory && state.showsPause -> ListenButtonLook(R.string.listen_pause, R.drawable.ic_listen_pause, !archiveTier, upNext)
+            loaded -> ListenButtonLook(R.string.listen_resume, R.drawable.ic_listen, !archiveTier, upNext)
+            else -> ListenButtonLook(R.string.listen_story_button, R.drawable.ic_listen, !archiveTier, upNext)
+        }
+    }
+
+    private fun applyListenButtonLook(look: ListenButtonLook) {
+        val actions = readingItemActionsBinding
+        val showsUpNext = look.upNext != UpNextButton.HIDDEN
+        // A Listen cell sharing a four-button row is too narrow for its label beside the Up Next button.
+        val iconOnly = showsUpNext && listenRowSize >= COMPACT_LISTEN_ROW_SIZE
+        actions.listenStoryButton.text = if (iconOnly) "" else getString(look.text)
+        actions.listenStoryButton.contentDescription = getString(look.text)
+        actions.listenStoryButton.iconPadding = if (iconOnly) 0 else UIUtils.dp2px(requireContext(), 6)
+        actions.listenStoryButton.setIconResource(look.icon)
+        actions.listenStoryPreviewPill.visibility = if (look.showsPreviewPill && !iconOnly) View.VISIBLE else View.GONE
+        actions.listenQueueButton.visibility = if (showsUpNext) View.VISIBLE else View.GONE
+        if (showsUpNext) {
+            val queued = look.upNext == UpNextButton.QUEUED
+            actions.listenQueueButton.setIconResource(if (queued) R.drawable.ic_checkmark else R.drawable.ic_add)
+            actions.listenQueueButton.iconSize = UIUtils.dp2px(requireContext(), if (queued) 16 else 12)
+            actions.listenQueueButton.contentDescription =
+                getString(if (queued) R.string.listen_queued_remove else R.string.listen_add_to_up_next)
+        }
+    }
+
+    /** The + beside Listen, and the story menu's Up Next item: adds this story to Up Next, or takes it back out. */
+    private fun toggleUpNext() {
+        val currentStory = story ?: return
+        if (listenManager.state.value.isQueued(currentStory.storyHash)) {
+            listenManager.removeFromUpNext(currentStory.storyHash)
+            showUpNextMessage(getString(R.string.listen_removed_from_up_next))
+        } else {
+            val position = listenManager.addToUpNext(currentStory)
+            // ICU's ordinal keeps "2nd" right in every language.
+            val message =
+                MessageFormat(getString(R.string.listen_added_to_up_next), Locale.getDefault())
+                    .format(arrayOf<Any>(position))
+            showUpNextMessage(message)
+        }
+    }
+
+    /** The confirmation sits above Listen's mini player, which would otherwise cover it. */
+    private fun showUpNextMessage(message: String) {
+        val activity = activity ?: return
+        val root = activity.findViewById<View>(android.R.id.content) ?: return
+        val snackbar = Snackbar.make(root, message, Snackbar.LENGTH_SHORT)
+        activity.findViewById<View>(R.id.listen_mini_player)?.takeIf { it.isShown && it.height > 0 }?.let {
+            snackbar.anchorView = it
+        }
+        snackbar.show()
+    }
+
+    /**
+     * When Listen reads the extracted article because the feed only carries a summary, the story on screen switches
+     * to Text view once, at playback start, so follow-along can highlight what's being read. The feed's default view
+     * stays as it was.
+     */
+    private fun showListenTextIfNeeded(state: ListenUiState) {
+        if (!state.isStory(story?.storyHash) || state.phase == ListenPhase.IDLE) {
+            listenShowedText = false
+            return
+        }
+        if (listenShowedText || state.textSource != LISTEN_TEXT_SOURCE_ORIGINAL) return
+        listenShowedText = true
+        if (selectedViewMode != DefaultFeedView.STORY) return
+        selectedViewMode = DefaultFeedView.TEXT
+        reloadStoryContent()
+        (activity as? Reading)?.refreshViewModeControls()
+    }
+
+    fun listenToStory() {
+        val currentStory = story ?: return
+        val reading = activity as? Reading
+        listenManager.listen(
+            currentStory,
+            reading?.listenQueue().orEmpty(),
+            reading?.listenQueueName(),
+            followsListOrder = reading?.listenFollowsListOrder() == true,
+        )
+    }
+
+    /** A paragraph tap from listenFollowAlong.js, through NewsblurWebview.java. */
+    fun onListenMessage(
+        webview: NewsblurWebview,
+        json: String,
+    ) {
+        if (webview !== readingWebview) return
+        listenFollower?.onMessage(json)
     }
 
     fun switchStorySavedState(notifyUser: Boolean = false) {
         story?.let {
-            val msg = if (it.starred) {
-                feedUtils.setStorySaved(it.storyHash, false, requireContext())
-                getString(R.string.story_saved)
-            } else {
-                feedUtils.setStorySaved(it.storyHash, true, requireContext())
-                getString(R.string.story_unsaved)
-            }
+            val msg =
+                if (it.starred) {
+                    feedUtils.setStorySaved(it, false, requireContext(), emptyList(), emptyList())
+                    getString(R.string.story_saved)
+                } else {
+                    feedUtils.setStorySaved(it, true, requireContext(), emptyList(), emptyList())
+                    getString(R.string.story_unsaved)
+                }
             if (notifyUser) UIUtils.showSnackBar(binding.root, msg)
-
         } ?: Log.e(this.javaClass.name, "Error switching null story saved state.")
     }
 
@@ -505,7 +1094,7 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
 
     private fun updateShareButton() {
         for (userId in story!!.sharedUserIds) {
-            if (TextUtils.equals(userId, user!!.id)) {
+            if (userId == this@ReadingItemFragment.userId!!) {
                 readingItemActionsBinding.shareStoryButton.setText(R.string.already_shared)
                 return
             }
@@ -513,11 +1102,39 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         readingItemActionsBinding.shareStoryButton.setText(R.string.share_this)
     }
 
-    private fun setupItemCommentsAndShares() {
+    private fun openAskAiDialog() {
+        val currentStory = story ?: return
+        if (parentFragmentManager.findFragmentByTag(AskAiBottomSheetFragment.TAG) != null) return
+
+        AskAiBottomSheetFragment
+            .newInstance(
+                storyHash = currentStory.storyHash,
+                storyTitle = UIUtils.fromHtml(currentStory.title).toString(),
+            ).show(parentFragmentManager, AskAiBottomSheetFragment.TAG)
+    }
+
+    private fun setupItemCommentsAndShares(force: Boolean = false) {
+        val socialSnapshot =
+            story?.let { current ->
+                listOf(
+                    current.id,
+                    current.sharedUserIds?.toList(),
+                    current.friendUserIds?.toList(),
+                    current.publicComments?.toList(),
+                    current.friendsComments?.toList(),
+                    current.friendsShares?.toList(),
+                )
+            }
+        if (!force && socialSnapshot == lastSocialSnapshot) return
+        lastSocialSnapshot = socialSnapshot
         SetupCommentSectionTask(this, binding.root, layoutInflater, story, iconLoader).execute()
     }
 
     private fun setupItemMetadata() {
+        setupClusterStories()
+        val snapshot = story?.let(::ReaderMetadataSnapshot)
+        if (snapshot == lastMetadataSnapshot) return
+        lastMetadataSnapshot = snapshot
         if (feedColor == null || feedFade == null || feedColor == "null" || feedFade == "null") {
             feedColor = "303030"
             feedFade = "505050"
@@ -528,7 +1145,9 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         UIUtils.setViewBackground(binding.rowItemFeedHeader, gradient)
 
         if (faviconText == "black") {
-            binding.readingFeedTitle.setTextColor(ContextCompat.getColor(requireContext(), R.color.text))
+            binding.readingFeedTitle.setTextColor(
+                UIUtils.getThemedColor(requireContext(), R.attr.defaultText, android.R.attr.textColor),
+            )
             binding.readingFeedTitle.setShadowLayer(1f, 0f, 1f, ContextCompat.getColor(requireContext(), R.color.half_white))
         } else {
             binding.readingFeedTitle.setTextColor(ContextCompat.getColor(requireContext(), R.color.white))
@@ -538,7 +1157,19 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
             binding.readingFeedTitle.visibility = View.GONE
             binding.readingFeedIcon.visibility = View.GONE
         } else {
-            iconLoader.displayImage(feedIconUrl, binding.readingFeedIcon)
+            // Check for custom feed icon
+            val customFeedIcon: CustomIcon? = story?.feedId?.let { BlurDatabaseHelper.getFeedIcon(it) }
+            if (customFeedIcon != null) {
+                val iconSize = UIUtils.dp2px(requireContext(), 17)
+                val iconBitmap = CustomIconRenderer.renderIcon(requireContext(), customFeedIcon, iconSize)
+                if (iconBitmap != null) {
+                    binding.readingFeedIcon.setImageBitmap(iconBitmap)
+                } else {
+                    iconLoader.displayImage(feedIconUrl, binding.readingFeedIcon)
+                }
+            } else {
+                iconLoader.displayImage(feedIconUrl, binding.readingFeedIcon)
+            }
             binding.readingFeedTitle.text = feedTitle
         }
 
@@ -554,25 +1185,35 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         }
 
         if (story!!.starred && story!!.starredTimestamp != 0L) {
-            val savedTimestampText = String.format(resources.getString(R.string.story_saved_timestamp),
-                    StoryUtils.formatLongDate(activity, story!!.starredTimestamp))
-            binding.readingItemSavedTimestamp.visibility = View.VISIBLE
+            val savedTimestampText =
+                String.format(
+                    resources.getString(R.string.story_saved_timestamp),
+                    StoryUtils.formatLongDate(activity, story!!.starredTimestamp),
+                )
             binding.readingItemSavedTimestamp.text = savedTimestampText
+            binding.readingItemSavedTimestamp.visibility = View.VISIBLE
+        } else {
+            binding.readingItemSavedTimestamp.visibility = View.GONE
         }
 
-        binding.readingItemAuthors.setOnClickListener(View.OnClickListener {
-            if (story!!.feedId == "0") return@OnClickListener  // cannot train on feedless stories
-            val intelFrag = StoryIntelTrainerFragment.newInstance(story, fs)
-            intelFrag.show(parentFragmentManager, StoryIntelTrainerFragment::class.java.name)
-        })
-        binding.readingFeedTitle.setOnClickListener(View.OnClickListener {
-            if (story!!.feedId == "0") return@OnClickListener  // cannot train on feedless stories
-            val intelFrag = StoryIntelTrainerFragment.newInstance(story, fs)
-            intelFrag.show(parentFragmentManager, StoryIntelTrainerFragment::class.java.name)
-        })
+        binding.readingItemAuthors.setOnClickListener(
+            View.OnClickListener {
+                if (story!!.feedId == "0") return@OnClickListener // cannot train on feedless stories
+                val intelFrag = StoryIntelTrainerFragment.newInstance(story, fs)
+                intelFrag.show(parentFragmentManager, StoryIntelTrainerFragment::class.java.name)
+            },
+        )
+        binding.readingFeedTitle.setOnClickListener(
+            View.OnClickListener {
+                if (story!!.feedId == "0") return@OnClickListener // cannot train on feedless stories
+                val intelFrag = StoryIntelTrainerFragment.newInstance(story, fs)
+                intelFrag.show(parentFragmentManager, StoryIntelTrainerFragment::class.java.name)
+            },
+        )
         binding.readingItemTitle.setOnClickListener { openBrowser() }
 
         setupTagsAndIntel()
+        nativeHeaderStoryHash = story?.storyHash
     }
 
     private fun setupTagsAndIntel() {
@@ -590,10 +1231,17 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
                         chip.setTextColor(ContextCompat.getColor(requireContext(), R.color.tag_green_text))
                         chip.chipIcon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_thumb_up_green)
                     }
+
                     Classifier.DISLIKE -> {
                         chip.setChipBackgroundColorResource(R.color.tag_red)
                         chip.setTextColor(ContextCompat.getColor(requireContext(), R.color.tag_red_text))
                         chip.chipIcon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_thumb_down_red)
+                    }
+
+                    Classifier.SUPER_DISLIKE -> {
+                        chip.setChipBackgroundColorResource(R.color.tag_dark_red)
+                        chip.setTextColor(ContextCompat.getColor(requireContext(), R.color.tag_red_text))
+                        chip.chipIcon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_thumb_down_double_crimson)
                     }
                 }
             }
@@ -601,7 +1249,7 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
             // tapping tags in saved stories doesn't bring up training
             if (!(fs!!.isAllSaved || fs!!.singleSavedTag != null)) {
                 v.setOnClickListener {
-                    if (story!!.feedId == "0") return@setOnClickListener   // cannot train on feedless stories
+                    if (story!!.feedId == "0") return@setOnClickListener // cannot train on feedless stories
                     val intelFrag = StoryIntelTrainerFragment.newInstance(story, fs)
                     intelFrag.show(parentFragmentManager, StoryIntelTrainerFragment::class.java.name)
                 }
@@ -610,34 +1258,37 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
             binding.readingItemTags.addView(v)
         }
 
-        binding.readingItemUserTags.removeAllViews()
-        if (story!!.userTags.isNotEmpty()) {
-            for (i in 0..story!!.userTags.size) {
-                val v = layoutInflater.inflate(R.layout.chip_view, null)
-                val chip: Chip = v.findViewById(R.id.chip)
-                if (i < story!!.userTags.size) {
-                    chip.text = story!!.userTags[i]
-                    chip.chipIcon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_tag)
-                } else {
-                    chip.text = getString(R.string.add_tag)
-                    chip.chipIcon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_add)
-                }
-                v.setOnClickListener {
-                    val userTagsFragment = StoryUserTagsFragment.newInstance(story!!, fs!!)
-                    userTagsFragment.show(childFragmentManager, StoryUserTagsFragment::class.java.name)
-                }
-                binding.readingItemUserTags.addView(v)
-            }
-            binding.readingItemUserTags.visibility = View.VISIBLE
-        }
+        setupUserTags()
 
         if (!TextUtils.isEmpty(story!!.authors)) {
-            binding.readingItemAuthors.text = "•   " + story!!.authors
-            if (classifier != null && classifier!!.authors.containsKey(story!!.authors)) {
-                when (classifier!!.authors[story!!.authors]) {
-                    Classifier.LIKE -> binding.readingItemAuthors.setTextColor(ContextCompat.getColor(requireContext(), R.color.positive))
-                    Classifier.DISLIKE -> binding.readingItemAuthors.setTextColor(ContextCompat.getColor(requireContext(), R.color.negative))
-                    else -> binding.readingItemAuthors.setTextColor(UIUtils.getThemedColor(requireContext(), R.attr.readingItemMetadata, android.R.attr.textColor))
+            // ReadingItemFragment.kt isolates the author so the bullet stays beside the date in either direction.
+            binding.readingItemAuthors.text = "•   " + BidiText.isolate(story!!.authors)
+            binding.readingItemAuthors.compoundDrawablePadding = UIUtils.dp2px(requireContext(), 4)
+            val authorScore = if (classifier != null) classifier!!.authors[story!!.authors] else null
+            when (authorScore) {
+                Classifier.LIKE -> {
+                    binding.readingItemAuthors.setTextColor(ContextCompat.getColor(requireContext(), R.color.positive))
+                    val icon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_thumb_up_green)
+                    icon?.setBounds(0, 0, UIUtils.dp2px(requireContext(), 12), UIUtils.dp2px(requireContext(), 12))
+                    binding.readingItemAuthors.setCompoundDrawablesRelative(null, null, icon, null)
+                }
+                Classifier.DISLIKE -> {
+                    binding.readingItemAuthors.setTextColor(ContextCompat.getColor(requireContext(), R.color.negative))
+                    val icon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_thumb_down_red)
+                    icon?.setBounds(0, 0, UIUtils.dp2px(requireContext(), 12), UIUtils.dp2px(requireContext(), 12))
+                    binding.readingItemAuthors.setCompoundDrawablesRelative(null, null, icon, null)
+                }
+                Classifier.SUPER_DISLIKE -> {
+                    binding.readingItemAuthors.setTextColor(ContextCompat.getColor(requireContext(), R.color.super_negative))
+                    val icon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_thumb_down_double_crimson)
+                    icon?.setBounds(0, 0, UIUtils.dp2px(requireContext(), 14), UIUtils.dp2px(requireContext(), 14))
+                    binding.readingItemAuthors.setCompoundDrawablesRelative(null, null, icon, null)
+                }
+                else -> {
+                    binding.readingItemAuthors.setTextColor(
+                        UIUtils.getThemedColor(requireContext(), R.attr.readingItemMetadata, android.R.attr.textColor),
+                    )
+                    binding.readingItemAuthors.setCompoundDrawablesRelative(null, null, null, null)
                 }
             }
         }
@@ -645,6 +1296,309 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         var title = story!!.title
         title = UIUtils.colourTitleFromClassifier(title, classifier)
         binding.readingItemTitle.text = UIUtils.fromHtml(title)
+    }
+
+    private fun setupUserTags() {
+        binding.readingItemUserTags.removeAllViews()
+
+        if (story?.userTags?.isNotEmpty() == true) {
+            for (tag in story!!.userTags) {
+                val chipView = createTagChip(tag, story!!, fs!!)
+                binding.readingItemUserTags.addView(chipView)
+            }
+            val addTagView = createTagChip(getString(R.string.add_tag), story!!, fs!!)
+            binding.readingItemUserTags.addView(addTagView)
+        } else if (story?.starred == true) {
+            val addTagView = createTagChip(getString(R.string.add_tag), story!!, fs!!)
+            binding.readingItemUserTags.addView(addTagView)
+        }
+
+        binding.readingItemUserTags.visibility = View.VISIBLE
+    }
+
+    private fun clusterStoriesForDetail(currentStory: Story, isArchive: Boolean): List<Story.ClusterStory> =
+        currentStory.clusterStories.orEmpty()
+            // story_detail_view.js includes both matched and related sources, including unsubscribed feeds.
+            .filter { !it.feedId.isNullOrBlank() && !it.storyHash.isNullOrBlank() }
+            .sortedByDescending { it.timestamp }
+            .let { if (isArchive) it else it.take(1) }
+
+    private fun setupClusterStories() {
+        val currentStory = story
+        if (currentStory == null) {
+            lastClusterSnapshot = null
+            hideClusterStories()
+            return
+        }
+        val snapshot = ReaderClusterSnapshot(
+            currentStory,
+            isArchiveUser(),
+            prefsRepo.getResolvedTheme(requireContext()),
+        )
+        if (snapshot == lastClusterSnapshot) return
+        lastClusterSnapshot = snapshot
+        binding.readingStoryClusterList.removeAllViews()
+
+        val allClusterStories = clusterStoriesForDetail(currentStory, isArchive = true)
+        if (allClusterStories.isEmpty()) {
+            hideClusterStories()
+            return
+        }
+        val visibleClusterStories = clusterStoriesForDetail(currentStory, isArchive = isArchiveUser())
+
+        val palette = StoryClusterThemeStyle.palette(prefsRepo.getResolvedTheme(requireContext()))
+
+        binding.readingStoryClusterDivider.setBackgroundColor(palette.detailSectionBorderColor)
+        binding.readingStoryClusterContainer.setBackgroundColor(palette.detailSectionColor)
+        binding.readingStoryClusterTitle.setTextColor(palette.metaColor)
+
+        binding.readingStoryClusterTitle.text =
+            resources.getQuantityString(R.plurals.story_cluster_header, allClusterStories.size, allClusterStories.size)
+
+        visibleClusterStories.forEachIndexed { index, clusterStory ->
+            val clusterView =
+                layoutInflater.inflate(R.layout.view_story_cluster_item, binding.readingStoryClusterList, false)
+
+            bindClusterItemView(
+                clusterView = clusterView,
+                clusterStory = clusterStory,
+                showDivider = index > 0,
+                maxTitleLines = 1,
+                onClick = {
+                    when (
+                        val target =
+                            StoryClusterNavigationDecision.resolve(
+                                currentFeedSet = fs,
+                                currentFolderName = feedUtils.currentFolderName,
+                                targetFeedId = clusterStory.feedId,
+                                storyHash = clusterStory.storyHash,
+                            )
+                    ) {
+                        is StoryClusterNavigationTarget.DirectReading -> {
+                            UIUtils.startReadingActivity(requireContext(), target.feedSet, target.storyHash)
+                        }
+
+                        is StoryClusterNavigationTarget.FeedListReading -> {
+                            val feed = feedUtils.getFeed(clusterStory.feedId)
+                            if (feed == null) {
+                                UIUtils.startReadingActivity(requireContext(), target.feedSet, target.storyHash)
+                                return@bindClusterItemView
+                            }
+                            feedUtils.currentFolderName =
+                                if (target.folderName == AppConstants.ROOT_FOLDER) {
+                                    null
+                                } else {
+                                    target.folderName
+                                }
+                            FeedItemsList.startStoryActivity(requireContext(), target.feedSet, feed, target.folderName, target.storyHash)
+                        }
+
+                        null -> Unit
+                    }
+                },
+            )
+
+            binding.readingStoryClusterList.addView(clusterView)
+        }
+
+        val hiddenCount = allClusterStories.size - visibleClusterStories.size
+        if (!isArchiveUser() && hiddenCount > 0) {
+            binding.readingStoryClusterMore.text =
+                resources.getQuantityString(R.plurals.story_cluster_more_sites, hiddenCount, hiddenCount) +
+                "  •  " +
+                getString(R.string.story_cluster_upgrade_archive)
+            binding.readingStoryClusterMore.visibility = View.VISIBLE
+            binding.readingStoryClusterMore.setBackground(
+                StoryClusterThemeStyle.roundedBackground(
+                    palette.upgradePillColor,
+                    UIUtils.dp2px(requireContext(), 999).toFloat(),
+                ),
+            )
+            binding.readingStoryClusterMore.setTextColor(palette.upgradeTextColor)
+            val horizontalPadding = UIUtils.dp2px(requireContext(), 10)
+            val verticalPadding = UIUtils.dp2px(requireContext(), 6)
+            binding.readingStoryClusterMore.setPadding(horizontalPadding, verticalPadding, horizontalPadding, verticalPadding)
+            binding.readingStoryClusterMore.setOnClickListener {
+                UIUtils.startSubscriptionActivity(requireContext())
+            }
+        } else {
+            binding.readingStoryClusterMore.visibility = View.GONE
+            binding.readingStoryClusterMore.setOnClickListener(null)
+        }
+
+        binding.readingStoryClusterDivider.visibility = View.VISIBLE
+        binding.readingStoryClusterContainer.visibility = View.VISIBLE
+        syncStoryLoadingUi()
+    }
+
+    private fun hideClusterStories() {
+        binding.readingStoryClusterDivider.visibility = View.GONE
+        binding.readingStoryClusterContainer.visibility = View.GONE
+        binding.readingStoryClusterMore.visibility = View.GONE
+        binding.readingStoryClusterMore.setOnClickListener(null)
+    }
+
+    internal fun bindClusterItemView(
+        clusterView: View,
+        clusterStory: Story.ClusterStory,
+        showDivider: Boolean,
+        maxTitleLines: Int,
+        onClick: () -> Unit,
+    ) {
+        val palette = StoryClusterThemeStyle.palette(prefsRepo.getResolvedTheme(requireContext()))
+        val isRead = clusterStory.read
+        val rowView: View = clusterView.findViewById(R.id.story_cluster_detail_row)
+        val dividerView: View = clusterView.findViewById(R.id.story_cluster_detail_divider)
+        val outerBar: View = clusterView.findViewById(R.id.story_cluster_bar_outer)
+        val innerBar: View = clusterView.findViewById(R.id.story_cluster_bar_inner)
+        val sentimentView: ImageView = clusterView.findViewById(R.id.story_cluster_sentiment)
+        val feedIconView: ImageView = clusterView.findViewById(R.id.story_cluster_feed_icon)
+        val previewView: StoryThumbnailView = clusterView.findViewById(R.id.story_cluster_preview)
+        val dateView: TextView = clusterView.findViewById(R.id.story_cluster_date)
+        val badgeView: TextView = clusterView.findViewById(R.id.story_cluster_badge)
+        val titleView: TextView = clusterView.findViewById(R.id.story_cluster_title)
+
+        sentimentView.setImageResource(StoryClusterDisplayDecision.indicatorDrawableRes(clusterStory.score))
+
+        val feed = feedUtils.getFeed(clusterStory.feedId)
+        rowView.setBackgroundColor(palette.detailSectionColor)
+        dividerView.visibility = if (showDivider) View.VISIBLE else View.GONE
+        dividerView.setBackgroundColor(palette.detailRowBorderColor)
+        outerBar.setBackgroundColor(UIUtils.decodeColourValue(feed?.faviconColor, Color.GRAY))
+        innerBar.setBackgroundColor(UIUtils.decodeColourValue(feed?.faviconFade, Color.LTGRAY))
+
+        val sentimentSize = if (clusterStory.score == 0) 10 else 12
+        sentimentView.layoutParams =
+            sentimentView.layoutParams.apply {
+                width = UIUtils.dp2px(requireContext(), sentimentSize)
+                height = UIUtils.dp2px(requireContext(), sentimentSize)
+            }
+
+        dateView.text = StoryUtils.formatRelativeShortDate(requireContext(), clusterStory.timestamp)
+        dateView.setTextColor(if (isRead) palette.readMetaColor else palette.metaColor)
+
+        titleView.text = UIUtils.fromHtml(clusterStory.title ?: "")
+        titleView.maxLines = maxTitleLines
+        titleView.setTextColor(if (isRead) palette.readTitleColor else palette.titleColor)
+        StoryClusterBadgeViewBinder.bind(
+            badgeView,
+            requireContext(),
+            clusterStory.clusterTier,
+            palette,
+            isRead,
+        )
+
+        bindClusterFeedIcon(feed, feedIconView)
+        bindClusterPreview(
+            previewView = previewView,
+            badgeView = badgeView,
+            titleView = titleView,
+            dateView = dateView,
+            thumbnailUrl = clusterStory.thumbnailUrl ?: feedUtils.getStoryThumbnailUrl(clusterStory.storyHash),
+            isRead = isRead,
+        )
+
+        outerBar.alpha = if (isRead) 0.15f else 1.0f
+        innerBar.alpha = if (isRead) 0.15f else 1.0f
+        sentimentView.imageAlpha = if (isRead) 38 else 255
+        feedIconView.imageAlpha = if (isRead) 102 else 255
+        dateView.alpha = 1.0f
+        titleView.alpha = 1.0f
+
+        clusterView.setOnClickListener { onClick() }
+    }
+
+    private fun bindClusterPreview(
+        previewView: StoryThumbnailView,
+        badgeView: TextView,
+        titleView: TextView,
+        dateView: TextView,
+        thumbnailUrl: String?,
+        isRead: Boolean,
+    ) {
+        if (thumbnailUrl.isNullOrBlank()) {
+            updateClusterEndAnchors(titleView, badgeView, hasPreview = false, previewId = previewView.id, dateId = dateView.id)
+            previewView.visibility = View.GONE
+            previewView.setImageDrawable(null)
+            return
+        }
+
+        updateClusterEndAnchors(titleView, badgeView, hasPreview = true, previewId = previewView.id, dateId = dateView.id)
+        previewView.visibility = View.VISIBLE
+        previewView.imageAlpha = if (isRead) 115 else 255
+        previewView.setImageDrawable(null)
+        clusterThumbnailLoader.displayImage(
+            thumbnailUrl,
+            previewView,
+            UIUtils.dp2px(requireContext(), 48),
+            true,
+        )
+    }
+
+    private fun updateClusterEndAnchors(
+        titleView: TextView,
+        badgeView: TextView,
+        hasPreview: Boolean,
+        previewId: Int,
+        dateId: Int,
+    ) {
+        val badgeAnchorId = StoryClusterBadgeViewBinder.endAnchorId(hasPreview, previewId, dateId)
+        val badgeParams = badgeView.layoutParams as RelativeLayout.LayoutParams
+        badgeParams.addRule(RelativeLayout.START_OF, badgeAnchorId)
+        badgeView.layoutParams = badgeParams
+
+        val titleParams = titleView.layoutParams as RelativeLayout.LayoutParams
+        titleParams.addRule(RelativeLayout.START_OF, badgeView.id)
+        titleView.layoutParams = titleParams
+    }
+
+    private fun bindClusterFeedIcon(
+        feed: com.newsblur.domain.Feed?,
+        target: ImageView,
+    ) {
+        if (feed == null) {
+            target.visibility = View.GONE
+            return
+        }
+
+        val customFeedIcon: CustomIcon? = BlurDatabaseHelper.getFeedIcon(feed.feedId)
+        if (customFeedIcon != null) {
+            val iconSize = UIUtils.dp2px(requireContext(), 16)
+            val iconBitmap = CustomIconRenderer.renderIcon(requireContext(), customFeedIcon, iconSize)
+            if (iconBitmap != null) {
+                target.setImageBitmap(iconBitmap)
+            } else {
+                iconLoader.displayImage(feed.faviconUrl, target)
+            }
+        } else {
+            iconLoader.displayImage(feed.faviconUrl, target)
+        }
+        target.visibility = View.VISIBLE
+    }
+
+    private fun isArchiveUser(): Boolean = prefsRepo.getIsArchive() || prefsRepo.getIsPro()
+
+    private fun createTagChip(
+        tag: String,
+        story: Story,
+        feedSet: FeedSet,
+    ): View {
+        val v = layoutInflater.inflate(R.layout.chip_view, null)
+        val chip: Chip = v.findViewById(R.id.chip)
+        chip.text = tag
+        chip.chipIcon = ContextCompat.getDrawable(requireContext(), R.drawable.ic_tag)
+        v.setOnClickListener {
+            showUserTagsFragment(story, feedSet)
+        }
+        return v
+    }
+
+    private fun showUserTagsFragment(
+        story: Story,
+        feedSet: FeedSet,
+    ) {
+        val userTagsFragment = StoryUserTagsFragment.newInstance(story, feedSet)
+        userTagsFragment.show(childFragmentManager, StoryUserTagsFragment::class.java.name)
     }
 
     fun switchSelectedViewMode() {
@@ -661,22 +1615,24 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
 
     private fun setViewMode(newMode: DefaultFeedView) {
         selectedViewMode = newMode
-        PrefsUtils.setDefaultViewModeForFeed(requireContext(), story!!.feedId, newMode)
+        prefsRepo.setDefaultViewModeForFeed(story!!.feedId, newMode)
     }
 
     fun viewModeChanged() {
-        synchronized(selectedViewMode!!) {
-            selectedViewMode = PrefsUtils.getDefaultViewModeForFeed(requireContext(), story!!.feedId)
+        synchronized(selectedViewMode) {
+            selectedViewMode = prefsRepo.getDefaultViewModeForFeed(story!!.feedId)
         }
         // these can come from async tasks
         activity?.runOnUiThread { reloadStoryContent() }
     }
 
     private fun reloadStoryContent() {
+        if (isWebViewReleasedForBackground && !isRestoringReleasedWebView) return
+
         // reset indicators
         binding.readingTextloading.visibility = View.GONE
         binding.readingTextmodefailed.visibility = View.GONE
-        enableProgress(false)
+        syncStoryLoadingUi()
 
         var needStoryContent = false
         var enableStoryChanges = false
@@ -690,15 +1646,17 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
                     binding.readingTextmodefailed.visibility = View.VISIBLE
                     needStoryContent = true
                 }
+
                 originalText == null -> {
                     binding.readingTextloading.visibility = View.VISIBLE
                     enableProgress(true)
-                    loadOriginalText()
+                    story?.let { viewModel.loadOriginalText(it.storyHash) } ?: activity?.finish()
                     // still show the story mode version, as the text mode one may take some time
                     needStoryContent = true
                 }
+
                 else -> {
-                    setupWebview(originalText!!)
+                    setupWebview(originalText!!) // TODO extract images
                     onContentLoadFinished()
                 }
             }
@@ -706,9 +1664,9 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
 
         if (needStoryContent) {
             if (storyContent == null) {
-                loadStoryContent()
+                story?.let { viewModel.loadStoryContent(it.storyHash) } ?: activity?.finish()
             } else {
-                setupWebview(storyContent!!)
+                setupWebview(storyContent!!) // TODO extract images
                 onContentLoadFinished()
             }
         }
@@ -720,6 +1678,50 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         (activity as Reading?)?.enableLeftProgressCircle(loading)
     }
 
+    private fun resetStoryRenderState() {
+        cancelPendingConfigurationChangeRestore()
+        invalidateReaderAnchorCapture()
+        readerAnchorCapturedScrollY = null
+        hasCompletedInitialStoryRender = false
+        isContentLoadFinished = false
+        isWebLoadFinished.set(false)
+        isWebVisualStateReady = false
+        isLoadFinished.set(false)
+    }
+
+    private fun syncStoryLoadingUi() {
+        readingItemActionsBinding.actionsContainer.visibility =
+            if (hasCompletedInitialStoryRender && articleReveal.isVisible) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+        // ReadingItemFragment.kt keeps below-article sections laid out without flashing them under the title.
+        val footerVisibility = if (articleReveal.isVisible) View.VISIBLE else View.INVISIBLE
+        for (section in listOf(binding.readingStoryClusterDivider, binding.readingStoryClusterContainer)) {
+            if (section.visibility != View.GONE) section.visibility = footerVisibility
+        }
+        readingItemActionsBinding.commentsContainer.visibility = footerVisibility
+        readingItemActionsBinding.readerTraversalFooter.visibility = footerVisibility
+        enableProgress(shouldShowLoadingProgress())
+    }
+
+    private fun shouldShowLoadingProgress(): Boolean =
+        !hasCompletedInitialStoryRender ||
+            (
+                selectedViewMode == DefaultFeedView.TEXT &&
+                    originalText == null &&
+                    !textViewUnavailable
+            )
+
+    private fun maybeFinishInitialStoryRender() {
+        if (hasCompletedInitialStoryRender) return
+        if (!isContentLoadFinished || !isWebLoadFinished.get() || !isWebVisualStateReady) return
+
+        hasCompletedInitialStoryRender = true
+        syncStoryLoadingUi()
+    }
+
     /**
      * Lets the pager offer us an updated version of our story when a new cursor is
      * cycled in. This class takes the responsibility of ensureing that the cursor
@@ -728,11 +1730,12 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
     fun offerStoryUpdate(story: Story?) {
         if (story == null) return
         if (story.storyHash != this.story!!.storyHash) {
-            com.newsblur.util.Log.d(this, "prevented story list index offset shift")
+            com.newsblur.util.Log
+                .d(this, "prevented story list index offset shift")
             return
         }
         this.story = story
-        //if (AppConstants.VERBOSE_LOG) com.newsblur.util.Log.d(this, "got fresh story");
+        // if (AppConstants.VERBOSE_LOG) com.newsblur.util.Log.d(this, "got fresh story");
     }
 
     fun handleUpdate(updateType: Int) {
@@ -741,13 +1744,14 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
             updateShareButton()
             updateMarkStoryReadState()
             setupItemCommentsAndShares()
+            setupItemMetadata()
         }
         if (updateType and UPDATE_TEXT != 0) {
             reloadStoryContent()
         }
         if (updateType and UPDATE_SOCIAL != 0) {
             updateShareButton()
-            setupItemCommentsAndShares()
+            setupItemCommentsAndShares(force = true)
         }
         if (updateType and UPDATE_INTEL != 0) {
             classifier = dbHelper.getClassifierForFeed(story!!.feedId)
@@ -755,200 +1759,174 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         }
     }
 
-    private fun loadOriginalText() {
-        story?.let { story ->
-            lifecycleScope.executeAsyncTask(
-                    doInBackground = {
-                        feedUtils.getStoryText(story.storyHash)
-                    },
-                    onPostExecute = { result ->
-                        if (result != null) {
-                            if (OriginalTextService.NULL_STORY_TEXT == result) {
-                                // the server reported that text mode is not available.  kick back to story mode
-                                com.newsblur.util.Log.d(this, "orig text not avail for story: " + story.storyHash)
-                                textViewUnavailable = true
-                            } else {
-                                originalText = result
-                            }
-                            reloadStoryContent()
-                        } else {
-                            com.newsblur.util.Log.d(this, "orig text not yet cached for story: " + story.storyHash)
-                            OriginalTextService.addPriorityHash(story.storyHash)
-                            triggerSync()
-                        }
-                    }
-            )
-        }
-    }
-
-    private fun loadStoryContent() {
-        story?.let { story ->
-            lifecycleScope.executeAsyncTask(
-                    doInBackground = {
-                        feedUtils.getStoryContent(story.storyHash)
-                    },
-                    onPostExecute = { result ->
-                        if (result != null) {
-                            storyContent = result
-                            reloadStoryContent()
-                        } else {
-                            com.newsblur.util.Log.w(this, "couldn't find story content for existing story.")
-                            activity?.finish()
-                        }
-                    }
-            )
-        }
-    }
-
     private fun loadStoryChanges() {
         val showChanges = storyChangesState == null || storyChangesState === StoryChangesState.SHOW_CHANGES
         story?.let { story ->
             lifecycleScope.executeAsyncTask(
-                    onPreExecute = {
-                        binding.readingStoryChanges.setText(R.string.story_changes_loading)
-                    },
-                    doInBackground = {
-                        apiManager.getStoryChanges(story.storyHash, showChanges)
-                    },
-                    onPostExecute = { response ->
-                        if (!response.isError && response.story != null) {
-                            storyContent = response.story.content
-                            reloadStoryContent()
-                            binding.readingStoryChanges.setText(if (showChanges) R.string.story_hide_changes else R.string.story_show_changes)
-                            storyChangesState = if (showChanges) StoryChangesState.HIDE_CHANGES else StoryChangesState.SHOW_CHANGES
-                        } else {
-                            binding.readingStoryChanges.setText(if (showChanges) R.string.story_show_changes else R.string.story_hide_changes)
-                        }
+                onPreExecute = {
+                    binding.readingStoryChanges.setText(R.string.story_changes_loading)
+                },
+                doInBackground = {
+                    storyApi.getStoryChanges(story.storyHash, showChanges)
+                },
+                onPostExecute = { response ->
+                    if (response != null && !response.isError && response.story != null) {
+                        storyContent = response.story.content
+                        reloadStoryContent()
+                        binding.readingStoryChanges.setText(
+                            if (showChanges) R.string.story_hide_changes else R.string.story_show_changes,
+                        )
+                        storyChangesState = if (showChanges) StoryChangesState.HIDE_CHANGES else StoryChangesState.SHOW_CHANGES
+                    } else {
+                        binding.readingStoryChanges.setText(
+                            if (showChanges) R.string.story_show_changes else R.string.story_hide_changes,
+                        )
                     }
+                },
             )
         }
     }
 
-    private fun setupWebview(storyText: String) {
+    private fun setupWebview(content: String) {
         // sometimes we get called before the activity is ready. abort, since we will get a refresh when
         // the cursor loads
         activity?.let {
-            it.runOnUiThread { _setupWebview(storyText) }
+            it.runOnUiThread { setupWebviewInternal(content) }
         }
     }
 
-    private fun _setupWebview(storyTextString: String) {
-        var storyText = storyTextString
-        if (activity == null) {
-            // this method gets called by async UI bits that might hold stale fragment references with no assigned
-            // activity.  If this happens, just abort the call.
-            return
-        }
-        synchronized(webViewContentMutex) {
-            // this method might get called repeatedly despite no content change, which is expensive
-            val contentHash = storyText.hashCode()
-            if (this.contentHash == contentHash) return
-            this.contentHash = contentHash
-
-            sniffAltTexts(storyText)
-
-            storyText = swapInOfflineImages(storyText)
-            val currentSize = PrefsUtils.getReadingTextSize(requireContext())
-            val font = PrefsUtils.getFont(requireContext())
-            val themeValue = PrefsUtils.getSelectedTheme(requireContext())
-
-            val builder = StringBuilder()
-            builder.append("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=0\" />")
-            builder.append(font.forWebView(currentSize))
-            builder.append("<link rel=\"stylesheet\" type=\"text/css\" href=\"reading.css\" />")
-            when (themeValue) {
-                ThemeValue.LIGHT -> {
-                    //                builder.append("<meta name=\"color-scheme\" content=\"light\"/>");
-                    //                builder.append("<meta name=\"supported-color-schemes\" content=\"light\"/>");
-                    builder.append("<link rel=\"stylesheet\" type=\"text/css\" href=\"light_reading.css\" />")
-                }
-                ThemeValue.DARK -> {
-                    builder.append("<link rel=\"stylesheet\" type=\"text/css\" href=\"dark_reading.css\" />")
-                }
-                ThemeValue.BLACK -> {
-                    builder.append("<link rel=\"stylesheet\" type=\"text/css\" href=\"black_reading.css\" />")
-                }
-                ThemeValue.AUTO -> {
-                    when (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) {
-                        Configuration.UI_MODE_NIGHT_YES -> {
-                            builder.append("<link rel=\"stylesheet\" type=\"text/css\" href=\"dark_reading.css\" />")
+    private fun setupWebviewInternal(content: String) {
+        if (activity == null || view == null) return
+        if (isWebViewReleasedForBackground && !isRestoringReleasedWebView) return
+        val size = prefsRepo.getReadingTextSize()
+        val request =
+            ReaderHtmlRequest(
+                content = content,
+                fontCss = prefsRepo.getFont().forWebView(size),
+                theme = prefsRepo.getResolvedTheme(requireContext()),
+                nightMask = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK,
+                enableHighlights = enableHighlights,
+                textClassifiers = classifier?.texts?.toMap().orEmpty(),
+                textRegexClassifiers = classifier?.textRegex?.toMap().orEmpty(),
+                interfaceRtl = resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL,
+            )
+        documentRenderer.submit(
+            scope = viewLifecycleOwner.lifecycleScope,
+            request = request,
+            prepare = {
+                // ReadingItemFragment.kt keeps image file checks and HTML preparation off the animation thread.
+                withContext(Dispatchers.IO) {
+                    val offlineHtml = swapInOfflineImages(request.content)
+                    val bodyClassifier =
+                        Classifier().apply {
+                            texts.putAll(request.textClassifiers)
+                            textRegex.putAll(request.textRegexClassifiers)
                         }
-                        Configuration.UI_MODE_NIGHT_NO -> {
-                            builder.append("<link rel=\"stylesheet\" type=\"text/css\" href=\"light_reading.css\" />")
-                        }
-                        Configuration.UI_MODE_NIGHT_UNDEFINED -> {
-                            builder.append("<link rel=\"stylesheet\" type=\"text/css\" href=\"light_reading.css\" />")
-                        }
-                    }
+                    PreparedReaderDocument(
+                        html =
+                            StoryUtil.buildMinimalHtml(
+                                storyHtml = offlineHtml,
+                                fontCss = request.fontCss,
+                                themeValue = request.theme,
+                                nightMask = request.nightMask,
+                                enableHighlights = request.enableHighlights,
+                                classifier = bodyClassifier,
+                                interfaceRtl = request.interfaceRtl,
+                            ),
+                    )
                 }
-                else -> {
-                }
-            }
-
-            builder.append("</head><body><div class=\"NB-story\">")
-            builder.append(storyText)
-            builder.append("<script type=\"text/javascript\" src=\"storyDetailView.js\"></script>")
-            builder.append("</div></body></html>")
-            binding.readingWebview.loadDataWithBaseURL("file:///android_asset/", builder.toString(), "text/html", "UTF-8", null)
-        }
+            },
+            display = { document ->
+                isWebViewReleasedForBackground = false
+                isRestoringReleasedWebView = false
+                isWebLoadFinished.set(false)
+                isWebVisualStateReady = false
+                val webview = ensureReadingWebview()
+                articleReveal.prepare(webview)
+                syncStoryLoadingUi()
+                webview.loadDataWithBaseURL(READING_BASE_URL, document.html, "text/html", "UTF-8", null)
+                hasWebViewContent = true
+                onContentLoadFinished()
+            },
+        )
     }
 
-    private fun sniffAltTexts(html: String) {
-        // Find images with alt tags and cache the text for use on long-press
-        //   NOTE: if doing this via regex has a smell, you have a good nose!  This method is far from perfect
-        //   and may miss valid cases or trucate tags, but it works for popular feeds (read: XKCD) and doesn't
-        //   require us to import a proper parser lib of hundreds of kilobytes just for this one feature.
-        imageAltTexts = HashMap()
-        // sniff for alts first
-        var imgTagMatcher = altSniff1.matcher(html)
-        while (imgTagMatcher.find()) {
-            imageAltTexts!![imgTagMatcher.group(2)] = imgTagMatcher.group(4)
-        }
-        imgTagMatcher = altSniff2.matcher(html)
-        while (imgTagMatcher.find()) {
-            imageAltTexts!![imgTagMatcher.group(4)] = imgTagMatcher.group(2)
-        }
-        // then sniff for 'title' tags, so they will overwrite alts and take precedence
-        imgTagMatcher = altSniff3.matcher(html)
-        while (imgTagMatcher.find()) {
-            imageAltTexts!![imgTagMatcher.group(2)] = imgTagMatcher.group(4)
-        }
-        imgTagMatcher = altSniff4.matcher(html)
-        while (imgTagMatcher.find()) {
-            imageAltTexts!![imgTagMatcher.group(4)] = imgTagMatcher.group(2)
-        }
-
-        // while were are at it, create a place where we can later cache offline image remaps so that when
-        // we do an alt-text lookup, we can search for the right URL key.
-        imageUrlRemaps = HashMap()
+    private fun applyStoryHighlights() {
+        if (!enableHighlights || isWebViewReleasedForBackground) return
+        val json = JSONArray(storyHighlights).toString()
+        ensureReadingWebview().evaluateJavascript("NB_applyHighlights($json);", null)
     }
 
     private fun swapInOfflineImages(htmlString: String): String {
-        var html = htmlString
-        val imageTagMatcher = imgSniff.matcher(html)
+        val html = StringBuilder(htmlString.length)
+        var copiedUntil = 0
+        val imageTagMatcher = imgSniff.matcher(htmlString)
         while (imageTagMatcher.find()) {
-            val url = imageTagMatcher.group(2)
-            val localPath = storyImageCache.getCachedLocation(url) ?: continue
-            html = html.replace(imageTagMatcher.group(1) + "\"" + url + "\"", "src=\"$localPath\"")
-            imageUrlRemaps!![localPath] = url
+            val url = imageTagMatcher.group(2) ?: continue
+            val localPath = storyImageCache.getWebViewImageCache(url) ?: continue
+            // ReadingItemFragment.kt replaces only original source spans, never attributes added for an earlier copy of the same image.
+            html.append(htmlString, copiedUntil, imageTagMatcher.start(1))
+            html.append("src=\"$localPath\" data-nb-original-src=\"$url\"")
+            copiedUntil = imageTagMatcher.end(2) + 1
         }
-
-        return html
+        return html.append(htmlString, copiedUntil, htmlString.length).toString()
     }
 
     /** We have pushed our desired content into the WebView.  */
     private fun onContentLoadFinished() {
         isContentLoadFinished = true
+        maybeFinishInitialStoryRender()
         checkLoadStatus()
     }
 
     /** The webview has finished loading our desired content.  */
     fun onWebLoadFinished() {
-        if (!isWebLoadFinished) {
-            binding.readingWebview.evaluateJavascript("loadImages();", null)
+        if (isWebViewReleasedForBackground) return
+        if (!isWebLoadFinished.getAndSet(true)) {
+            ensureReadingWebview().evaluateJavascript("loadImages();", null)
+            listenFollower?.onDocumentLoaded()
         }
-        isWebLoadFinished = true
+        maybeFinishInitialStoryRender()
         checkLoadStatus()
+    }
+
+    fun onWebVisualStateReady() {
+        if (isWebViewReleasedForBackground) return
+        isWebVisualStateReady = true
+        articleReveal.ready()
+        maybeFinishInitialStoryRender()
+        story?.storyHash?.let { (activity as? Reading)?.onReaderPageVisualReady(it) }
+    }
+
+    fun isNativeHeaderReady(storyHash: String): Boolean =
+        ::binding.isInitialized && nativeHeaderStoryHash == storyHash &&
+            binding.readingItemTitle.let { it.width > 0 && it.height > 0 && !it.isLayoutRequested }
+
+    fun isArticleVisible(): Boolean = articleReveal.isVisible
+
+    fun isReadyForDisplay(): Boolean =
+        hasWebViewContent && isWebVisualStateReady && articleReveal.isVisible &&
+            readingWebview?.let { it.width > 0 && it.height > 0 && !it.isLayoutRequested } == true
+
+    fun releaseWebViewForBackground() {
+        if (!::binding.isInitialized || isWebViewReleasedForBackground || readingWebview == null) return
+
+        isWebViewReleasedForBackground = true
+        isRestoringReleasedWebView = false
+        val shouldCapture =
+            shouldCaptureScrollPositionBeforeWebViewRelease(
+                isViewStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
+                hasSavedScrollPosition = hasSavedScrollPosition,
+            )
+        logReaderRestore(
+            "releaseWebView shouldCapture=$shouldCapture state=${lifecycle.currentState} " +
+                "savedPx=$savedScrollPosPx savedRel=$savedScrollPosRel preferAbs=$preferAbsoluteScrollRestore",
+        )
+        if (shouldCapture) {
+            captureCurrentScrollPosition(preferAbsoluteRestore = true, reason = "release")
+        }
+        documentRenderer.clear()
+        destroyReadingWebviewForBackground()
     }
 
     /** The social UI has finished loading from the DB.  */
@@ -959,13 +1937,14 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
 
     private fun checkLoadStatus() {
         synchronized(isLoadFinished) {
-            if (isContentLoadFinished && isWebLoadFinished && isSocialLoadFinished) {
+            if (isContentLoadFinished && isWebLoadFinished.get() && isSocialLoadFinished) {
                 // iff this is the first time all content has finished loading, trigger any UI
                 // behaviour that is position-dependent
-                if (!isLoadFinished) {
+                if (!isLoadFinished.getAndSet(true)) {
                     onLoadFinished()
                 }
-                isLoadFinished = true
+
+                applyStoryHighlights()
             }
         }
     }
@@ -976,21 +1955,261 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
      */
     private fun onLoadFinished() {
         // if there was a scroll position saved, restore it
-        if (savedScrollPosRel > 0f) {
-            // ScrollViews containing WebViews are very particular about call timing.  since the inner view
-            // height can drastically change as viewport width changes, position has to be saved and restored
-            // as a proportion of total inner view height. that height won't be known until all the various 
-            // async bits of the fragment have finished loading.  however, even after the WebView calls back
-            // onProgressChanged with a value of 100, immediate calls to get the size of the view will return
-            // incorrect values.  even posting a runnable to the very end of our UI event queue may be
-            // insufficient time to allow the WebView to actually finish internally computing state and size.
-            // an additional fixed delay is added in a last ditch attempt to give the black-box platform
-            // threads a chance to finish their work.
-            binding.readingScrollview.postDelayed({
-                val relPos = (binding.readingScrollview.getChildAt(0).measuredHeight * savedScrollPosRel).roundToInt()
-                binding.readingScrollview.scrollTo(0, relPos)
-            }, 75L)
+        if (hasSavedScrollPosition) {
+            scheduleSavedScrollRestore()
         }
+        scheduleReaderAnchorCapture()
+    }
+
+    private fun scheduleSavedScrollRestore(
+        attempt: Int = 0,
+        previousAppliedScrollY: Int? = null,
+    ) {
+        val delayMs = STORY_SCROLL_RESTORE_DELAYS_MS.getOrNull(attempt) ?: return
+        binding.readingScrollview.postDelayed({
+            if (!::binding.isInitialized || !hasSavedScrollPosition) return@postDelayed
+            if (!shouldApplyScrollRestore(binding.readingScrollview.scrollY, previousAppliedScrollY)) {
+                logReaderRestore(
+                    "restore skipped attempt=$attempt current=${binding.readingScrollview.scrollY} " +
+                        "previousApplied=$previousAppliedScrollY",
+                )
+                return@postDelayed
+            }
+
+            val contentHeight = binding.readingScrollview.getChildAt(0).measuredHeight
+            val desiredScrollY =
+                resolveRestoredScrollY(
+                    contentHeight = contentHeight,
+                    savedScrollPosRel = savedScrollPosRel,
+                    savedScrollPosPx = savedScrollPosPx,
+                    preferAbsoluteScrollRestore = preferAbsoluteScrollRestore,
+                )
+            val maxScrollY = maxRestoredScrollY(contentHeight, binding.readingScrollview.height)
+            val restoreY = desiredScrollY.coerceIn(0, maxScrollY)
+            binding.readingScrollview.scrollTo(0, restoreY)
+
+            val appliedScrollY = binding.readingScrollview.scrollY
+            val shouldRetry =
+                shouldRetryScrollRestore(
+                    desiredScrollY = desiredScrollY,
+                    maxScrollY = maxScrollY,
+                    appliedScrollY = appliedScrollY,
+                    attempt = attempt,
+                    maxAttempts = STORY_SCROLL_RESTORE_DELAYS_MS.size,
+                )
+            logReaderRestore(
+                "restore attempt=$attempt desired=$desiredScrollY max=$maxScrollY applied=$appliedScrollY " +
+                    "contentHeight=$contentHeight viewport=${binding.readingScrollview.height} retry=$shouldRetry",
+            )
+            if (shouldRetry) {
+                scheduleSavedScrollRestore(attempt + 1, appliedScrollY)
+            }
+        }, delayMs)
+    }
+
+    private fun scheduleReaderAnchorCapture() {
+        if (!hasCompletedInitialStoryRender || pendingConfigurationChangeRestore != null) return
+
+        val scrollView = binding.readingScrollview
+        readerAnchorCaptureRunnable?.let(scrollView::removeCallbacks)
+        val captureGeneration = ++readerAnchorCaptureGeneration
+        readerAnchorCaptureRunnable =
+            Runnable {
+                captureReaderAnchor(
+                    scrollY = scrollView.scrollY,
+                    captureGeneration = captureGeneration,
+                )
+            }.also {
+                scrollView.postDelayed(it, READER_ANCHOR_CAPTURE_DELAY_MS)
+            }
+    }
+
+    private fun captureReaderAnchor(
+        scrollY: Int,
+        captureGeneration: Long,
+    ) {
+        val webView = readingWebview ?: return
+        if (webView.height <= 0) return
+
+        val visibleWebViewY = scrollY - webView.top
+        if (visibleWebViewY !in 0 until webView.height) {
+            readerAnchorCapturedScrollY = null
+            return
+        }
+
+        val documentYFraction = visibleWebViewY.toDouble() / webView.height
+        webView.evaluateJavascript("NB_capture_reader_anchor($documentYFraction);") { result ->
+            if (
+                captureGeneration != readerAnchorCaptureGeneration ||
+                pendingConfigurationChangeRestore != null ||
+                readingWebview !== webView
+            ) {
+                return@evaluateJavascript
+            }
+            readerAnchorCapturedScrollY =
+                if (result == "true") {
+                    scrollY
+                } else {
+                    null
+                }
+            logReaderRestore(
+                "anchor capture result=$result scroll=$scrollY webTop=${webView.top} " +
+                    "webHeight=${webView.height} fraction=$documentYFraction",
+            )
+        }
+    }
+
+    private fun scheduleConfigurationChangeScrollRestore(
+        source: ConfigurationChangeScrollSource,
+        attempt: Int = 0,
+    ) {
+        val delayMs = STORY_SCROLL_RESTORE_DELAYS_MS.getOrNull(attempt) ?: return
+        val scrollView = binding.readingScrollview
+        scrollView.postDelayed({
+            if (!isCurrentConfigurationChangeRestore(source, scrollView)) return@postDelayed
+
+            if (source.hasReaderAnchor) {
+                resolveReaderAnchorAfterConfigurationChange(source, scrollView, attempt)
+            } else {
+                restoreConfigurationChangeFallback(source, scrollView, attempt)
+            }
+        }, delayMs)
+    }
+
+    private fun resolveReaderAnchorAfterConfigurationChange(
+        source: ConfigurationChangeScrollSource,
+        scrollView: ReadingScrollView,
+        attempt: Int,
+    ) {
+        val webView = readingWebview
+        if (webView == null || webView !== source.webView || webView.height <= 0) {
+            retryOrFallbackConfigurationChangeRestore(source, scrollView, attempt)
+            return
+        }
+
+        webView.evaluateJavascript("NB_resolve_reader_anchor();") { result ->
+            if (!isCurrentConfigurationChangeRestore(source, scrollView) || readingWebview !== webView) {
+                return@evaluateJavascript
+            }
+
+            val resolution = parseReaderAnchorResolution(result)
+            if (resolution == null) {
+                retryOrFallbackConfigurationChangeRestore(source, scrollView, attempt)
+                return@evaluateJavascript
+            }
+            if (
+                !resolution.layoutChanged &&
+                attempt < STORY_SCROLL_RESTORE_DELAYS_MS.lastIndex
+            ) {
+                scheduleConfigurationChangeScrollRestore(source, attempt + 1)
+                return@evaluateJavascript
+            }
+
+            val desiredScrollY =
+                resolveReaderAnchorScrollY(
+                    webViewTop = webView.top,
+                    webViewHeight = webView.height,
+                    documentYFraction = resolution.documentYFraction,
+                )
+            applyConfigurationChangeScrollRestore(source, scrollView, desiredScrollY, "anchor")
+        }
+    }
+
+    private fun retryOrFallbackConfigurationChangeRestore(
+        source: ConfigurationChangeScrollSource,
+        scrollView: ReadingScrollView,
+        attempt: Int,
+    ) {
+        if (attempt < STORY_SCROLL_RESTORE_DELAYS_MS.lastIndex) {
+            scheduleConfigurationChangeScrollRestore(source, attempt + 1)
+        } else {
+            restoreConfigurationChangeFallback(source, scrollView, attempt)
+        }
+    }
+
+    private fun restoreConfigurationChangeFallback(
+        source: ConfigurationChangeScrollSource,
+        scrollView: ReadingScrollView,
+        attempt: Int,
+    ) {
+        if (!isCurrentConfigurationChangeRestore(source, scrollView)) return
+
+        val contentHeight = scrollView.getChildAt(0).measuredHeight
+        if (contentHeight <= 0) {
+            if (attempt >= STORY_SCROLL_RESTORE_DELAYS_MS.lastIndex) {
+                pendingConfigurationChangeRestore = null
+            } else {
+                scheduleConfigurationChangeScrollRestore(source, attempt + 1)
+            }
+            return
+        }
+        val layoutChanged =
+            contentHeight != source.contentHeight ||
+                readingWebview?.width != source.webViewWidth ||
+                readingWebview?.height != source.webViewHeight
+        if (!layoutChanged && attempt < STORY_SCROLL_RESTORE_DELAYS_MS.lastIndex) {
+            scheduleConfigurationChangeScrollRestore(source, attempt + 1)
+            return
+        }
+
+        val desiredScrollY =
+            resolveConfigurationChangeScrollY(
+                oldScrollY = source.scrollY,
+                oldContentHeight = source.contentHeight,
+                reflowedContentHeight = contentHeight,
+            )
+        applyConfigurationChangeScrollRestore(source, scrollView, desiredScrollY, "relative-fallback")
+    }
+
+    private fun applyConfigurationChangeScrollRestore(
+        source: ConfigurationChangeScrollSource,
+        scrollView: ReadingScrollView,
+        desiredScrollY: Int,
+        method: String,
+    ) {
+        if (!isCurrentConfigurationChangeRestore(source, scrollView)) return
+
+        val contentHeight = scrollView.getChildAt(0).measuredHeight
+        if (contentHeight <= 0) return
+        val restoreY = desiredScrollY.coerceIn(0, maxRestoredScrollY(contentHeight, scrollView.height))
+        scrollView.scrollTo(0, restoreY)
+        pendingConfigurationChangeRestore = null
+        logReaderRestore(
+            "configuration restore method=$method generation=${source.generation} desired=$desiredScrollY " +
+                "applied=${scrollView.scrollY} contentHeight=$contentHeight",
+        )
+        scheduleReaderAnchorCapture()
+    }
+
+    private fun isCurrentConfigurationChangeRestore(
+        source: ConfigurationChangeScrollSource,
+        scrollView: ReadingScrollView,
+    ): Boolean =
+        shouldApplyConfigurationChangeRestore(
+            sourceGeneration = source.generation,
+            currentGeneration = configurationChangeGeneration,
+            hasCurrentView = ::binding.isInitialized && binding.readingScrollview === scrollView,
+        ) &&
+            pendingConfigurationChangeRestore === source
+
+    private fun cancelPendingConfigurationChangeRestore() {
+        if (pendingConfigurationChangeRestore == null) return
+        configurationChangeGeneration++
+        pendingConfigurationChangeRestore = null
+        scheduleReaderAnchorCapture()
+    }
+
+    private fun invalidateReaderAnchorCapture() {
+        if (::binding.isInitialized) {
+            readerAnchorCaptureRunnable?.let(binding.readingScrollview::removeCallbacks)
+        }
+        readerAnchorCaptureRunnable = null
+        readerAnchorCaptureGeneration++
+    }
+
+    private fun logReaderRestore(message: String) {
+        com.newsblur.util.Log
+            .d(this.javaClass.name, "reader_restore story=${story?.storyHash} $message")
     }
 
     fun showStoryShortcuts() {
@@ -998,15 +2217,21 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         newFragment.show(requireActivity().supportFragmentManager, StoryShortcutsFragment::class.java.name)
     }
 
-    fun flagWebviewError() {
-        // TODO: enable a selective reload mechanism on load failures?
-    }
+    fun traversalControlsSlot(): FrameLayout? =
+        if (view != null && hasCompletedInitialStoryRender && articleReveal.isVisible) {
+            readingItemActionsBinding.readerTraversalSlot
+        } else {
+            null
+        }
 
     private val updateStoryReadTitleState = {
         story?.let {
             val (typeFace, iconVisibility) =
-                    if (it.read) Typeface.create(binding.readingItemTitle.typeface, Typeface.NORMAL) to View.GONE
-                    else Typeface.create(binding.readingItemTitle.typeface, Typeface.BOLD) to View.VISIBLE
+                if (it.read) {
+                    Typeface.create(binding.readingItemTitle.typeface, Typeface.NORMAL) to View.GONE
+                } else {
+                    Typeface.create(binding.readingItemTitle.typeface, Typeface.BOLD) to View.VISIBLE
+                }
             binding.readingItemTitle.typeface = typeFace
             binding.readingItemUnreadIcon.visibility = iconVisibility
         }
@@ -1014,29 +2239,32 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
 
     private fun setTextSizeStyle(readingTextSize: ReadingTextSize) {
         val textSize = readingTextSize.size
-        PrefsUtils.setReadingTextSize(requireContext(), textSize)
-        binding.readingWebview.setTextSize(textSize)
+        prefsRepo.setReadingTextSize(textSize)
+        ensureReadingWebview().setTextSize(textSize)
     }
 
     private fun setReadingFont(font: String) {
-       PrefsUtils.setFontString(requireContext(), font)
-        contentHash = 0 // Force reload since content hasn't changed
+        prefsRepo.setFontString(font)
+        documentRenderer.clear() // Force reload since content hasn't changed
         reloadStoryContent()
     }
 
     fun openBrowser() {
         story?.let {
             val uri = Uri.parse(it.permalink)
-            UIUtils.handleUri(requireContext(), uri)
+            UIUtils.handleUri(requireContext(), prefsRepo, uri)
         } ?: Log.e(this.javaClass.name, "Error opening null story by permalink URL.")
     }
 
     fun scrollToComments() {
-        val targetView = if (readingItemActionsBinding.readingFriendCommentHeader.isVisible) {
-            readingItemActionsBinding.readingFriendCommentContainer
-        } else if (readingItemActionsBinding.readingPublicCommentHeader.isVisible) {
-            readingItemActionsBinding.readingPublicCommentContainer
-        } else null
+        val targetView =
+            if (readingItemActionsBinding.readingFriendCommentHeader.isVisible) {
+                readingItemActionsBinding.readingFriendCommentContainer
+            } else if (readingItemActionsBinding.readingPublicCommentHeader.isVisible) {
+                readingItemActionsBinding.readingPublicCommentContainer
+            } else {
+                null
+            }
         targetView?.let {
             it.parent.requestChildFocus(targetView, it)
         }
@@ -1046,16 +2274,278 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
         binding.readingScrollview.smoothScrollBy(0, dy)
     }
 
+    /**
+     * Determines whether the fragment should receive an update for story original text content.
+     * This ensures that only fragments that actually need the update will process it,
+     * preventing unnecessary reprocessing.
+     */
+    fun shouldReceiveUpdateText(updateType: Int) = updateType and UPDATE_TEXT != 0 && originalText == null
+
+    private fun handleWebviewAction(
+        actionType: WebviewActionType,
+        selectedText: String,
+    ) {
+        when (actionType) {
+            WebviewActionType.WEB_SEARCH -> {
+                if (selectedText.isNotEmpty()) {
+                    UIUtils.openWebSearch(requireContext(), selectedText)
+                }
+            }
+
+            WebviewActionType.HIGHLIGHT -> {
+                story?.let {
+                    viewModel.updateHighlights(selectedText, it.storyHash, storyHighlights)
+                }
+            }
+        }
+    }
+
+    private fun configureReadingWebview(
+        webview: NewsblurWebview,
+        readingActivity: Reading,
+    ) {
+        registerForContextMenu(webview)
+        webview.setAssetLoader(assetLoader)
+        webview.setPrefsRepo(prefsRepo)
+        webview.setCustomViewLayout(binding.customViewContainer)
+        webview.setWebviewWrapperLayout(binding.readingContainer)
+        webview.setBackgroundColor(Color.TRANSPARENT)
+        articleReveal.prepare(webview)
+        syncStoryLoadingUi()
+        webview.setOnTouchListener(
+            com.newsblur.view.ReaderTapGestures(webview) { twoFingers ->
+                val action =
+                    if (twoFingers) {
+                        prefsRepo.getReaderGesture("reader_two_finger_double_tap", "text")
+                    } else {
+                        prefsRepo.getReaderGesture("reader_double_tap", "original")
+                    }
+                if (webview.hitTestResult?.type != HitTestResult.UNKNOWN_TYPE) {
+                    false
+                } else {
+                    when (action) {
+                        "original" -> openBrowser()
+                        "text" -> switchSelectedViewMode()
+                        "unread" -> story?.let { feedUtils.markStoryUnread(it, requireContext()) }
+                        "save" -> story?.let { feedUtils.setStorySaved(it, true, requireContext(), emptyList(), emptyList()) }
+                        "listen" -> listenToStory()
+                    }
+                    action != "none"
+                }
+            },
+        )
+
+        webview.fragment = this
+        webview.activity = readingActivity
+        webview.setWebviewActionDelegate { action, selectedText ->
+            handleWebviewAction(action, selectedText)
+        }
+    }
+
+    fun openStoryImage(webview: NewsblurWebview, json: String) {
+        val host = activity ?: return
+        if (view == null || readingWebview !== webview || !isResumed || storyImageViewer != null || host.isFinishing) return
+        if (android.os.SystemClock.uptimeMillis() - storyImageHostLaunchedAt < STORY_IMAGE_HOST_LAUNCH_GUARD_MS) return
+        val visible = android.graphics.Rect()
+        if (!webview.getGlobalVisibleRect(visible)) return
+        val source = com.newsblur.image.StoryImageSource.parse(json) ?: return
+        if (source.generation != webview.documentGeneration) return
+        val scale = webview.width / source.viewportWidth
+        val location = IntArray(2)
+        webview.getLocationOnScreen(location)
+        val origin = android.graphics.RectF(location[0] + source.x * scale, location[1] + source.y * scale,
+            location[0] + (source.x + source.width) * scale, location[1] + (source.y + source.height) * scale)
+        if (!android.graphics.RectF.intersects(origin, android.graphics.RectF(visible))) return
+        // ReadingItemFragment.kt takes a bounded preview so opening does not wait for another network request.
+        val previewScale = minOf(1f, 1024f / maxOf(source.width * scale, source.height * scale))
+        val preview = runCatching {
+            android.graphics.Bitmap.createBitmap(maxOf(1, (source.width * scale * previewScale).toInt()),
+                maxOf(1, (source.height * scale * previewScale).toInt()), android.graphics.Bitmap.Config.ARGB_8888).also { bitmap ->
+                val canvas = android.graphics.Canvas(bitmap)
+                canvas.scale(previewScale, previewScale)
+                canvas.translate(-source.x * scale, -source.y * scale)
+                webview.draw(canvas)
+            }
+        }.getOrNull()
+
+        // ReadingItemFragment.kt builds the viewer against whichever activity hosts its window.
+        fun createViewer(
+            viewerActivity: android.app.Activity,
+            onClosed: () -> Unit,
+        ) = com.newsblur.image.StoryImageViewer(
+            viewerActivity,
+            source,
+            preview,
+            origin,
+            storyImageCache,
+            imageViewerClient,
+            prefsRepo = prefsRepo,
+            returnRect = { finish ->
+                if (readingWebview !== webview || view == null || source.generation != webview.documentGeneration) {
+                    finish(null)
+                } else {
+                    webview.evaluateJavascript("NB_story_image_rect('${source.token}', ${source.generation});") { result ->
+                        finish(storyImageReturnRect(webview, source, visible, result))
+                    }
+                }
+            },
+            onClosed = onClosed,
+            // A linked photo's Open Link goes where tapping the photo's link in the story would.
+            onOpenLink = { link -> context?.let { UIUtils.handleUri(it, prefsRepo, Uri.parse(link)) } },
+        )
+        // In a tablet split a Dialog is clipped to the reader pane, so the photo opens on
+        // StoryImageViewerHost.kt, which always fills the window (StorySplitView.kt).
+        if (StorySplitView.isInSplit(host)) {
+            // A host that never arrived still holds the last photo's bitmap, so drop it first.
+            storyImageHostToken?.let(StoryImageViewerHost::cancelPending)
+            storyImageHostLaunchedAt = android.os.SystemClock.uptimeMillis()
+            storyImageHostToken =
+                StoryImageViewerHost.show(host) { viewerHost ->
+                    storyImageHostLaunchedAt = 0L
+                    storyImageHostToken = null
+                    createViewer(viewerHost) {
+                        storyImageViewer = null
+                        viewerHost.onViewerClosed()
+                    }.also { viewer ->
+                        storyImageViewer = viewer
+                        viewer.show()
+                    }
+                }
+        } else {
+            storyImageViewer = createViewer(host) { storyImageViewer = null }.also { it.show() }
+        }
+    }
+
+    // ReadingItemFragment.kt turns the page's reported image rect back into screen coordinates for the viewer's close animation.
+    private fun storyImageReturnRect(
+        webview: NewsblurWebview,
+        source: com.newsblur.image.StoryImageSource,
+        visible: android.graphics.Rect,
+        result: String?,
+    ): android.graphics.RectF? =
+        runCatching {
+            if (readingWebview !== webview || source.generation != webview.documentGeneration) return@runCatching null
+            val data =
+                com.google.gson.JsonParser
+                    .parseString(result)
+                    .asJsonObject
+            val ratio = webview.width / data["viewportWidth"].asFloat
+            val position = IntArray(2)
+            webview.getLocationOnScreen(position)
+            val rect =
+                android.graphics.RectF(
+                    position[0] + data["x"].asFloat * ratio,
+                    position[1] + data["y"].asFloat * ratio,
+                    position[0] + (data["x"].asFloat + data["width"].asFloat) * ratio,
+                    position[1] + (data["y"].asFloat + data["height"].asFloat) * ratio,
+                )
+            val isFinite = rect.left.isFinite() && rect.top.isFinite() && rect.right.isFinite() && rect.bottom.isFinite()
+            rect.takeIf {
+                isFinite &&
+                    webview.getGlobalVisibleRect(visible) &&
+                    android.graphics.RectF.intersects(it, android.graphics.RectF(visible))
+            }
+        }.getOrNull()
+
+    private fun ensureReadingWebview(): NewsblurWebview {
+        readingWebview?.let { return it }
+
+        val parent = readingWebviewParent ?: error("readingWebviewParent missing")
+        val readingActivity = requireActivity() as Reading
+        val layoutParams =
+            readingWebviewLayoutParams ?: ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+        val recreatedWebview =
+            NewsblurWebview(requireContext(), null).apply {
+                id = R.id.reading_webview
+                this.layoutParams = layoutParams
+            }
+        val insertIndex = readingWebviewIndex.coerceIn(0, parent.childCount)
+        parent.addView(recreatedWebview, insertIndex, layoutParams)
+        configureReadingWebview(recreatedWebview, readingActivity)
+        readingWebview = recreatedWebview
+        hasWebViewContent = false
+        return recreatedWebview
+    }
+
+    private fun destroyReadingWebviewForBackground() {
+        storyImageViewer?.dismiss()
+        storyImageViewer = null
+        articleReveal.release()
+        documentRenderer.clear()
+        cancelPendingConfigurationChangeRestore()
+        invalidateReaderAnchorCapture()
+        readerAnchorCapturedScrollY = null
+        listenFollower?.onDocumentReleased()
+        val webview = readingWebview ?: return
+        webview.stopLoading()
+        // ReadingItemFragment.kt must not pauseTimers(): it freezes layout and JavaScript in every pager WebView.
+        webview.onPause()
+        webview.clearHistory()
+        unregisterForContextMenu(webview)
+
+        val parent = readingWebviewParent ?: (webview.parent as? ViewGroup)
+        if (parent != null) {
+            readingWebviewParent = parent
+            if (readingWebviewIndex < 0) {
+                readingWebviewIndex = parent.indexOfChild(webview)
+            }
+            if (webview.parent === parent) {
+                parent.removeView(webview)
+            }
+        }
+
+        if (readingWebviewLayoutParams == null) {
+            readingWebviewLayoutParams = webview.layoutParams
+        }
+        webview.removeAllViews()
+        webview.destroy()
+        readingWebview = null
+        hasWebViewContent = false
+    }
+
     companion object {
+        // How long ReadingItemFragment.kt ignores photo taps while StoryImageViewerHost.kt starts.
+        private const val STORY_IMAGE_HOST_LAUNCH_GUARD_MS = 2_000L
+
+        private const val LISTEN_TEXT_SOURCE_ORIGINAL = "original"
+        private const val COMPACT_LISTEN_ROW_SIZE = 4
+
+        // How long after the reader last touched the story Listen waits before scrolling it.
+        private const val LISTEN_SCROLL_QUIET_MS = 2_500L
+
         private const val BUNDLE_SCROLL_POS_REL = "scrollStateRel"
+        private const val BUNDLE_SCROLL_POS_PX = "scrollStatePx"
+        private const val BUNDLE_SCROLL_POS_PREFER_ABSOLUTE = "scrollStatePreferAbsolute"
+        private const val ARG_INITIAL_SCROLL_POS_REL = "initialScrollPosRel"
         const val VERTICAL_SCROLL_DISTANCE_DP = 240
+        private val STORY_SCROLL_RESTORE_DELAYS_MS = longArrayOf(75L, 250L, 750L, 1500L)
 
         @JvmStatic
-        fun newInstance(story: Story?, feedTitle: String?, feedFaviconColor: String?, feedFaviconFade: String?, feedFaviconBorder: String?, faviconText: String?, faviconUrl: String?, classifier: Classifier?, displayFeedDetails: Boolean, sourceUserId: String?): ReadingItemFragment {
+        fun newInstance(
+            story: Story?,
+            feedTitle: String?,
+            feedFaviconColor: String?,
+            feedFaviconFade: String?,
+            feedFaviconBorder: String?,
+            faviconText: String?,
+            faviconUrl: String?,
+            classifier: Classifier?,
+            displayFeedDetails: Boolean,
+            sourceUserId: String?,
+            initialScrollPosRel: Float = 0f,
+        ): ReadingItemFragment {
             val readingFragment = ReadingItemFragment()
+            // ReadingItemFragment.kt keeps full metadata in memory; only saved state uses the bounded copy.
+            readingFragment.story = story
 
             val args = Bundle()
-            args.putSerializable("story", story)
+            // Store a lightweight copy of the Story so the activity's saved-state Bundle stays
+            // under the 1 MB Binder transaction limit when many reading fragments are alive.
+            // See Story.copyForBundle and Play crash 313659223e4fd44c9953ab2cd7b29706.
+            args.putSerializable("story", story?.copyForBundle())
             args.putString("feedTitle", feedTitle)
             args.putString("feedColor", feedFaviconColor)
             args.putString("feedFade", feedFaviconFade)
@@ -1065,32 +2555,143 @@ class ReadingItemFragment : NbFragment(), PopupMenu.OnMenuItemClickListener {
             args.putBoolean("displayFeedDetails", displayFeedDetails)
             args.putSerializable("classifier", classifier)
             args.putString("sourceUserId", sourceUserId)
+            args.putFloat(ARG_INITIAL_SCROLL_POS_REL, initialScrollPosRel)
             readingFragment.arguments = args
 
             return readingFragment
         }
 
-        private val altSniff1 = Pattern.compile("<img[^>]*src=(['\"])((?:(?!\\1).)*)\\1[^>]*alt=(['\"])((?:(?!\\3).)*)\\3[^>]*>", Pattern.CASE_INSENSITIVE)
-        private val altSniff2 = Pattern.compile("<img[^>]*alt=(['\"])((?:(?!\\1).)*)\\1[^>]*src=(['\"])((?:(?!\\3).)*)\\3[^>]*>", Pattern.CASE_INSENSITIVE)
-        private val altSniff3 = Pattern.compile("<img[^>]*src=(['\"])((?:(?!\\1).)*)\\1[^>]*title=(['\"])((?:(?!\\3).)*)\\3[^>]*>", Pattern.CASE_INSENSITIVE)
-        private val altSniff4 = Pattern.compile("<img[^>]*title=(['\"])((?:(?!\\1).)*)\\1[^>]*src=(['\"])((?:(?!\\3).)*)\\3[^>]*>", Pattern.CASE_INSENSITIVE)
         private val imgSniff = Pattern.compile("<img[^>]*(src\\s*=\\s*)\"([^\"]*)\"[^>]*>", Pattern.CASE_INSENSITIVE)
     }
 }
 
-private fun MaterialButton.setStoryReadState(context: Context, isRead: Boolean) {
-    var selectedTheme = PrefsUtils.getSelectedTheme(context)
-    if (selectedTheme == ThemeValue.AUTO) {
-        selectedTheme = when (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) {
-            Configuration.UI_MODE_NIGHT_YES -> ThemeValue.DARK
-            else -> ThemeValue.LIGHT
-        }
+internal fun shouldReloadStoryContentOnResume(
+    isWebViewReleasedForBackground: Boolean,
+    hasCompletedInitialStoryRender: Boolean,
+    hasWebViewContent: Boolean,
+): Boolean = isWebViewReleasedForBackground || !hasCompletedInitialStoryRender || !hasWebViewContent
+
+internal fun shouldCaptureScrollPositionBeforeWebViewRelease(
+    isViewStarted: Boolean,
+    hasSavedScrollPosition: Boolean,
+): Boolean = isViewStarted || !hasSavedScrollPosition
+
+internal fun resolveRestoredScrollY(
+    contentHeight: Int,
+    savedScrollPosRel: Float,
+    savedScrollPosPx: Int,
+    preferAbsoluteScrollRestore: Boolean,
+): Int =
+    if (preferAbsoluteScrollRestore && savedScrollPosPx > 0) {
+        savedScrollPosPx
+    } else {
+        (contentHeight * savedScrollPosRel).roundToInt()
     }
-    val styleResId: Int = when (selectedTheme) {
-        ThemeValue.LIGHT -> if (isRead) R.style.storyButtonsDimmed else R.style.storyButtons
-        else -> if (isRead) R.style.storyButtonsDimmed_dark else R.style.storyButtons_dark
-    }
-    val stringResId: Int = if (isRead) R.string.story_mark_unread_state else R.string.story_mark_read_state
-    this.text = context.getString(stringResId)
-    this.setTextAppearance(styleResId)
+
+internal fun resolveConfigurationChangeScrollY(
+    oldScrollY: Int,
+    oldContentHeight: Int,
+    reflowedContentHeight: Int,
+): Int {
+    if (oldContentHeight <= 0 || reflowedContentHeight <= 0) return 0
+
+    val relativeScrollPosition = (oldScrollY.toFloat() / oldContentHeight).coerceIn(0f, 1f)
+    return (reflowedContentHeight * relativeScrollPosition).roundToInt()
 }
+
+internal fun resolveReaderAnchorScrollY(
+    webViewTop: Int,
+    webViewHeight: Int,
+    documentYFraction: Double,
+): Int {
+    if (webViewHeight <= 0 || !documentYFraction.isFinite()) return webViewTop.coerceAtLeast(0)
+    return webViewTop + (webViewHeight * documentYFraction.coerceIn(0.0, 1.0)).roundToInt()
+}
+
+internal fun shouldApplyConfigurationChangeRestore(
+    sourceGeneration: Long,
+    currentGeneration: Long,
+    hasCurrentView: Boolean,
+): Boolean = hasCurrentView && sourceGeneration == currentGeneration
+
+internal fun shouldUseReaderAnchorForConfigurationChange(
+    previousRestoreHasAnchor: Boolean,
+    anchorCapturedScrollY: Int?,
+    currentScrollY: Int,
+): Boolean =
+    previousRestoreHasAnchor ||
+        anchorCapturedScrollY?.let {
+            abs(it - currentScrollY) <= READER_ANCHOR_CAPTURE_TOLERANCE_PX
+        } == true
+
+private fun parseReaderAnchorResolution(result: String): ReaderAnchorResolution? =
+    runCatching {
+        val values = JSONArray(result)
+        ReaderAnchorResolution(
+            documentYFraction = values.getDouble(0),
+            layoutChanged = values.getBoolean(1),
+        )
+    }.getOrNull()
+
+internal fun maxRestoredScrollY(
+    contentHeight: Int,
+    viewportHeight: Int,
+): Int = (contentHeight - viewportHeight).coerceAtLeast(0)
+
+internal fun shouldRetryScrollRestore(
+    desiredScrollY: Int,
+    maxScrollY: Int,
+    appliedScrollY: Int,
+    attempt: Int,
+    maxAttempts: Int,
+): Boolean {
+    if (attempt >= maxAttempts - 1) return false
+
+    val reachableScrollY = desiredScrollY.coerceIn(0, maxScrollY)
+    val contentCannotReachSavedOffset =
+        maxScrollY + STORY_SCROLL_RESTORE_TOLERANCE_PX < desiredScrollY
+    val scrollDidNotApply =
+        appliedScrollY + STORY_SCROLL_RESTORE_TOLERANCE_PX < reachableScrollY
+    return contentCannotReachSavedOffset || scrollDidNotApply
+}
+
+internal fun shouldApplyScrollRestore(
+    currentScrollY: Int,
+    previousAppliedScrollY: Int?,
+): Boolean =
+    previousAppliedScrollY == null ||
+        abs(currentScrollY - previousAppliedScrollY) <= STORY_SCROLL_RESTORE_TOLERANCE_PX
+
+private const val STORY_SCROLL_RESTORE_TOLERANCE_PX = 24
+private const val READER_ANCHOR_CAPTURE_DELAY_MS = 125L
+private const val READER_ANCHOR_CAPTURE_TOLERANCE_PX = 48
+
+private data class ConfigurationChangeScrollSource(
+    val generation: Long,
+    val scrollY: Int,
+    val contentHeight: Int,
+    val webView: NewsblurWebview?,
+    val webViewWidth: Int,
+    val webViewHeight: Int,
+    val hasReaderAnchor: Boolean,
+)
+
+private data class ReaderAnchorResolution(
+    val documentYFraction: Double,
+    val layoutChanged: Boolean,
+)
+
+private data class ReaderHtmlRequest(
+    val content: String,
+    val fontCss: String,
+    val theme: ThemeValue,
+    val nightMask: Int,
+    val enableHighlights: Boolean,
+    val textClassifiers: Map<String, Int>,
+    val textRegexClassifiers: Map<String, Int>,
+    val interfaceRtl: Boolean,
+)
+
+private data class PreparedReaderDocument(
+    val html: String,
+)

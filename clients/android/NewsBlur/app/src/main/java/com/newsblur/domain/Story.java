@@ -2,7 +2,8 @@ package com.newsblur.domain;
 
 import java.io.Serializable;
 import java.util.Arrays;
-import java.util.Map;
+import java.util.HashMap;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -49,6 +50,9 @@ public class Story implements Serializable {
 	@SerializedName("user_tags")
     public String[] userTags = new String[]{};
 
+    @SerializedName("highlights")
+    public String[] highlights = new String[]{};
+
 	@SerializedName("social_user_id")
 	public String socialUserId;
 
@@ -90,14 +94,21 @@ public class Story implements Serializable {
     @SerializedName("story_hash")
     public String storyHash;
 
+    // NOTE: declared as HashMap (not Map) so Gson creates a java.util.HashMap instead of
+    // its internal LinkedTreeMap. LinkedTreeMap is not Serializable, which caused a
+    // NotSerializableException when Android tried to save a Story into an activity's
+    // saved-instance-state Bundle. See Play crash 812322145eb6ef2abf80c9ad17b66368.
     @SerializedName("secure_image_urls")
-    public Map<String, String> secureImageUrls;
+    public HashMap<String, String> secureImageUrls;
 
     @SerializedName("secure_image_thumbnails")
-    public Map<String, String> secureImageThumbnails;
+    public HashMap<String, String> secureImageThumbnails;
 
     @SerializedName("has_modifications")
     public boolean hasModifications;
+
+    @SerializedName("cluster_stories")
+    public ClusterStory[] clusterStories = new ClusterStory[]{};
 
     // NOTE: this is parsed and saved to the DB, but is *not* generally un-thawed when stories are fetched back from the DB
     @SerializedName("image_urls")
@@ -118,6 +129,9 @@ public class Story implements Serializable {
     // non-API, but indicates that the story came from the infrequent-feeds river
     public boolean infrequent;
 
+    // non-API, only used to style the Daily Briefing summary row in the story list
+    public boolean isBriefingSummary;
+
     // these properties are associated with stories, but only available if the record was joined on other tables
     // when queried and thus are not generally thawed.  calling bindExternValues() immediately after fromCursor()
     // will populate them iff the cursor was from a joined query
@@ -131,8 +145,9 @@ public class Story implements Serializable {
 
 	public ContentValues getValues() {
 		final ContentValues values = new ContentValues();
+        String safeTitle = title == null ? "" : title;
 		values.put(DatabaseConstants.STORY_ID, id);
-		values.put(DatabaseConstants.STORY_TITLE, title.replace("\n", " ").replace("\r", " "));
+		values.put(DatabaseConstants.STORY_TITLE, safeTitle.replace("\n", " ").replace("\r", " "));
 		values.put(DatabaseConstants.STORY_TIMESTAMP, timestamp);
         values.put(DatabaseConstants.STORY_CONTENT, content);
         values.put(DatabaseConstants.STORY_SHORT_CONTENT, shortContent);
@@ -149,6 +164,7 @@ public class Story implements Serializable {
         values.put(DatabaseConstants.STORY_INTELLIGENCE_TOTAL, intelligence.calcTotalIntel());
 		values.put(DatabaseConstants.STORY_TAGS, StoryUtil.nullSafeJoin(",", tags));
 		values.put(DatabaseConstants.STORY_USER_TAGS, StoryUtil.nullSafeJoin(",", userTags));
+		values.put(DatabaseConstants.STORY_HIGHLIGHTS, StoryUtil.nullSafeJoin(",", highlights));
 		values.put(DatabaseConstants.STORY_READ, read);
 		values.put(DatabaseConstants.STORY_STARRED, starred);
 		values.put(DatabaseConstants.STORY_STARRED_DATE, starredTimestamp);
@@ -157,10 +173,11 @@ public class Story implements Serializable {
         values.put(DatabaseConstants.STORY_IMAGE_URLS, StoryUtil.nullSafeJoin(",", imageUrls));
         values.put(DatabaseConstants.STORY_LAST_READ_DATE, lastReadTimestamp);
         values.put(DatabaseConstants.STORY_SHARED_DATE, sharedTimestamp);
-		values.put(DatabaseConstants.STORY_SEARCH_HIT, searchHit);
+        values.put(DatabaseConstants.STORY_SEARCH_HIT, searchHit);
         values.put(DatabaseConstants.STORY_THUMBNAIL_URL, thumbnailUrl);
         values.put(DatabaseConstants.STORY_INFREQUENT, infrequent);
         values.put(DatabaseConstants.STORY_HAS_MODIFICATIONS, hasModifications);
+        values.put(DatabaseConstants.STORY_CLUSTER_STORIES, DatabaseConstants.JsonHelper.toJson(clusterStories));
 		return values;
 	}
 
@@ -186,6 +203,7 @@ public class Story implements Serializable {
 		story.starred = cursor.getInt(cursor.getColumnIndex(DatabaseConstants.STORY_STARRED)) > 0;
 		story.starredTimestamp = cursor.getLong(cursor.getColumnIndex(DatabaseConstants.STORY_STARRED_DATE));
 		story.tags = TextUtils.split(cursor.getString(cursor.getColumnIndex(DatabaseConstants.STORY_TAGS)), ",");
+		story.highlights = TextUtils.split(cursor.getString(cursor.getColumnIndex(DatabaseConstants.STORY_HIGHLIGHTS)), ",");
 		story.userTags = TextUtils.split(cursor.getString(cursor.getColumnIndex(DatabaseConstants.STORY_USER_TAGS)), ",");
 		story.feedId = cursor.getString(cursor.getColumnIndex(DatabaseConstants.STORY_FEED_ID));
 		story.id = cursor.getString(cursor.getColumnIndex(DatabaseConstants.STORY_ID));
@@ -194,8 +212,61 @@ public class Story implements Serializable {
         story.sharedTimestamp = cursor.getLong(cursor.getColumnIndex(DatabaseConstants.STORY_SHARED_DATE));
 		story.thumbnailUrl = cursor.getString(cursor.getColumnIndex(DatabaseConstants.STORY_THUMBNAIL_URL));
 		story.hasModifications = cursor.getInt(cursor.getColumnIndex(DatabaseConstants.STORY_HAS_MODIFICATIONS)) > 0;
+        String clusterStoriesJson = cursor.getString(cursor.getColumnIndex(DatabaseConstants.STORY_CLUSTER_STORIES));
+        story.clusterStories = ClusterStory.fromJson(clusterStoriesJson);
 		return story;
 	}
+
+    /**
+     * Returns a shallow copy of this Story with the heaviest, non-essential fields cleared.
+     * Use when placing a Story into a Fragment argument Bundle to keep the activity's saved
+     * state small. Reading fragments (one per story in the Reading ViewPager) re-fetch their
+     * content through the ReadingItemViewModel, so these fields don't need to persist across
+     * activity-stop / process-death rehydration.
+     *
+     * Without this the fragment args for a large reading session can push the saved-state
+     * Bundle past the 1MB Binder transaction limit, triggering
+     * android.os.TransactionTooLargeException at activityStopped.
+     * See Play crash id 313659223e4fd44c9953ab2cd7b29706.
+     */
+    public Story copyForBundle() {
+        Story copy = new Story();
+        copy.id = id;
+        copy.permalink = permalink;
+        copy.sharedUserIds = sharedUserIds;
+        copy.friendUserIds = friendUserIds;
+        copy.read = read;
+        copy.starred = starred;
+        copy.starredTimestamp = starredTimestamp;
+        copy.tags = tags;
+        copy.userTags = userTags;
+        copy.highlights = highlights;
+        copy.socialUserId = socialUserId;
+        copy.sourceUserId = sourceUserId;
+        copy.title = title;
+        copy.timestamp = timestamp;
+        copy.authors = authors;
+        copy.feedId = feedId;
+        copy.intelligence = intelligence;
+        copy.storyHash = storyHash;
+        copy.hasModifications = hasModifications;
+        copy.lastReadTimestamp = lastReadTimestamp;
+        copy.searchHit = searchHit;
+        copy.thumbnailUrl = thumbnailUrl;
+        copy.sharedTimestamp = sharedTimestamp;
+        copy.infrequent = infrequent;
+        copy.isBriefingSummary = isBriefingSummary;
+        copy.extern_feedColor = extern_feedColor;
+        copy.extern_feedFade = extern_feedFade;
+        copy.extern_intelTotalScore = extern_intelTotalScore;
+        copy.extern_faviconUrl = extern_faviconUrl;
+        copy.extern_faviconTextColor = extern_faviconTextColor;
+        copy.extern_faviconBorderColor = extern_faviconBorderColor;
+        copy.extern_feedTitle = extern_feedTitle;
+        // deliberately skipped: content, shortContent, imageUrls, secureImageUrls,
+        // secureImageThumbnails, publicComments, friendsComments, friendsShares, clusterStories
+        return copy;
+    }
 
     public void bindExternValues(Cursor cursor) {
         extern_feedColor = cursor.getString(cursor.getColumnIndex(DatabaseConstants.FEED_FAVICON_COLOR));
@@ -208,7 +279,7 @@ public class Story implements Serializable {
     }
 
 	public static class Intelligence implements Serializable {
-		private static final long serialVersionUID = -1314486209455376730L;
+		private static final long serialVersionUID = -1314486209455376731L;
 
 		@SerializedName("feed")
 		public int intelligenceFeed = 0;
@@ -216,23 +287,61 @@ public class Story implements Serializable {
 		@SerializedName("author")
 		public int intelligenceAuthors = 0;
 
+		@SerializedName("author_regex")
+		public int intelligenceAuthorRegex = 0;
+
 		@SerializedName("tags")
 		public int intelligenceTags = 0;
 
 		@SerializedName("title")
 		public int intelligenceTitle = 0;
 
+		@SerializedName("title_regex")
+		public int intelligenceTitleRegex = 0;
+
+		@SerializedName("text")
+		public int intelligenceText = 0;
+
+		@SerializedName("text_regex")
+		public int intelligenceTextRegex = 0;
+
+		@SerializedName("url")
+		public int intelligenceUrl = 0;
+
+		@SerializedName("url_regex")
+		public int intelligenceUrlRegex = 0;
+
+		@SerializedName("prompt")
+		public int intelligencePrompt = 0;
+
         public int calcTotalIntel() {
+            // AI prompt classifier takes absolute priority
+            if (intelligencePrompt != 0) return intelligencePrompt;
+
             int max = 0;
             max = Math.max(max, intelligenceAuthors);
+            max = Math.max(max, intelligenceAuthorRegex);
             max = Math.max(max, intelligenceTags);
             max = Math.max(max, intelligenceTitle);
-            if (max > 0) return max;
+            max = Math.max(max, intelligenceTitleRegex);
+            max = Math.max(max, intelligenceText);
+            max = Math.max(max, intelligenceTextRegex);
+            max = Math.max(max, intelligenceUrl);
+            max = Math.max(max, intelligenceUrlRegex);
 
             int min = 0;
             min = Math.min(min, intelligenceAuthors);
+            min = Math.min(min, intelligenceAuthorRegex);
             min = Math.min(min, intelligenceTags);
             min = Math.min(min, intelligenceTitle);
+            min = Math.min(min, intelligenceTitleRegex);
+            min = Math.min(min, intelligenceText);
+            min = Math.min(min, intelligenceTextRegex);
+            min = Math.min(min, intelligenceUrl);
+            min = Math.min(min, intelligenceUrlRegex);
+
+            if (min <= -2) return min;
+            if (max > 0) return max;
             if (min < 0) return min;
 
             return intelligenceFeed;
@@ -296,6 +405,7 @@ public class Story implements Serializable {
         if (!Arrays.deepEquals(s.publicComments, publicComments)) return false;
         if (!Arrays.deepEquals(s.friendsComments, friendsComments)) return false;
         if (!Arrays.deepEquals(s.friendsShares, friendsShares)) return false;
+        if (!Arrays.deepEquals(s.clusterStories, clusterStories)) return false;
         if (s.intelligence.calcTotalIntel() != intelligence.calcTotalIntel()) return false;
         return true;
     }
@@ -311,21 +421,23 @@ public class Story implements Serializable {
         String content = story.content;
         
         String ytUrl = null;
-        if (ytUrl == null) {
-            Matcher m = ytSniff1.matcher(content);
-            if (m.find()) ytUrl = m.group(1);
-        }
-        if (ytUrl == null) {
-            Matcher m = ytSniff2.matcher(content);
-            if (m.find()) ytUrl = m.group(1);
-        }
-        if (ytUrl == null) {
-            Matcher m = ytSniff3.matcher(content);
-            if (m.find()) ytUrl = m.group(1);
-        }
-        if (ytUrl == null) {
-            Matcher m = ytSniff4.matcher(content);
-            if (m.find()) ytUrl = m.group(1);
+        if (content != null && !content.isEmpty()) {
+            if (ytUrl == null) {
+                Matcher m = ytSniff1.matcher(content);
+                if (m.find()) ytUrl = m.group(1);
+            }
+            if (ytUrl == null) {
+                Matcher m = ytSniff2.matcher(content);
+                if (m.find()) ytUrl = m.group(1);
+            }
+            if (ytUrl == null) {
+                Matcher m = ytSniff3.matcher(content);
+                if (m.find()) ytUrl = m.group(1);
+            }
+            if (ytUrl == null) {
+                Matcher m = ytSniff4.matcher(content);
+                if (m.find()) ytUrl = m.group(1);
+            }
         }
         if (ytUrl != null) {
             return YT_THUMB_PRE + ytUrl + YT_THUMB_POST;
@@ -339,6 +451,88 @@ public class Story implements Serializable {
             return thumbnail;
         }
         return null;
+    }
+
+    public static class ClusterStory implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        @SerializedName("story_feed_id")
+        public String feedId;
+
+        @SerializedName("story_hash")
+        public String storyHash;
+
+        @SerializedName("story_title")
+        public String title;
+
+        @SerializedName("story_timestamp")
+        public long timestamp;
+
+        @SerializedName("story_authors")
+        public String authors;
+
+        @SerializedName("score")
+        public int score;
+
+        @SerializedName("cluster_tier")
+        public String clusterTier;
+
+        @SerializedName("read_status")
+        public boolean read;
+
+        @SerializedName("image_urls")
+        public String[] imageUrls;
+
+        // See note on Story.secureImageUrls above - HashMap ensures Java Serialization works.
+        @SerializedName("secure_image_thumbnails")
+        public HashMap<String, String> secureImageThumbnails;
+
+        public String getThumbnailUrl() {
+            if (imageUrls == null || imageUrls.length == 0) return null;
+            String thumbnail = imageUrls[0];
+            if (thumbnail.startsWith("http://") && secureImageThumbnails != null && secureImageThumbnails.containsKey(thumbnail)) {
+                thumbnail = secureImageThumbnails.get(thumbnail);
+            }
+            return thumbnail;
+        }
+
+        public static ClusterStory[] fromJson(String json) {
+            if (TextUtils.isEmpty(json)) {
+                return new ClusterStory[]{};
+            }
+
+            ClusterStory[] clusterStories = DatabaseConstants.JsonHelper.fromJson(json, ClusterStory[].class);
+            if (clusterStories == null) {
+                return new ClusterStory[]{};
+            }
+
+            return clusterStories;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) return true;
+            if (!(other instanceof ClusterStory)) return false;
+
+            ClusterStory clusterStory = (ClusterStory) other;
+            return timestamp == clusterStory.timestamp &&
+                score == clusterStory.score &&
+                read == clusterStory.read &&
+                Objects.equals(feedId, clusterStory.feedId) &&
+                Objects.equals(storyHash, clusterStory.storyHash) &&
+                Objects.equals(title, clusterStory.title) &&
+                Objects.equals(authors, clusterStory.authors) &&
+                Objects.equals(clusterTier, clusterStory.clusterTier) &&
+                Arrays.equals(imageUrls, clusterStory.imageUrls);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(feedId, storyHash, title, timestamp, authors, score, clusterTier, read);
+            result = 31 * result + Arrays.hashCode(imageUrls);
+            return result;
+        }
     }
 
 }

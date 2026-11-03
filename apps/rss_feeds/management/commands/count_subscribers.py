@@ -1,9 +1,12 @@
 from django.core.management.base import BaseCommand
+from django.db.models import ProtectedError
 
 from apps.rss_feeds.models import Feed
 
 
 class Command(BaseCommand):
+    help = "Count subscribers per feed in batches, optionally deleting feeds with zero subscribers."
+
     def add_arguments(self, parser):
         parser.add_argument("-f", "--feed", dest="feed", default=None)
         parser.add_argument("-t", "--title", dest="title", default=None)
@@ -32,4 +35,9 @@ class Command(BaseCommand):
                 feed.count_subscribers(verbose=True)
                 if feed.num_subscribers == 0:
                     print((" ---> Deleting: [%s] %s" % (feed.pk, feed)))
-                    feed.delete()
+                    try:
+                        feed.delete()
+                    except ProtectedError:
+                        # Feed.branch_from_feed is PROTECT: a parent with branches stays
+                        # (its branches may be readers' private URLs) and cleanup moves on.
+                        print((" ---> Kept: [%s] %s still has branched feeds" % (feed.pk, feed)))

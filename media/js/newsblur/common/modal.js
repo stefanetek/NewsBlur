@@ -49,6 +49,14 @@ NEWSBLUR.Modal.prototype = {
             },
             'onClose': function (dialog, callback) {
                 self.flags.open = false;
+                // modal.js: Optional per-modal cleanup, such as the trainer's deferred
+                // feed refresh in reader_classifier.js.
+                if (self.handle_modal_closed) {
+                    self.handle_modal_closed();
+                }
+                // modal.js: Hover tooltips live on body (bind_tooltip in reader_classifier.js),
+                // so one over a control that closes the dialog would outlive it.
+                $('.NB-scope-tooltip').remove();
                 dialog.data.hide().empty().remove();
                 dialog.container.hide().empty().remove();
                 dialog.overlay.fadeOut(200, function () {
@@ -90,16 +98,46 @@ NEWSBLUR.Modal.prototype = {
         }
         this.options.social_feed = this.feed && this.feed.is_social();
 
-        $('.NB-modal-subtitle .NB-modal-feed-image', this.$modal).attr('src', $.favicon(this.feed));
+        var $feed_icon = $.favicon_el(this.feed, {
+            image_class: 'NB-modal-feed-image feed_favicon',
+            emoji_class: 'NB-modal-feed-image NB-feed-emoji',
+            colored_class: 'NB-modal-feed-image NB-feed-icon-colored'
+        });
+        var $feed_icon_container = $('.NB-modal-subtitle .NB-modal-feed-image', this.$modal).first();
+        if ($feed_icon) {
+            if ($feed_icon_container.length) {
+                $feed_icon_container.replaceWith($feed_icon);
+            } else {
+                $('.NB-modal-subtitle', this.$modal).prepend($feed_icon);
+            }
+        }
         $('.NB-modal-subtitle .NB-modal-feed-title', this.$modal).html(this.feed.get('feed_title'));
-        $('.NB-modal-subtitle .NB-modal-feed-subscribers', this.$modal).html(Inflector.pluralize(' subscriber', this.feed.get('num_subscribers'), true)).show();
+        // Hide subscriber count for starred/saved tags and social feeds
+        if (this.feed.is_starred() || this.feed.is_social()) {
+            $('.NB-modal-subtitle .NB-modal-feed-subscribers', this.$modal).hide();
+        } else {
+            var num_subscribers = this.feed.get('num_subscribers');
+            $('.NB-modal-subtitle .NB-modal-feed-subscribers', this.$modal).html(interpolate(ngettext("%(count)s subscriber", "%(count)s subscribers", num_subscribers), { count: Inflector.commas(num_subscribers) }, true)).show();
+        }
     },
 
     initialize_folder: function (folder_title) {
         this.folder_title = folder_title;
         this.folder = this.model.get_folder(folder_title);
 
-        $('.NB-modal-subtitle .NB-modal-feed-image', this.$modal).attr('src', NEWSBLUR.Globals.MEDIA_URL + '/img/icons/nouns/folder-open.svg');
+        var $folder_icon = $.favicon_el('river:' + folder_title, {
+            image_class: 'NB-modal-feed-image feed_favicon',
+            emoji_class: 'NB-modal-feed-image NB-folder-emoji',
+            colored_class: 'NB-modal-feed-image NB-folder-icon-colored'
+        });
+        var $folder_icon_container = $('.NB-modal-subtitle .NB-modal-feed-image', this.$modal).first();
+        if ($folder_icon) {
+            if ($folder_icon_container.length) {
+                $folder_icon_container.replaceWith($folder_icon);
+            } else {
+                $('.NB-modal-subtitle', this.$modal).prepend($folder_icon);
+            }
+        }
         $('.NB-modal-subtitle .NB-modal-feed-title', this.$modal).html(this.folder_title);
         $('.NB-modal-subtitle .NB-modal-feed-subscribers', this.$modal).hide();
     },

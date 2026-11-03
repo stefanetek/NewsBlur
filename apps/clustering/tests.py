@@ -1,0 +1,758 @@
+from django.test import TestCase
+
+from apps.clustering.models import (
+    CLUSTER_TIER_RELATED,
+    CLUSTER_TIER_TITLE,
+    SEMANTIC_MIN_OVERLAP_COEF,
+    SEMANTIC_MIN_TITLE_INTERSECTION,
+    _simple_stem,
+    cluster_mode_prefixes,
+    find_title_clusters,
+    merge_clusters,
+    normalize_title,
+    tier_from_score,
+    title_significant_words,
+    title_words_excluding_feed,
+)
+
+
+class Test_NormalizeTitle(TestCase):
+    def test_basic(self):
+        self.assertEqual(normalize_title("  Breaking News!  "), "breaking news")
+
+    def test_empty(self):
+        self.assertEqual(normalize_title(""), "")
+
+    def test_none(self):
+        self.assertEqual(normalize_title(None), "")
+
+    def test_hyphen_splits_words(self):
+        self.assertEqual(normalize_title("Anthropic-backed"), "anthropic backed")
+
+    def test_slash_splits_words(self):
+        self.assertEqual(normalize_title("Kang/New York Times"), "kang new york times")
+
+    def test_multiple_hyphens(self):
+        self.assertEqual(normalize_title("well-known test-driven"), "well known test driven")
+
+
+class Test_SimpleStem(TestCase):
+    def test_plural(self):
+        self.assertEqual(_simple_stem("regulations"), "regulation")
+
+    def test_begins(self):
+        self.assertEqual(_simple_stem("begins"), "begin")
+
+    def test_short_word_preserved(self):
+        self.assertEqual(_simple_stem("bus"), "bus")
+        self.assertEqual(_simple_stem("gas"), "gas")
+        self.assertEqual(_simple_stem("ios"), "ios")
+
+    def test_double_s_preserved(self):
+        self.assertEqual(_simple_stem("press"), "press")
+        self.assertEqual(_simple_stem("class"), "class")
+
+    def test_no_trailing_s(self):
+        self.assertEqual(_simple_stem("anthropic"), "anthropic")
+
+
+class Test_TitleSignificantWords(TestCase):
+    def test_short_acronyms_included(self):
+        words = title_significant_words("AI regulation in the EU")
+        self.assertIn("ai", words)
+        self.assertIn("eu", words)
+
+    def test_stopwords_excluded(self):
+        words = title_significant_words("he said she was going up")
+        self.assertNotIn("he", words)
+        self.assertNotIn("she", words)
+        self.assertNotIn("up", words)
+
+    def test_stemming_applied(self):
+        words = title_significant_words("AI regulations and political ads")
+        self.assertIn("regulation", words)
+        # "ads" (3 chars) is NOT stemmed — stemmer only applies to len > 3
+        # to avoid mangling short words like "bus", "gas"
+        self.assertIn("ads", words)
+
+    def test_hyphenated_words_split(self):
+        words = title_significant_words("Anthropic-backed super PAC")
+        self.assertIn("anthropic", words)
+        self.assertIn("backed", words)
+
+
+class Test_FindTitleClusters(TestCase):
+    def test_aggregator_title_clusters(self):
+        """The NYT/Techmeme case that motivated this fix."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "Backed by Anthropic, a Super PAC Begins an Ad Blitz in Support of A.I. Regulation",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "222:bbb",
+                "story_feed_id": 2,
+                "story_title": (
+                    "Anthropic-backed super PAC Public First Action begins running ads urging AI"
+                    " regulations in New Jersey; the PAC raised nearly $50M and now aims to raise"
+                    " $75M (Cecilia Kang/New York Times)"
+                ),
+                "story_date": 999,
+            },
+        ]
+        clusters = find_title_clusters(stories)
+        self.assertEqual(len(clusters), 1)
+        cluster_hashes = list(clusters.values())[0]
+        self.assertIn("111:aaa", cluster_hashes)
+        self.assertIn("222:bbb", cluster_hashes)
+
+    def test_no_false_positive_on_shared_topic_word(self):
+        """Stories sharing only 1-2 common words should NOT cluster."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "Apple Releases the New iPhone 17 with Better Camera",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "222:bbb",
+                "story_feed_id": 2,
+                "story_title": "Apple Releases New macOS Update with Security Fixes",
+                "story_date": 999,
+            },
+        ]
+        clusters = find_title_clusters(stories)
+        self.assertEqual(len(clusters), 0)
+
+    def test_same_feed_not_clustered(self):
+        """Stories from the same feed should NOT form a cluster."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "Breaking: Major Event Unfolds in Washington Today",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "111:bbb",
+                "story_feed_id": 1,
+                "story_title": "Breaking: Major Event Unfolds in Washington Today",
+                "story_date": 999,
+            },
+        ]
+        clusters = find_title_clusters(stories)
+        self.assertEqual(len(clusters), 0)
+
+    def test_exact_title_match_across_feeds(self):
+        """Identical titles from different feeds should cluster."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "Major Climate Agreement Reached at United Nations Summit",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "222:bbb",
+                "story_feed_id": 2,
+                "story_title": "Major Climate Agreement Reached at United Nations Summit",
+                "story_date": 999,
+            },
+        ]
+        clusters = find_title_clusters(stories)
+        self.assertEqual(len(clusters), 1)
+
+
+class Test_SemanticClusterFalsePositive(TestCase):
+    """Tests that semantic clustering rejects false positives with insufficient title overlap."""
+
+    def _make_stories(self):
+        return [
+            {
+                "story_hash": "100:aaa",
+                "story_feed_id": 1,
+                "story_title": "Apple Launches New 'Sales Coach' App",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "200:bbb",
+                "story_feed_id": 2,
+                "story_title": "Rivian owners will soon be able to access Apple Watch apps from their cars",
+                "story_date": 999,
+            },
+            {
+                "story_hash": "300:ccc",
+                "story_feed_id": 3,
+                "story_title": "Rivian Releases Apple Watch App",
+                "story_date": 998,
+            },
+        ]
+
+    def test_title_words_for_apple_stories(self):
+        """Verify the word intersection counts that drive the threshold decision."""
+        w1 = title_significant_words("Apple Launches New 'Sales Coach' App")
+        w2 = title_significant_words(
+            "Rivian owners will soon be able to access Apple Watch apps from their cars"
+        )
+        w3 = title_significant_words("Rivian Releases Apple Watch App")
+
+        # Sales Coach vs either Rivian story: only 'apple' and 'app'
+        self.assertEqual(len(w1 & w2), 2)
+        self.assertEqual(len(w1 & w3), 2)
+        # Rivian vs Rivian: 'apple', 'app', 'rivian', 'watch'
+        self.assertEqual(len(w2 & w3), 4)
+        self.assertGreaterEqual(len(w2 & w3), SEMANTIC_MIN_TITLE_INTERSECTION)
+        self.assertLess(len(w1 & w2), SEMANTIC_MIN_TITLE_INTERSECTION)
+
+    def test_merge_rejects_semantic_false_positive(self):
+        """Sales Coach story should not merge with Rivian Apple Watch stories
+        when semantic clustering falsely matches them on shared 'apple'/'app' terms."""
+        stories = self._make_stories()
+        story_title_map = {s["story_hash"]: s["story_title"] for s in stories}
+        story_feed_map = {s["story_hash"]: s["story_feed_id"] for s in stories}
+
+        # Title clusters correctly group only Rivian stories
+        title_clusters = find_title_clusters(stories)
+
+        # Simulate ES semantic false positive: Sales Coach matched with Rivian story
+        semantic_clusters = {"100:aaa": ["100:aaa", "200:bbb"]}
+
+        merged = merge_clusters(
+            title_clusters,
+            semantic_clusters,
+            story_feed_map=story_feed_map,
+            story_title_map=story_title_map,
+        )
+
+        # Sales Coach should NOT be in the same cluster as Rivian stories
+        for members in merged.values():
+            self.assertFalse(
+                "100:aaa" in members and ("200:bbb" in members or "300:ccc" in members),
+                "Sales Coach story should not merge with Rivian Apple Watch stories",
+            )
+
+    def test_merge_preserves_valid_rivian_cluster(self):
+        """Rivian Apple Watch stories should remain clustered together."""
+        stories = self._make_stories()
+        story_title_map = {s["story_hash"]: s["story_title"] for s in stories}
+        story_feed_map = {s["story_hash"]: s["story_feed_id"] for s in stories}
+
+        title_clusters = find_title_clusters(stories)
+        semantic_clusters = {"100:aaa": ["100:aaa", "200:bbb"]}
+
+        merged = merge_clusters(
+            title_clusters,
+            semantic_clusters,
+            story_feed_map=story_feed_map,
+            story_title_map=story_title_map,
+        )
+
+        # Rivian stories should still be clustered together
+        rivian_clustered = any("200:bbb" in members and "300:ccc" in members for members in merged.values())
+        self.assertTrue(rivian_clustered, "Rivian Apple Watch stories should remain clustered")
+
+    def test_merge_without_title_map_unions_everything(self):
+        """Without story_title_map, merge_clusters should behave as before (union all)."""
+        stories = self._make_stories()
+        story_feed_map = {s["story_hash"]: s["story_feed_id"] for s in stories}
+
+        semantic_clusters = {"100:aaa": ["100:aaa", "200:bbb"]}
+
+        merged = merge_clusters(
+            {},
+            semantic_clusters,
+            story_feed_map=story_feed_map,
+            story_title_map=None,
+        )
+
+        # Without title validation, the false positive union is allowed
+        found_both = any("100:aaa" in members and "200:bbb" in members for members in merged.values())
+        self.assertTrue(found_both, "Without title map, all semantic matches should union")
+
+
+class Test_TitleWordsExcludingFeed(TestCase):
+    def test_strips_feed_title_words(self):
+        """Feed title words should be removed from significant words."""
+        words = title_words_excluding_feed(
+            "Saturday Morning Breakfast Cereal - Cow",
+            "Saturday Morning Breakfast Cereal",
+        )
+        self.assertEqual(words, frozenset({"cow"}))
+
+    def test_no_feed_title(self):
+        """Without feed title, all significant words are kept."""
+        words = title_words_excluding_feed("Saturday Morning Breakfast Cereal - Cow", "")
+        self.assertEqual(words, title_significant_words("Saturday Morning Breakfast Cereal - Cow"))
+
+    def test_feed_title_words_not_in_story(self):
+        """When feed title words don't appear in story, nothing is stripped."""
+        words = title_words_excluding_feed(
+            "Trump Signs Executive Order on Artificial Intelligence",
+            "New York Times",
+        )
+        expected = title_significant_words("Trump Signs Executive Order on Artificial Intelligence")
+        self.assertEqual(words, expected)
+
+
+class Test_SingleCellGreedyCluster(TestCase):
+    """Regression for the single-cell research cluster reported on the forum.
+
+    Six unrelated scientific papers were bound into one cluster because they
+    all shared a handful of domain words like "single", "cell", "rna",
+    "sequencing". Tier 1 (title) correctly rejects every pair (max overlap
+    coefficient 0.36), so the cluster came entirely from Tier 2 semantic
+    matches passing the old intersection>=3 rule. With the tightened
+    thresholds (intersection>=4 AND overlap>=0.45), merge_clusters should
+    reject the false-positive semantic union.
+    """
+
+    def _scientific_stories(self):
+        return [
+            {
+                "story_hash": "11:a",
+                "story_feed_id": 1,
+                "story_title": (
+                    "Single-cell RNA-seq reveals trans-sialidase-like superfamily gene"
+                    " expression heterogeneity in Trypanosoma cruzi populations"
+                ),
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "22:b",
+                "story_feed_id": 2,
+                "story_title": (
+                    "Locat: Joint enrichment and depletion testing identifies localized"
+                    " marker genes in single-cell transcriptomics"
+                ),
+                "story_date": 999,
+            },
+            {
+                "story_hash": "33:c",
+                "story_feed_id": 3,
+                "story_title": (
+                    "MitoChontrol: Adaptive mitochondrial filtering for robust single-cell"
+                    " RNA sequencing quality control"
+                ),
+                "story_date": 998,
+            },
+        ]
+
+    def test_tier1_finds_no_clusters(self):
+        """Tier 1 (title) must reject every pair — proves any cluster we see
+        in production came from Tier 2 semantic matching, not title fuzzy."""
+        clusters = find_title_clusters(self._scientific_stories())
+        self.assertEqual(clusters, {})
+
+    def test_tier2_merge_rejects_tightened_threshold(self):
+        """With the tightened intersection>=4 and overlap>=0.45 thresholds,
+        merge_clusters should NOT union these stories even if ES MLT hands
+        them over as a semantic cluster."""
+        stories = self._scientific_stories()
+        story_title_map = {s["story_hash"]: s["story_title"] for s in stories}
+        story_feed_map = {s["story_hash"]: s["story_feed_id"] for s in stories}
+
+        # Simulate ES more_like_this returning all three as a semantic match
+        semantic_clusters = {"11:a": ["11:a", "22:b", "33:c"]}
+
+        merged = merge_clusters(
+            {},  # no Tier 1 clusters — Tier 1 already rejected them above
+            semantic_clusters,
+            story_feed_map=story_feed_map,
+            story_title_map=story_title_map,
+        )
+
+        # No cluster should survive validation with the tightened floors.
+        for members in merged.values():
+            clustered_together = [h for h in ("11:a", "22:b", "33:c") if h in members]
+            self.assertLess(
+                len(clustered_together),
+                2,
+                "Tightened Tier 2 validation should reject single-cell false positives",
+            )
+
+    def test_semantic_thresholds_reflect_real_world(self):
+        """Pairwise overlap coefficients for the reported cluster should all
+        fall below SEMANTIC_MIN_OVERLAP_COEF. This pins the constant to the
+        behavior we actually want."""
+        stories = self._scientific_stories()
+        worst_coef = 0.0
+        for i in range(len(stories)):
+            for j in range(i + 1, len(stories)):
+                wa = title_significant_words(stories[i]["story_title"])
+                wb = title_significant_words(stories[j]["story_title"])
+                smaller = min(len(wa), len(wb))
+                if smaller:
+                    worst_coef = max(worst_coef, len(wa & wb) / smaller)
+        self.assertLess(worst_coef, SEMANTIC_MIN_OVERLAP_COEF)
+
+
+class Test_ClusterModePrefixes(TestCase):
+    def test_title_mode_uses_title_namespace(self):
+        key_prefix, zkey_prefix = cluster_mode_prefixes(CLUSTER_TIER_TITLE)
+        self.assertEqual(key_prefix, "sCLt")
+        self.assertEqual(zkey_prefix, "zCLt")
+
+    def test_related_mode_uses_merged_namespace(self):
+        key_prefix, zkey_prefix = cluster_mode_prefixes(CLUSTER_TIER_RELATED)
+        self.assertEqual(key_prefix, "sCL")
+        self.assertEqual(zkey_prefix, "zCL")
+
+    def test_unknown_mode_falls_back_to_related(self):
+        """Unrecognized/missing modes should default to the merged namespace
+        so the feature degrades gracefully when the preference is absent."""
+        key_prefix, zkey_prefix = cluster_mode_prefixes(None)
+        self.assertEqual(key_prefix, "sCL")
+        self.assertEqual(zkey_prefix, "zCL")
+
+    def test_tier_from_score(self):
+        self.assertEqual(tier_from_score(1), CLUSTER_TIER_TITLE)
+        self.assertEqual(tier_from_score(2), CLUSTER_TIER_RELATED)
+        # Legacy entries written before tier scoring get score 0; they should
+        # read back as related (the safer default).
+        self.assertEqual(tier_from_score(0), CLUSTER_TIER_RELATED)
+
+
+class Test_FeedTitleStripping(TestCase):
+    def _smbc_stories(self):
+        """SMBC-style stories: shared feed-name prefix, unique single-word suffix."""
+        return [
+            {
+                "story_hash": "785:aaa",
+                "story_feed_id": 1,
+                "story_title": "Saturday Morning Breakfast Cereal - Cow",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "6165:bbb",
+                "story_feed_id": 2,
+                "story_title": "Saturday Morning Breakfast Cereal - Ant",
+                "story_date": 999,
+            },
+            {
+                "story_hash": "785:ccc",
+                "story_feed_id": 1,
+                "story_title": "Saturday Morning Breakfast Cereal - Out",
+                "story_date": 998,
+            },
+            {
+                "story_hash": "6165:ddd",
+                "story_feed_id": 2,
+                "story_title": "Saturday Morning Breakfast Cereal - Never",
+                "story_date": 997,
+            },
+            {
+                "story_hash": "785:eee",
+                "story_feed_id": 1,
+                "story_title": "Saturday Morning Breakfast Cereal - Nantucket",
+                "story_date": 996,
+            },
+            {
+                "story_hash": "6165:fff",
+                "story_feed_id": 2,
+                "story_title": "Saturday Morning Breakfast Cereal - Nantucket",
+                "story_date": 995,
+            },
+        ]
+
+    def _feed_title_map(self):
+        return {1: "Saturday Morning Breakfast Cereal", 2: "Saturday Morning Breakfast Cereal"}
+
+    def test_smbc_not_clustered_with_feed_title_map(self):
+        """SMBC-style stories should NOT fuzzy-match when feed title is stripped."""
+        stories = self._smbc_stories()
+        feed_title_map = self._feed_title_map()
+        clusters = find_title_clusters(stories, feed_title_map=feed_title_map)
+        # Only exact title match "Nantucket" should cluster (785:eee + 6165:fff)
+        self.assertEqual(len(clusters), 1)
+        cluster = list(clusters.values())[0]
+        self.assertIn("785:eee", cluster)
+        self.assertIn("6165:fff", cluster)
+        # Other stories should NOT be in any cluster
+        all_clustered = set()
+        for members in clusters.values():
+            all_clustered.update(members)
+        self.assertNotIn("785:aaa", all_clustered)
+        self.assertNotIn("6165:bbb", all_clustered)
+
+    def test_smbc_falsely_clustered_without_feed_title_map(self):
+        """Without feed_title_map, SMBC stories WOULD fuzzy-match (demonstrating the bug)."""
+        stories = self._smbc_stories()
+        clusters = find_title_clusters(stories)
+        # Without the fix, fuzzy matching chains everything together
+        all_clustered = set()
+        for members in clusters.values():
+            all_clustered.update(members)
+        # All 6 stories end up clustered
+        self.assertEqual(len(all_clustered), 6)
+
+    def test_legitimate_cluster_still_works_with_feed_title_map(self):
+        """Normal news stories should still cluster when feed title is stripped."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "Backed by Anthropic, a Super PAC Begins an Ad Blitz in Support of A.I. Regulation",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "222:bbb",
+                "story_feed_id": 2,
+                "story_title": (
+                    "Anthropic-backed super PAC Public First Action begins running ads urging AI"
+                    " regulations in New Jersey; the PAC raised nearly $50M and now aims to raise"
+                    " $75M (Cecilia Kang/New York Times)"
+                ),
+                "story_date": 999,
+            },
+        ]
+        feed_title_map = {1: "New York Times", 2: "Techmeme"}
+        clusters = find_title_clusters(stories, feed_title_map=feed_title_map)
+        self.assertEqual(len(clusters), 1)
+        cluster = list(clusters.values())[0]
+        self.assertIn("111:aaa", cluster)
+        self.assertIn("222:bbb", cluster)
+
+
+class Test_NumericTokenFiltering(TestCase):
+    def test_numeric_tokens_excluded(self):
+        """Pure numeric tokens like years and dates should not be significant words."""
+        words = title_significant_words("March 17, 2026 Breaking News")
+        self.assertNotIn("17", words)
+        self.assertNotIn("2026", words)
+        self.assertIn("march", words)
+        self.assertIn("breaking", words)
+        # "news" is stemmed to "new" by _simple_stem
+        self.assertIn("new", words)
+
+    def test_alphanumeric_tokens_kept(self):
+        """Tokens mixing letters and numbers should still be included."""
+        words = title_significant_words("iPhone 17 Pro vs Galaxy S26")
+        self.assertIn("iphone", words)
+        # "17" is purely numeric — should be filtered
+        self.assertNotIn("17", words)
+        # "s26" is alphanumeric — should be kept
+        self.assertIn("s26", words)
+
+    def test_date_stories_not_falsely_matched(self):
+        """Stories sharing only a date should not cluster."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "Daily Cartoon: Tuesday, March 17, 2026",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "222:bbb",
+                "story_feed_id": 2,
+                "story_title": "NYT Mini crossword answers for March 17, 2026",
+                "story_date": 999,
+            },
+        ]
+        clusters = find_title_clusters(stories)
+        self.assertEqual(len(clusters), 0)
+
+    def test_non_date_cluster_still_works(self):
+        """Legitimate clusters should not be affected by numeric filtering."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "UK government withdraws AI copyright training proposal after artist backlash",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "222:bbb",
+                "story_feed_id": 2,
+                "story_title": "UK government drops AI copyright training proposal following backlash from artists",
+                "story_date": 999,
+            },
+        ]
+        clusters = find_title_clusters(stories)
+        self.assertEqual(len(clusters), 1)
+
+
+class Test_NewAIToolFalsePositive(TestCase):
+    """Test that generic short titles don't create false-positive hub clusters."""
+
+    def test_short_generic_title_does_not_cluster_unrelated(self):
+        """'Rolling Out Our New A.I. Tools' should not cluster with
+        'New font-rendering trick hides malicious commands from AI tools'
+        — they share only generic words {new, ai, tool}."""
+        stories = [
+            {
+                "story_hash": "111:aaa",
+                "story_feed_id": 1,
+                "story_title": "Rolling Out Our New A.I. Tools",
+                "story_date": 1000,
+            },
+            {
+                "story_hash": "222:bbb",
+                "story_feed_id": 2,
+                "story_title": "New font-rendering trick hides malicious commands from AI tools",
+                "story_date": 999,
+            },
+            {
+                "story_hash": "333:ccc",
+                "story_feed_id": 3,
+                "story_title": "UK government withdraws AI copyright proposal after backlash from artists like Dua Lipa",
+                "story_date": 998,
+            },
+            {
+                "story_hash": "444:ddd",
+                "story_feed_id": 4,
+                "story_title": "UK government withdraws AI copyright proposal after artist backlash",
+                "story_date": 997,
+            },
+        ]
+        clusters = find_title_clusters(stories)
+        # The UK copyright stories should cluster together
+        uk_clustered = any("333:ccc" in members and "444:ddd" in members for members in clusters.values())
+        self.assertTrue(uk_clustered, "UK copyright stories should cluster")
+        # The UK copyright stories should NOT be in the same cluster as the AI tool stories
+        for members in clusters.values():
+            if "333:ccc" in members or "444:ddd" in members:
+                self.assertNotIn(
+                    "111:aaa",
+                    members,
+                    "Rolling Out should not be in the same cluster as UK copyright",
+                )
+                self.assertNotIn(
+                    "222:bbb",
+                    members,
+                    "Font-rendering should not be in the same cluster as UK copyright",
+                )
+
+
+class Test_SameFeedClusterFolding(TestCase):
+    """A feed's own distinct stories must not be folded into each other.
+
+    Reproduces the NewsBlur 15 blog posts: the iOS and Android posts were
+    republished by two NewsBlur Forum feeds, and the semantic tier chained the
+    iOS and Android title clusters into one "Title + related" cluster. In the
+    blog's own feed view, apply_clustering_to_stories then removed the Android
+    post from the list and showed it underneath the iOS post as a Related
+    sibling, so the feed looked like it had deduplicated its own story.
+    """
+
+    IOS_TITLE = "NewsBlur 15 for iOS and Mac: faster story lists, a glass toolbar, and Add + Discover Sites"
+    ANDROID_TITLE = "NewsBlur 15 for Android: faster scrolling, a tablet layout, and Add + Discover Sites"
+
+    def setUp(self):
+        import redis
+        from django.conf import settings
+        from django.contrib.auth.models import User
+
+        from apps.reader.models import UserSubscription
+        from apps.rss_feeds.models import Feed
+
+        self.redis = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+        self.user = User.objects.create_user(
+            username="clusterfold", password="testpass", email="fold@test.com"
+        )
+        self.blog = Feed.objects.create(
+            feed_address="http://blog.fold.example.com/feed.xml",
+            feed_link="http://blog.fold.example.com",
+            feed_title="The NewsBlur Blog",
+        )
+        self.forum_posts = Feed.objects.create(
+            feed_address="http://forum.fold.example.com/posts.rss",
+            feed_link="http://forum.fold.example.com",
+            feed_title="The NewsBlur Forum - Latest posts",
+        )
+        self.forum_topics = Feed.objects.create(
+            feed_address="http://forum.fold.example.com/latest.rss",
+            feed_link="http://forum.fold.example.com",
+            feed_title="The NewsBlur Forum - Latest topics",
+        )
+        for feed in (self.blog, self.forum_posts, self.forum_topics):
+            UserSubscription.objects.create(user=self.user, feed=feed, is_trained=False)
+        self.cluster_keys = []
+
+    def tearDown(self):
+        if self.cluster_keys:
+            self.redis.delete(*self.cluster_keys)
+
+    def story(self, feed, guid, title, score=0):
+        return {
+            "story_hash": "%s:%s" % (feed.pk, guid),
+            "story_feed_id": feed.pk,
+            "story_title": title,
+            "story_date": "2026-10-03 04:00",
+            "story_timestamp": "1790740800",
+            "story_authors": "",
+            "score": score,
+            "read_status": 0,
+        }
+
+    def store_cluster(self, cluster_id, members):
+        """Write one merged-namespace cluster the way store_clusters_to_redis does."""
+        skey_prefix, zkey_prefix = cluster_mode_prefixes(CLUSTER_TIER_RELATED)
+        zkey = "%s:%s" % (zkey_prefix, cluster_id)
+        self.redis.delete(zkey)
+        for story_hash in members:
+            skey = "%s:%s" % (skey_prefix, story_hash)
+            self.redis.set(skey, cluster_id, ex=600)
+            self.redis.zadd(zkey, {story_hash: 1})
+            self.cluster_keys.append(skey)
+        self.redis.expire(zkey, 600)
+        self.cluster_keys.append(zkey)
+
+    def test_feed_keeps_distinct_stories_chained_through_other_feeds(self):
+        from apps.clustering.models import apply_clustering_to_stories
+
+        ios_blog = self.story(self.blog, "f01d10", self.IOS_TITLE)
+        android_blog = self.story(self.blog, "f01d20", self.ANDROID_TITLE)
+        members = [
+            "%s:f01d21" % self.forum_posts.pk,
+            "%s:f01d11" % self.forum_posts.pk,
+            "%s:f01d12" % self.forum_topics.pk,
+            "%s:f01d22" % self.forum_topics.pk,
+            android_blog["story_hash"],
+            ios_blog["story_hash"],
+        ]
+        self.store_cluster(members[0], members)
+
+        result = apply_clustering_to_stories([ios_blog, android_blog], self.user)
+
+        rows = [s["story_hash"] for s in result]
+        self.assertIn(ios_blog["story_hash"], rows)
+        self.assertIn(
+            android_blog["story_hash"],
+            rows,
+            "The Android post is a different story from the same feed and must keep its own row",
+        )
+        under_ios = [s["story_hash"] for s in result[0].get("cluster_stories", [])]
+        self.assertNotIn(android_blog["story_hash"], under_ios)
+
+    def test_feed_still_folds_its_own_duplicate_headline(self):
+        from apps.clustering.models import apply_clustering_to_stories
+
+        original = self.story(self.blog, "d0b100", self.IOS_TITLE, score=1)
+        repost = self.story(self.blog, "d0b200", self.IOS_TITLE)
+        forum_copy = "%s:d0b300" % self.forum_posts.pk
+        self.store_cluster(forum_copy, [forum_copy, original["story_hash"], repost["story_hash"]])
+
+        result = apply_clustering_to_stories([original, repost], self.user)
+
+        rows = [s["story_hash"] for s in result]
+        self.assertEqual(rows, [original["story_hash"]])
+        under_original = [s["story_hash"] for s in result[0].get("cluster_stories", [])]
+        self.assertIn(repost["story_hash"], under_original)
+
+    def test_river_still_folds_related_story_from_another_feed(self):
+        from apps.clustering.models import apply_clustering_to_stories
+
+        ios_blog = self.story(self.blog, "a11e10", self.IOS_TITLE, score=1)
+        android_forum = self.story(self.forum_posts, "a11e20", self.ANDROID_TITLE)
+        self.store_cluster(ios_blog["story_hash"], [ios_blog["story_hash"], android_forum["story_hash"]])
+
+        result = apply_clustering_to_stories([ios_blog, android_forum], self.user)
+
+        rows = [s["story_hash"] for s in result]
+        self.assertEqual(rows, [ios_blog["story_hash"]])
+        under_ios = {s["story_hash"]: s["cluster_tier"] for s in result[0].get("cluster_stories", [])}
+        self.assertEqual(under_ios.get(android_forum["story_hash"]), CLUSTER_TIER_RELATED)

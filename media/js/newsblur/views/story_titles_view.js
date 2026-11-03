@@ -1,11 +1,46 @@
+// story_titles_view.js: One-sentence explanations of how the four curated rivers are
+// assembled, shown as a non-sticky banner above the first story title.
 NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
 
     el: '.NB-story-titles',
 
+    explainers: {
+        'river:global': {
+            label: gettext('Global Shared Stories'),
+            explanation: gettext('A fresh handful of the stories NewsBlur readers shared, chosen every hour.')
+        },
+        'trending:well_read': {
+            label: gettext('Widely Read Stories'),
+            explanation: gettext('Stories that held the most attention across NewsBlur.')
+        },
+        'trending:long_reads': {
+            label: gettext('Long Reads'),
+            explanation: gettext('Features and essays that readers gave real time to.')
+        },
+        'trending:good_reads': {
+            label: gettext('Good Reads'),
+            explanation: gettext('Not the most read, but the best received, and tilted toward small sites over big ones.')
+        }
+    },
+
     events: {
         "click .NB-feed-story-premium-only a": function (e) {
             e.preventDefault();
-            NEWSBLUR.reader.open_feedchooser_modal({ premium_only: true });
+            // story_titles_view.js: The notice link's data-feature names the tier
+            // line to highlight (river, saved-tags, or search).
+            NEWSBLUR.reader.open_premium_upgrade_modal({ highlight_feature: $(e.currentTarget).data('feature') });
+        },
+        "click .NB-briefing-generate-btn": function (e) {
+            e.preventDefault();
+            NEWSBLUR.reader.generate_daily_briefing();
+        },
+        "click .NB-classifier-filter-empty-clear": function (e) {
+            e.preventDefault();
+            NEWSBLUR.reader.close_classifier_filter();
+        },
+        "click .NB-classifier-filter-empty-widen": function (e) {
+            e.preventDefault();
+            this.widen_classifier_filter();
         }
     },
 
@@ -27,6 +62,16 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
     // ==========
 
     render: function (options) {
+        if (NEWSBLUR.reader.flags.briefing_view && NEWSBLUR.assets.briefing_data && !this.options.on_dashboard) {
+            // story_titles_view.js: When triggered by a collection reset event
+            // (Backbone passes the collection as first arg), skip re-rendering
+            // briefing to avoid resetting the scroll position while reading.
+            // Only re-render on explicit calls (options is undefined or a plain object).
+            if (options && options.models) {
+                return;
+            }
+            return this.render_briefing(options);
+        }
         // console.log(['render story_titles', this.options.override_layout, this.collection.length, this.$story_titles[0]]);
         this.clear();
         this.$story_titles.scrollTop(0);
@@ -36,8 +81,12 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
         var on_dashboard = this.options.on_dashboard;
         var on_discover_feed = this.options.on_discover_feed;
         var on_discover_story = this.options.on_discover_story;
+        var on_trending_feed = this.options.on_trending_feed;
+        var in_trending_view = this.options.in_trending_view;
         var in_popover = this.options.in_popover;
+        var in_add_site_view = this.options.in_add_site_view;
         var override_layout = this.options.override_layout;
+        var pane_anchor = this.options.pane_anchor;
         var stories = this.collection.map(function (story) {
             return new NEWSBLUR.Views.StoryTitleView({
                 model: story,
@@ -46,10 +95,14 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
                 is_grid: story_layout == 'grid',
                 is_magazine: story_layout == 'magazine',
                 override_layout: override_layout,
+                pane_anchor: pane_anchor,
                 on_dashboard: on_dashboard,
                 on_discover_feed: on_discover_feed,
                 on_discover_story: on_discover_story,
-                in_popover: in_popover
+                on_trending_feed: on_trending_feed,
+                in_trending_view: in_trending_view,
+                in_popover: in_popover,
+                in_add_site_view: in_add_site_view
             }).render();
         });
         this.stories = stories;
@@ -57,6 +110,7 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
             return story.el;
         });
         this.$el.html($stories);
+        this.render_explainer();
         // console.log(['Rendered story titles', this.$el, $stories]);
         this.end_loading();
         this.fill_out();
@@ -67,6 +121,264 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
         return this;
     },
 
+    render_explainer: function () {
+        // story_titles_view.js: The explainer only belongs above the full story list, not in
+        // the dashboard rivers, discover popovers, or add site previews that reuse this view.
+        if (this.options.on_dashboard || this.options.on_discover_feed ||
+            this.options.on_discover_story || this.options.on_trending_feed ||
+            this.options.in_trending_view || this.options.in_popover ||
+            this.options.in_add_site_view) {
+            return;
+        }
+
+        var explainer = this.explainers[NEWSBLUR.reader.active_feed];
+        if (!explainer) return;
+
+        var $explainer = $.make('div', { className: 'NB-story-titles-explainer' }, [
+            $.make('div', { className: 'NB-story-titles-explainer-header' }, [
+                $.make('img', {
+                    className: 'NB-story-titles-explainer-icon',
+                    src: $.favicon(NEWSBLUR.reader.active_feed)
+                }),
+                $.make('div', { className: 'NB-story-titles-explainer-label' }, explainer.label),
+                $.make('div', { className: 'NB-story-titles-explainer-rule' })
+            ]),
+            $.make('div', { className: 'NB-story-titles-explainer-body' }, explainer.explanation)
+        ]);
+
+        this.$el.prepend($explainer);
+    },
+
+    render_briefing: function (options) {
+        this.clear();
+        this.$story_titles.scrollTop(0);
+
+        var data = NEWSBLUR.assets.briefing_data;
+        var briefings = data.briefings || [];
+        var $groups = [];
+
+        // story_titles_view.js: Collect summary + curated stories and load them into the
+        // main stories collection so split view, selection, and story detail all work.
+        var all_stories = this._collect_briefing_stories(briefings);
+        if (all_stories.length) {
+            this.collection.reset(all_stories, { added: all_stories.length, silent: true });
+            // story_titles_view.js: Manually trigger the story list view to create
+            // StoryDetailView instances for split view. We use silent reset above to
+            // avoid an infinite loop (this view also listens for reset).
+            if (NEWSBLUR.app.story_list) {
+                NEWSBLUR.app.story_list.reset_flags();
+                NEWSBLUR.app.story_list.render();
+                NEWSBLUR.app.story_list.reset_story_positions();
+            }
+        }
+        // story_titles_view.js: Set no_more_stories AFTER reset_flags, because
+        // reset_flags->clear() resets it to false.
+        this.collection.no_more_stories = !data.has_next_page;
+
+        $groups = this._render_briefing_groups(briefings, data);
+
+        // story_titles_view.js: Banner for non-archive users explaining that briefings
+        // are preview-only on their plan — no schedule, and only the first few stories
+        // of each briefing are unlocked.
+        if (data.is_preview) {
+            $groups.unshift(NEWSBLUR.utils.make_archive_callout(
+                gettext("You're previewing the first 3 stories of each briefing. Upgrade to unlock every story and automatic briefings on your schedule."),
+                { highlight_feature: 'briefing' }
+            ));
+        }
+
+        if (!briefings.length) {
+            var $empty = $.make('div', { className: 'NB-briefing-empty' }, [
+                $.make('div', { className: 'NB-briefing-empty-icon' }),
+                $.make('div', { className: 'NB-briefing-empty-text' },
+                    gettext('No briefings yet.')),
+                $.make('div', { className: 'NB-briefing-generate-btn NB-briefing-generate-btn-large' }, gettext('Generate Briefing'))
+            ]);
+            $groups.push($empty);
+        } else {
+            // story_titles_view.js: Regenerate button at the bottom of existing briefings
+            var $regenerate = $.make('div', { className: 'NB-briefing-regenerate' }, [
+                $.make('div', { className: 'NB-briefing-generate-btn NB-briefing-regenerate-btn' }, gettext('Regenerate Briefing'))
+            ]);
+            $groups.push($regenerate);
+        }
+
+        this.$el.html($groups);
+        this.end_loading();
+
+        // story_titles_view.js: If generation is in progress, restore progress UI
+        if (NEWSBLUR.reader.flags.briefing_generating) {
+            this.show_briefing_progress(gettext("Generating..."));
+        }
+
+        return this;
+    },
+
+    append_briefing_page: function (briefings) {
+        var data = NEWSBLUR.assets.briefing_data;
+
+        // story_titles_view.js: Add new stories to the collection for split view
+        var new_stories = this._collect_briefing_stories(briefings);
+        if (new_stories.length) {
+            this.collection.add(new_stories, { silent: true });
+            if (NEWSBLUR.app.story_list) {
+                NEWSBLUR.app.story_list.render();
+                NEWSBLUR.app.story_list.reset_story_positions();
+            }
+        }
+
+        this.collection.no_more_stories = !data.has_next_page;
+
+        // story_titles_view.js: Remove the old regenerate/loading elements, append new groups, then re-add
+        this.$el.find('.NB-briefing-regenerate').remove();
+        this.$el.find('.NB-briefing-loading').remove();
+
+        var $groups = this._render_briefing_groups(briefings, data, { all_collapsed: true });
+        var $regenerate = $.make('div', { className: 'NB-briefing-regenerate' }, [
+            $.make('div', { className: 'NB-briefing-generate-btn NB-briefing-regenerate-btn' }, gettext('Regenerate Briefing'))
+        ]);
+        $groups.push($regenerate);
+
+        this.$el.append($groups);
+
+        if (!data.has_next_page) {
+            this.show_no_more_stories();
+        }
+    },
+
+    _collect_briefing_stories: function (briefings) {
+        var active_section = NEWSBLUR.reader.flags.briefing_section;
+        var all_stories = [];
+        _.each(briefings, function (briefing) {
+            if (active_section) {
+                var section_hashes = (briefing.curated_sections || {})[active_section] || [];
+                var section_hash_set = {};
+                _.each(section_hashes, function (h) { section_hash_set[h] = true; });
+                var section_html = (briefing.section_summaries || {})[active_section];
+                if (section_html && briefing.summary_story) {
+                    all_stories.push(_.extend({}, briefing.summary_story, {
+                        story_content: section_html
+                    }));
+                }
+                _.each(briefing.curated_stories || [], function (story_data) {
+                    if (section_hash_set[story_data.story_hash]) {
+                        all_stories.push(story_data);
+                    }
+                });
+            } else {
+                if (briefing.summary_story) {
+                    all_stories.push(briefing.summary_story);
+                }
+                _.each(briefing.curated_stories || [], function (story_data) {
+                    all_stories.push(story_data);
+                });
+            }
+        });
+        return all_stories;
+    },
+
+    _render_briefing_groups: function (briefings, data, options) {
+        options = options || {};
+        var active_section = NEWSBLUR.reader.flags.briefing_section;
+        var $groups = [];
+        var group_index = 0;
+        _.each(briefings, function (briefing) {
+            var display_briefing = briefing;
+            if (active_section) {
+                var section_hashes = (briefing.curated_sections || {})[active_section] || [];
+                var section_hash_set = {};
+                _.each(section_hashes, function (h) { section_hash_set[h] = true; });
+                var section_html = (briefing.section_summaries || {})[active_section];
+                var section_summary = null;
+                if (section_html && briefing.summary_story) {
+                    section_summary = _.extend({}, briefing.summary_story, {
+                        story_content: section_html
+                    });
+                }
+                display_briefing = _.extend({}, briefing, {
+                    summary_story: section_summary,
+                    curated_stories: _.filter(briefing.curated_stories || [], function (s) {
+                        return section_hash_set[s.story_hash];
+                    })
+                });
+                if (!display_briefing.curated_stories.length && !section_summary) return;
+            }
+            // story_titles_view.js: Only the first briefing group is expanded,
+            // all subsequent ones start collapsed. Paginated groups are always collapsed.
+            var group = new NEWSBLUR.Views.BriefingGroupView({
+                briefing: display_briefing,
+                collection: this.collection,
+                collapsed: options.all_collapsed || group_index > 0
+            }).render();
+            $groups.push(group.el);
+            group_index++;
+        }, this);
+        return $groups;
+    },
+
+    show_briefing_loading: function () {
+        this.$el.find('.NB-briefing-loading').remove();
+        var $loading = $.make('div', { className: 'NB-briefing-loading' }, [
+            $.make('div', { className: 'NB-briefing-progress-spinner' }),
+            $.make('div', { className: 'NB-briefing-progress-message' }, gettext('Loading more briefings...'))
+        ]);
+        // story_titles_view.js: Insert loading indicator before the regenerate button
+        var $regenerate = this.$el.find('.NB-briefing-regenerate');
+        if ($regenerate.length) {
+            $regenerate.before($loading);
+        } else {
+            this.$el.append($loading);
+        }
+    },
+
+    hide_briefing_loading: function () {
+        this.$el.find('.NB-briefing-loading').remove();
+    },
+
+    _briefing_target: function () {
+        var $target = this.$el.find('.NB-briefing-empty');
+        if (!$target.length) {
+            $target = this.$el.find('.NB-briefing-regenerate');
+        }
+        return $target;
+    },
+
+    show_briefing_progress: function (message) {
+        this.$el.find('.NB-briefing-generate-btn').hide();
+        this.$el.find('.NB-briefing-progress').remove();
+        this.$el.find('.NB-briefing-error').remove();
+
+        var $progress = $.make('div', { className: 'NB-briefing-progress' }, [
+            $.make('div', { className: 'NB-briefing-progress-spinner' }),
+            $.make('div', { className: 'NB-briefing-progress-message' }, message)
+        ]);
+
+        var $target = this._briefing_target();
+        if ($target.length) {
+            $target.append($progress);
+        }
+    },
+
+    hide_briefing_progress: function () {
+        this.$el.find('.NB-briefing-progress').remove();
+        this.$el.find('.NB-briefing-generate-btn').show();
+    },
+
+    show_briefing_error: function (error_message) {
+        this.$el.find('.NB-briefing-progress').remove();
+        this.$el.find('.NB-briefing-error').remove();
+
+        var $error = $.make('div', { className: 'NB-briefing-error' }, [
+            $.make('div', { className: 'NB-briefing-error-message' }, error_message),
+            $.make('div', { className: 'NB-briefing-generate-btn NB-briefing-generate-btn-small' }, gettext('Try Again'))
+        ]);
+
+        var $target = this._briefing_target();
+        if ($target.length) {
+            $target.append($error);
+        }
+    },
+
     add: function (options) {
         // console.log(['add story_titles', options]);
         var collection = this.collection;
@@ -74,8 +386,12 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
             var on_dashboard = this.options.on_dashboard;
             var on_discover_feed = this.options.on_discover_feed;
             var on_discover_story = this.options.on_discover_story;
+            var on_trending_feed = this.options.on_trending_feed;
+            var in_trending_view = this.options.in_trending_view;
             var in_popover = this.options.in_popover;
+            var in_add_site_view = this.options.in_add_site_view;
             var override_layout = this.options.override_layout;
+            var pane_anchor = this.options.pane_anchor;
             var story_layout = this.options.override_layout ||
                 NEWSBLUR.assets.view_setting(NEWSBLUR.reader.active_feed, 'layout');
             var stories = _.compact(_.map(this.collection.models.slice(-1 * options.added), function (story) {
@@ -87,10 +403,14 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
                     is_grid: story_layout == 'grid',
                     is_magazine: story_layout == 'magazine',
                     override_layout: override_layout,
+                    pane_anchor: pane_anchor,
                     on_dashboard: on_dashboard,
                     on_discover_feed: on_discover_feed,
                     on_discover_story: on_discover_story,
-                    in_popover: in_popover
+                    on_trending_feed: on_trending_feed,
+                    in_trending_view: in_trending_view,
+                    in_popover: in_popover,
+                    in_add_site_view: in_add_site_view
                 }).render();
             }));
             this.stories = this.stories.concat(stories);
@@ -98,7 +418,7 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
                 return story.el;
             });
             this.$el.append($stories);
-            if (this.options.on_dashboard || this.options.on_discover_feed || this.options.on_discover_story) {
+            if (this.options.on_dashboard || this.options.on_discover_feed || this.options.on_discover_story || this.options.on_trending_feed) {
                 var $extras = this.$el.find('.NB-story-title-container .NB-story-title:not(.NB-hidden)').slice(5);
                 $extras.addClass('NB-hidden');
             }
@@ -142,28 +462,29 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
         $layout.addClass('NB-grid-height-' + height);
     },
 
+    // story_titles_view.js: Each premium notice is one complete translated sentence whose
+    // %(link_start)s/%(link_end)s markers wrap the upgrade link.
+    make_premium_only_text: function (message, feature) {
+        var link_start = '<a href="#" class="NB-splash-link"' +
+            (feature ? ' data-feature="' + feature + '"' : '') + '>';
+        var $text = $.make('div', { className: 'NB-feed-story-premium-only-text' });
+        $text.html(interpolate(_.escape(message), { link_start: link_start, link_end: '</a>' }, true));
+        return $text;
+    },
+
     append_river_premium_only_notification: function () {
-        var message = [
-            'The full River of News is a ',
-            $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-            '.'
-        ];
+        var message = gettext('The full River of News is a %(link_start)spremium feature%(link_end)s.');
+        var feature = 'river';
         if (NEWSBLUR.reader.flags['starred_view']) {
-            message = [
-                'Reading saved stories by tag is a ',
-                $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-                '.'
-            ];
+            message = gettext('Reading saved stories by tag is a %(link_start)spremium feature%(link_end)s.');
+            feature = 'saved-tags';
         }
         if (NEWSBLUR.reader.active_feed == "read") {
-            message = [
-                'This read stories list is a ',
-                $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-                '.'
-            ];
+            message = gettext('This read stories list is a %(link_start)spremium feature%(link_end)s.');
+            feature = null;
         }
         var $notice = $.make('div', { className: 'NB-feed-story-premium-only' }, [
-            $.make('div', { className: 'NB-feed-story-premium-only-text' }, message)
+            this.make_premium_only_text(message, feature)
         ]);
         this.$('.NB-feed-story-premium-only').remove();
         this.$(".NB-end-line").append($notice);
@@ -171,11 +492,7 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
 
     append_search_premium_only_notification: function () {
         var $notice = $.make('div', { className: 'NB-feed-story-premium-only' }, [
-            $.make('div', { className: 'NB-feed-story-premium-only-text' }, [
-                'Search is a ',
-                $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-                '.'
-            ])
+            this.make_premium_only_text(gettext('Search is a %(link_start)spremium feature%(link_end)s.'), 'search')
         ]);
         this.$('.NB-feed-story-premium-only').remove();
         this.$(".NB-end-line").append($notice);
@@ -205,8 +522,6 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
             _.delay(_.bind(function () {
                 this.scroll();
             }, this), 10);
-        } else {
-            this.show_no_more_stories();
         }
     },
 
@@ -267,8 +582,34 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
         }
     },
 
+    show_fetching_indicator: function () {
+        this.$('.NB-feed-fetching-indicator').remove();
+        var $indicator = $.make('div', { className: 'NB-feed-fetching-indicator' }, [
+            $.make('div', { className: 'NB-feed-fetching-spinner' }),
+            $.make('div', { className: 'NB-feed-fetching-text' }, gettext('Fetching stories...'))
+        ]);
+        this.$el.prepend($indicator);
+        _.defer(function () {
+            $indicator.addClass('NB-active');
+        });
+    },
+
+    hide_fetching_indicator: function () {
+        var $indicator = this.$('.NB-feed-fetching-indicator');
+        if (!$indicator.length) return;
+        $indicator.removeClass('NB-active');
+        setTimeout(function () {
+            $indicator.remove();
+        }, 1000);
+    },
+
     show_no_more_stories: function () {
-        this.$('.NB-end-line').remove();
+        this.$('.NB-end-line, .NB-classifier-filter-empty').remove();
+        var filter = NEWSBLUR.reader.flags['classifier_filter'];
+        if (filter && !this.collection.length) {
+            this.show_classifier_filter_empty(filter);
+            return;
+        }
         var $end_stories_line = $.make('div', { className: "NB-end-line" }, [
             $.make('div', { className: 'NB-fleuron' })
         ]);
@@ -291,6 +632,59 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
         }
 
         this.$el.append($end_stories_line);
+    },
+
+    show_classifier_filter_empty: function (filter) {
+        var active_feed = NEWSBLUR.reader.active_feed;
+        var can_widen = active_feed !== 'river:';
+        var context = NEWSBLUR.reader.feed_title(active_feed);
+        // story_titles_view.js: One complete sentence per filter type, with and without a view name.
+        var copy_with_context = {
+            'tag': gettext("Tag filters found no stories in %(context)s."),
+            'author': gettext("Author filters found no stories in %(context)s."),
+            'title': gettext("Title filters found no stories in %(context)s."),
+            'url': gettext("URL filters found no stories in %(context)s."),
+            'text': gettext("Text filters found no stories in %(context)s.")
+        };
+        var copy_without_context = {
+            'tag': gettext("Tag filters found no stories in this view."),
+            'author': gettext("Author filters found no stories in this view."),
+            'title': gettext("Title filters found no stories in this view."),
+            'url': gettext("URL filters found no stories in this view."),
+            'text': gettext("Text filters found no stories in this view.")
+        };
+        var empty_copy = context ?
+            interpolate(copy_with_context[filter.type] || gettext("Filters found no stories in %(context)s."), { context: context }, true) :
+            (copy_without_context[filter.type] || gettext("Filters found no stories in this view."));
+
+        var $actions = $.make('div', { className: 'NB-classifier-filter-empty-actions' });
+        if (can_widen) {
+            $actions.append($.make('button', {
+                type: 'button',
+                className: 'NB-classifier-filter-empty-widen'
+            }, gettext('Search All Site Stories')));
+        }
+        $actions.append($.make('button', {
+            type: 'button',
+            className: 'NB-classifier-filter-empty-clear'
+        }, gettext('Clear filter')));
+
+        var $icon = $.make('div', { className: 'NB-classifier-filter-empty-icon', 'aria-hidden': 'true' });
+        $icon.html('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>');
+        this.$el.append($.make('div', { className: 'NB-classifier-filter-empty' }, [
+            $icon,
+            $.make('div', { className: 'NB-classifier-filter-empty-title' }, interpolate(gettext("No matches for “%(value_1)s”"), {value_1: filter.value}, true)),
+            $.make('div', { className: 'NB-classifier-filter-empty-copy' }, empty_copy),
+            $actions
+        ]));
+    },
+
+    widen_classifier_filter: function (e) {
+        var filter = NEWSBLUR.reader.flags['classifier_filter'];
+        if (!filter) return;
+        NEWSBLUR.reader.open_river_stories(null, null, {
+            classifier_filter: filter
+        });
     },
 
     snap_back_scroll_position: function () {
@@ -317,42 +711,46 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
             (this.collection.active_story && this.collection.active_story.story_title_view);
         var story_layout = this.options.override_layout ||
             NEWSBLUR.assets.view_setting(NEWSBLUR.reader.active_feed, 'layout');
+        var is_always_scroll_layout = _.contains(['list', 'grid', 'magazine'], story_layout);
         if (!story_title_view) return;
         if (story &&
             !story.get('selected') &&
             !options.force &&
             story_layout != 'grid') return;
 
-        // console.log(["scroll_to_selected_story 1", story, options]);
-        var story_title_visisble = this.$story_titles.isScrollVisible(story_title_view.$el);
-        if (!story_title_visisble || options.force ||
-            _.contains(['list', 'grid', 'magazine'], story_layout)) {
-            var container_offset = this.$story_titles.position().top;
-            var scroll = story_title_view.$el.find('.NB-story-title').position().top;
-            if (options.scroll_to_comments) {
-                scroll = story_title_view.$el.find('.NB-feed-story-comments').position().top;
-            }
-            var container = this.$story_titles.scrollTop();
-            var height = this.$story_titles.outerHeight();
-            var position = scroll + container - height / 5;
-            // console.log(["scroll_to_selected_story 2", container_offset, scroll, container, height, position]);
-            if (_.contains(['list', 'grid', 'magazine'], story_layout)) {
-                position = scroll + container;
-            }
-            if (story_layout == 'grid') {
-                // position -= 21;
-            }
+        var $selected_story = options.scroll_to_comments
+            ? story_title_view.$el.find('.NB-feed-story-comments').first()
+            : story_title_view.$el.children('.NB-story-title:not(.NB-story-title-cluster)').first();
 
-            // console.log(["scroll_to_selected_story 3", position]);
-            NEWSBLUR.reader.flags['opening_story'] = true;
-            this.$story_titles.stop().scrollTo(position, {
-                duration: !options.immediate && NEWSBLUR.assets.preference('animations') ? 260 : 0,
-                queue: false,
-                onAfter: function () {
-                    NEWSBLUR.reader.flags['opening_story'] = false;
-                }
-            });
+        if (!$selected_story.length) {
+            $selected_story = options.scroll_to_comments
+                ? story_title_view.$el.find('.NB-feed-story-comments').first()
+                : story_title_view.$el.find('.NB-story-title').first();
         }
+        if (!$selected_story.length) return;
+
+        var scroll = $selected_story.position().top;
+        var position = NEWSBLUR.story_titles_scroll_utils &&
+            NEWSBLUR.story_titles_scroll_utils.compute_selected_story_scroll_position({
+                element_top: scroll,
+                element_height: $selected_story.outerHeight(),
+                viewport_height: this.$story_titles.outerHeight(),
+                container_scroll: this.$story_titles.scrollTop(),
+                force: options.force,
+                always_scroll: is_always_scroll_layout,
+                scroll_up_only: options.scroll_up_only
+            });
+
+        if (position == null) return;
+
+        NEWSBLUR.reader.flags['opening_story'] = true;
+        this.$story_titles.stop().scrollTo(position, {
+            duration: !options.immediate && NEWSBLUR.assets.preference('animations') ? 260 : 0,
+            queue: false,
+            onAfter: function () {
+                NEWSBLUR.reader.flags['opening_story'] = false;
+            }
+        });
     },
 
     // ==========
@@ -385,7 +783,12 @@ NEWSBLUR.Views.StoryTitlesView = Backbone.View.extend({
 
         // console.log(["scroll titles", this.options.on_dashboard ? "dashboard" : "stories", visible_height, scroll_y, ">", total_height, this.$el, container_offset]);
         if (visible_height + scroll_y >= total_height) {
-            NEWSBLUR.reader.load_page_of_feed_stories({ scroll_to_loadbar: false });
+            // story_titles_view.js: For briefing view, load next page instead of feed stories
+            if (NEWSBLUR.reader.flags.briefing_view) {
+                NEWSBLUR.reader.load_next_briefing_page();
+            } else {
+                NEWSBLUR.reader.load_page_of_feed_stories({ scroll_to_loadbar: false });
+            }
         }
     },
 

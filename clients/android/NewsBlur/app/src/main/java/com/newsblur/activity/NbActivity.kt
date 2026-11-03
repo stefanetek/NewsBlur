@@ -1,24 +1,30 @@
 package com.newsblur.activity
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.os.Bundle
+import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.newsblur.database.BlurDatabaseHelper
+import com.newsblur.listen.ListenManager
+import com.newsblur.listen.ListenMiniPlayerHost
+import com.newsblur.preference.PrefsRepo
 import com.newsblur.service.NBSync
 import com.newsblur.service.NbSyncManager
+import com.newsblur.service.SyncServiceState
+import com.newsblur.util.EdgeToEdgeUtil.applyTheme
 import com.newsblur.util.FeedUtils
 import com.newsblur.util.Log
+import com.newsblur.util.PrefConstants
 import com.newsblur.util.PrefConstants.ThemeValue
-import com.newsblur.util.PrefsUtils
+import com.newsblur.util.StorySplitView
 import com.newsblur.util.UIUtils
 import dagger.hilt.android.AndroidEntryPoint
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 /**
@@ -26,30 +32,38 @@ import javax.inject.Inject
  * login state and tracking of sync/update broadcasts.
  */
 @AndroidEntryPoint
-open class NbActivity : AppCompatActivity() {
-
+open class NbActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceChangeListener {
     @Inject
     lateinit var dbHelper: BlurDatabaseHelper
 
+    @Inject
+    lateinit var prefsRepo: PrefsRepo
+
+    @Inject
+    lateinit var syncServiceState: SyncServiceState
+
+    @Inject
+    lateinit var listenManager: ListenManager
+
+    private var listenMiniPlayerHost: ListenMiniPlayerHost? = null
+
     private var uniqueLoginKey: String? = null
     private var lastTheme: ThemeValue? = null
+    private var themePreferences: SharedPreferences? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        Log.offerContext(this)
-        Log.d(this, "onCreate")
-
-        // this is not redundant to the applyThemePreference() call in onResume. the theme needs to be set
-        // before onCreate() in order to work
-        PrefsUtils.applyThemePreference(this)
-        lastTheme = PrefsUtils.getSelectedTheme(this)
-
+        // A foldable that started folded gets its split rules once any window opens up wide.
+        StorySplitView.installIfWideEnough(this)
+        applyTheme(readStartupTheme(), shouldUseTranslucentTheme())
         super.onCreate(savedInstanceState)
+        Log.d(this, "onCreate")
+        lastTheme = prefsRepo.getSelectedTheme()
 
         // in rare cases of process interruption or DB corruption, an activity can launch without valid
         // login creds.  redirect the user back to the loging workflow.
-        if (PrefsUtils.getUserId(this) == null) {
+        if (prefsRepo.getUserId() == null) {
             Log.e(this, "post-login activity launched without valid login.")
-            PrefsUtils.logout(this, dbHelper)
+            prefsRepo.logout(this, dbHelper)
             finish()
         }
 
@@ -58,22 +72,33 @@ open class NbActivity : AppCompatActivity() {
         }
 
         if (uniqueLoginKey == null) {
-            uniqueLoginKey = PrefsUtils.getUniqueLoginKey(this)
+            uniqueLoginKey = prefsRepo.getUniqueLoginKey()
         }
 
         finishIfNotLoggedIn()
 
-        // Facilitates the db updates by the sync service on the UI
         lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
-                launch {
-                    NbSyncManager.state.collectLatest {
-                        withContext(Dispatchers.Main) {
-                            handleSyncUpdate(it)
-                        }
-                    }
+            // Translucent reading/list transitions can leave activities underneath in STARTED,
+            // which causes hidden screens to react to sync updates and fight over the reading session.
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                NbSyncManager.state.collect {
+                    handleSyncUpdate(it)
                 }
             }
+        }
+    }
+
+    override fun onPostCreate(savedInstanceState: Bundle?) {
+        super.onPostCreate(savedInstanceState)
+        if (showsListenMiniPlayer() && !isFinishing) {
+            listenMiniPlayerHost =
+                ListenMiniPlayerHost(
+                    activity = this,
+                    listenManager = listenManager,
+                    prefsRepo = prefsRepo,
+                    anchor = ::listenMiniPlayerAnchor,
+                    onInsetChanged = ::onListenMiniPlayerInsetChanged,
+                ).also { it.attach() }
         }
     }
 
@@ -81,23 +106,72 @@ open class NbActivity : AppCompatActivity() {
         Log.d(this, "onResume" + UIUtils.getMemoryUsageDebug(this))
         super.onResume()
         finishIfNotLoggedIn()
+        listenMiniPlayerHost?.setShownInThisPane(showsListenMiniPlayerInThisPane())
 
-        // is is possible that another activity changed the theme while we were on the backstack
-        val currentSelectedTheme = PrefsUtils.getSelectedTheme(this)
+        startObservingThemeChanges()
+    }
+
+    private fun startObservingThemeChanges() {
+        if (themePreferences == null) {
+            themePreferences = getSharedPreferences(PrefConstants.PREFERENCES, Context.MODE_PRIVATE).also {
+                it.registerOnSharedPreferenceChangeListener(this)
+            }
+        }
+        refreshThemeIfChanged()
+    }
+
+    private fun stopObservingThemeChanges() {
+        val preferences = themePreferences
+        themePreferences = null
+        preferences?.unregisterOnSharedPreferenceChangeListener(this)
+    }
+
+    override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
+        // NbActivity.kt observes each resumed pane, including peers that never leave the foreground.
+        if (themePreferences != null && key == PrefConstants.THEME) refreshThemeIfChanged()
+    }
+
+    private fun refreshThemeIfChanged() {
+        if (isFinishing || isDestroyed) return
+        val currentSelectedTheme = prefsRepo.getSelectedTheme()
         if (lastTheme != currentSelectedTheme) {
             lastTheme = currentSelectedTheme
-            PrefsUtils.applyThemePreference(this)
             UIUtils.restartActivity(this)
         }
     }
 
     override fun onPause() {
         Log.d(this.javaClass.name, "onPause")
+        stopObservingThemeChanges()
         super.onPause()
     }
 
+    protected open fun shouldUseTranslucentTheme(): Boolean = false
+
+    /** NbActivity.kt floats Listen's mini player (ListenMiniPlayerHost.kt) on the main screens that opt in. */
+    protected open fun showsListenMiniPlayer(): Boolean = false
+
+    /** The bottom toolbar the mini player sits above, or null to sit above the navigation bar. */
+    protected open fun listenMiniPlayerAnchor(): View? = null
+
+    /** In a tablet split only one pane shows the mini player, so neighbors can decline it here. */
+    protected open fun showsListenMiniPlayerInThisPane(): Boolean = true
+
+    /** How much of the screen bottom the mini player covers, for screens that pad their lists to match. */
+    protected open fun onListenMiniPlayerInsetChanged(insetPx: Int) = Unit
+
+    private fun readStartupTheme(): ThemeValue {
+        val prefs = getSharedPreferences(PrefConstants.PREFERENCES, Context.MODE_PRIVATE)
+        return when (prefs.getString(PrefConstants.THEME, ThemeValue.AUTO.name)) {
+            "light" -> ThemeValue.LIGHT
+            "dark" -> ThemeValue.DARK
+            null -> ThemeValue.AUTO
+            else -> ThemeValue.valueOf(prefs.getString(PrefConstants.THEME, ThemeValue.AUTO.name)!!)
+        }
+    }
+
     private fun finishIfNotLoggedIn() {
-        val currentLoginKey = PrefsUtils.getUniqueLoginKey(this)
+        val currentLoginKey = prefsRepo.getUniqueLoginKey()
         if (currentLoginKey == null || currentLoginKey != uniqueLoginKey) {
             Log.d(this.javaClass.name, "This activity was for a different login. finishing it.")
             finish()
@@ -117,10 +191,11 @@ open class NbActivity : AppCompatActivity() {
         FeedUtils.triggerSync(this)
     }
 
-    private fun handleSyncUpdate(nbSync: NBSync) = when (nbSync) {
-        is NBSync.Update -> handleUpdate(nbSync.type)
-        is NBSync.Error -> handleErrorMsg(nbSync.msg)
-    }
+    private fun handleSyncUpdate(nbSync: NBSync) =
+        when (nbSync) {
+            is NBSync.Update -> handleUpdate(nbSync.type)
+            is NBSync.Error -> handleErrorMsg(nbSync.msg)
+        }
 
     protected open fun handleUpdate(updateType: Int) {
         Log.w(this, "activity doesn't implement handleUpdate")

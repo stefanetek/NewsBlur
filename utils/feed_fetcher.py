@@ -1,3 +1,11 @@
+"""Multi-process feed fetcher and story parser.
+
+Dispatches feed update jobs across worker processes, fetches RSS/Atom feeds
+via feedparser, parses and stores new stories, handles feed redirects and
+errors, and computes intelligence scores after each fetch.
+"""
+
+import copy
 import datetime
 import html
 import multiprocessing
@@ -18,7 +26,9 @@ http.client._MAXHEADERS = 10000
 
 import random
 import re
+import ssl
 import xml.sax
+import zlib
 
 import feedparser
 import pymongo
@@ -27,24 +37,36 @@ import requests
 from django.conf import settings
 from django.core.cache import cache
 from django.db import IntegrityError
+from redis.exceptions import LockError
 from sentry_sdk import set_user
 
-from apps.notifications.models import MUserFeedNotification
-from apps.notifications.tasks import QueueNotifications
+from apps.notifications.models import MUserClassifierNotification, MUserFeedNotification
+from apps.notifications.tasks import QueueClassifierNotifications, QueueNotifications
 from apps.push.models import PushSubscription
 from apps.reader.models import UserSubscription
 from apps.rss_feeds.icon_importer import IconImporter
-from apps.rss_feeds.models import Feed, MStory
+from apps.rss_feeds.models import (
+    FETCH_LOCK_BLOCKING_SECONDS,
+    FETCH_LOCK_DEFERRAL_SECONDS,
+    FETCH_LOCK_TIMEOUT_SECONDS,
+    Feed,
+    MStory,
+    feed_write_lock,
+)
 from apps.rss_feeds.page_importer import PageImporter
 from apps.statistics.models import MAnalyticsFetcher, MStatistics
+from apps.statistics.rscrapingbee import RScrapingBee
 
 feedparser.sanitizer._HTMLSanitizer.acceptable_elements.update(["iframe"])
 feedparser.sanitizer._HTMLSanitizer.acceptable_elements.update(["text"])
+feedparser.sanitizer._BaseHTMLProcessor.elements_no_end_tag.update(
+    ["line", "circle", "rect", "path", "polygon", "polyline", "ellipse", "use", "image"]
+)
 
 from bs4 import BeautifulSoup
 from celery.exceptions import SoftTimeLimitExceeded
 from django.utils import feedgenerator
-from django.utils.encoding import smart_str
+from django.utils.encoding import DjangoUnicodeDecodeError, smart_str
 from django.utils.html import linebreaks
 from mongoengine import connect, connection
 from qurl import qurl
@@ -52,13 +74,17 @@ from sentry_sdk import capture_exception, flush
 
 from utils import json_functions as json
 from utils import log as logging
+from utils.bluesky_fetcher import enrich_bluesky_entries, is_bluesky_feed
 from utils.facebook_fetcher import FacebookFetcher
 from utils.feed_functions import (
     TimeoutError,
+    is_youtube_feed_address,
+    rewrite_openrss_to_feed_address,
     strip_underscore_from_feed_address,
     timelimit,
 )
 from utils.json_fetcher import JSONFetcher
+from utils.reddit_fetcher import RedditFetcher
 from utils.story_functions import (
     extract_story_date,
     linkify,
@@ -66,7 +92,13 @@ from utils.story_functions import (
     strip_tags,
 )
 from utils.twitter_fetcher import TwitterFetcher
-from utils.youtube_fetcher import YoutubeFetcher
+from utils.url_safety import (
+    UnsafeUrlError,
+    safe_http2_get,
+    safe_requests_get,
+    validate_public_url,
+)
+from utils.youtube_fetcher import YoutubeFetcher, YoutubeQuotaError
 
 
 def preprocess_feed_encoding(raw_xml):
@@ -147,8 +179,111 @@ MAX_ENTRIES_HIGH_VOLUME = 250
 HIGH_VOLUME_FEED_URLS = ["arxiv.org"]  # Feeds that can handle more stories per fetch
 
 FEED_OK, FEED_SAME, FEED_ERRPARSE, FEED_ERRHTTP, FEED_ERREXC = list(range(5))
+# An archive page that finds the feed's merge lock held is tried again this many times, this
+# far apart, before the archive walk stops at that page. utils/feed_fetcher.py
+ARCHIVE_PAGE_LOCK_ATTEMPTS = 3
+ARCHIVE_PAGE_LOCK_WAIT_SECONDS = 30
+# A walk stopped at a locked page is queued again at most this many times within the window,
+# so a feed whose lock stays taken can't keep queuing its own walk forever. utils/feed_fetcher.py
+ARCHIVE_WALK_MAX_REQUEUES = 3
+ARCHIVE_WALK_REQUEUE_WINDOW_SECONDS = 60 * 60 * 6
+# The walk that queues the retry keeps going through the other page styles and holds the feed's
+# walk lock until it finishes, at most the backfill task's time limit, which is also how long the
+# lock lasts (apps/rss_feeds/models.py fill_out_archive_stories). A retry that arrived sooner
+# would find the lock taken and exit without walking. utils/feed_fetcher.py
+ARCHIVE_WALK_REQUEUE_DELAY_SECONDS = settings.MAX_SECONDS_ARCHIVE_FETCH_SINGLE_FEED + 60
+# Counts a requeue and starts its window in one step, and gives a counter that somehow lost its
+# expiry one again, so a feed's requeues can never be stopped for good. utils/feed_fetcher.py
+ARCHIVE_WALK_REQUEUE_COUNT_SCRIPT = """
+local requeues = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return requeues
+"""
+
+# Statuses a site uses to refuse a request because of its User-Agent rather than because the
+# feed is gone: bugs.kde.org answers any UA carrying a desktop browser string with 403 (forum
+# #13835). A fetch that ends in one of these after the fake-header retry is tried once more
+# with the plain "NewsBlur Feed Fetcher" UA before the fetcher gives up or spends a proxy
+# credit. 404 and 410 are not here: those are the feed being gone, and a third request for
+# every dead feed would be waste. 429 is not here either: it asks us to back off.
+# utils/feed_fetcher.py
+BLOCKED_BY_USER_AGENT_STATUSES = (401, 403, 406, 451, 503)
+
+# Forbidden feeds are fetched through ScrapingBee, which bills a credit per successful
+# request. Once a feed has failed this many fetches in a row (errors_since_good), the
+# paid proxies are skipped, with a small chance to retry so a recovered feed is noticed.
+# See FetchFeed.should_skip_paid_proxy.
+SCRAPINGBEE_SKIP_AFTER_ERRORS = 3
+SCRAPINGBEE_RETRY_CHANCE = 0.1
 
 NO_UNDERSCORE_ADDRESSES = ["jwz"]
+
+# Everything a broken or hostile server can make feedparser (and the urllib/http/ssl
+# stack underneath it) raise while downloading and parsing a feed. These are feed
+# problems, not NewsBlur bugs, so they're logged and recorded in fetch history rather
+# than escalated to the generic handler in FetchFeed's caller, which reports to Sentry.
+# http.client.HTTPException covers InvalidURL, BadStatusLine, IncompleteRead, and
+# LineTooLong; ValueError covers the UnicodeEncodeError feedparser raises on lone
+# surrogates in charrefs and the "Invalid IPv6 URL" from urlsplit. utils/feed_fetcher.py
+FEEDPARSER_FETCH_ERRORS = (
+    UnsafeUrlError,
+    TypeError,
+    ValueError,
+    IndexError,
+    KeyError,
+    EOFError,
+    MemoryError,
+    urllib.error.URLError,
+    http.client.HTTPException,
+    ConnectionResetError,
+    ssl.SSLError,
+    zlib.error,
+)
+
+
+def feed_image_url(image):
+    if isinstance(image, str):
+        return image.strip()
+    if isinstance(image, dict):
+        for key in ("href", "url"):
+            value = image.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def fetch_url_with_scrapingbee(url):
+    """Fetch a URL using ScrapingBee without requiring a Feed object.
+    Used for feed discovery when direct requests are blocked.
+    Returns (status_code, body) tuple."""
+    api_key = getattr(settings, "SCRAPINGBEE_API_KEY", None)
+    if not api_key:
+        return None, None
+    try:
+        validate_public_url(url)
+    except UnsafeUrlError as e:
+        logging.debug("   ***> ScrapingBee standalone URL rejected for %s: %s" % (url, e))
+        return None, None
+
+    params = {
+        "api_key": api_key,
+        "url": url,
+        "render_js": "false",
+        "return_page_source": "true",
+    }
+
+    try:
+        response = requests.get("https://app.scrapingbee.com/api/v1", params=params, timeout=15)
+        RScrapingBee.record_response("discovery", response, url=url)
+        if response.status_code == 200 and response.content:
+            return response.status_code, smart_str(response.content)
+        return response.status_code, None
+    except Exception as e:
+        RScrapingBee.record("discovery", None, url=url)
+        logging.debug("   ***> ScrapingBee standalone fetch error for %s: %s" % (url, e))
+        return None, None
 
 
 class FetchFeed:
@@ -157,6 +292,39 @@ class FetchFeed:
         self.options = options
         self.fpf = None
         self.raw_feed = None
+        # ETag / Last-Modified returned by the last ScrapingBee fetch, see fetch_scrapingbee
+        self.proxy_validators = {}
+        # Set by should_skip_paid_proxy when the host is over its daily credit cap, so the
+        # forbidden fetch doesn't record an error for a fetch that was never attempted
+        self.skipped_for_credit_cap = False
+        # Set by should_skip_paid_proxy when the feed's only subscriber hasn't been seen in
+        # a year (Feed.has_dormant_sole_subscriber), likewise never attempted
+        self.skipped_for_dormant_subscriber = False
+        # Set by should_skip_paid_proxy when every subscriber has spent their share of the
+        # plan for this billing period (RScrapingBee.users_over_budget), also never attempted
+        self.skipped_for_user_budget = False
+        # The subscribers a billed proxy fetch is charged to, looked up by should_skip_paid_proxy
+        self.proxy_user_ids = None
+
+    def openrss_corrected_address(self, address):
+        """Rewrite a legacy Open RSS preview address to its actual /feed/ form.
+
+        Open RSS serves a human-readable preview at the bare path and the real
+        feed under /feed/. This returns the /feed/ address to fetch so we download
+        the actual feed, and updates self.feed.feed_address in memory so the rest
+        of fetch() (retries, JSON/forbidden checks) operate on the same address.
+        The corrected address is persisted later by ProcessFeed.migrate_openrss_feed_address,
+        since this FetchFeed instance is discarded after the download. See
+        utils/feed_functions.py.
+        """
+        corrected = rewrite_openrss_to_feed_address(address)
+        if corrected != address:
+            logging.debug(
+                "   ---> [%-30s] ~FBOpen RSS preview, fetching feed instead: ~SB%s~SN -> ~SB%s"
+                % (self.feed.log_title[:30], address, corrected)
+            )
+            self.feed.feed_address = corrected
+        return corrected
 
     @timelimit(45)
     def fetch(self):
@@ -184,6 +352,18 @@ class FetchFeed:
         etag = self.feed.etag
         modified = self.feed.last_modified.utctimetuple()[:7] if self.feed.last_modified else None
         address = self.feed.feed_address
+
+        # Self-correct legacy Open RSS feeds cached at the human-readable preview
+        # path by fetching the actual /feed/ address instead. Like the 301/308
+        # redirect below, the corrected feed_address is persisted by the normal
+        # save flow that follows.
+        corrected_address = self.openrss_corrected_address(address)
+        if corrected_address != address:
+            address = corrected_address
+            # The /feed/ URL is a different resource than the cached preview, so
+            # drop the preview's validators to force a fresh fetch.
+            etag = None
+            modified = None
 
         if self.options.get("force") or self.options.get("archive_page", None) or random.random() <= 0.01:
             self.options["force"] = True
@@ -216,12 +396,45 @@ class FetchFeed:
             )
             return FEED_OK, self.fpf
 
-        if "youtube.com" in address:
-            youtube_feed = self.fetch_youtube()
+        try:
+            clean_address = qurl(address, remove=["_"])
+        except ValueError:
+            clean_address = address
+
+        try:
+            if address.startswith("http"):
+                validate_public_url(address)
+        except UnsafeUrlError as e:
+            logging.debug("   ***> [%-30s] ~FRUnsafe feed URL rejected: %s" % (self.feed.log_title[:30], e))
+            self.feed.save_feed_history(401, "Unsafe URL", e)
+            return FEED_ERRHTTP, None
+
+        if is_youtube_feed_address(address):
+            try:
+                youtube_feed = self.fetch_youtube()
+            except YoutubeQuotaError as e:
+                # Record the quota failure so the feed backs off and the stall is
+                # visible in fetch history instead of silently showing no stories.
+                # The shared quota resets at midnight Pacific. utils/feed_fetcher.py
+                logging.debug(
+                    "   ***> [%-30s] ~FRYouTube API quota exceeded: %s" % (self.feed.log_title[:30], e)
+                )
+                self.feed.save_feed_history(429, "YouTube API quota exceeded")
+                self.feed = self.feed.save()
+                return FEED_ERRHTTP, None
+            except requests.RequestException as e:
+                logging.debug(
+                    "   ***> [%-30s] ~FRYouTube API request failed: %s" % (self.feed.log_title[:30], e)
+                )
+                self.feed.save_feed_history(503, "YouTube API request failed", e)
+                self.feed = self.feed.save()
+                return FEED_ERRHTTP, None
             if not youtube_feed:
                 logging.debug(
                     "   ***> [%-30s] ~FRYouTube fetch failed: %s." % (self.feed.log_title[:30], address)
                 )
+                self.feed.save_feed_history(404, "YouTube fetch failed")
+                self.feed = self.feed.save()
                 return FEED_ERRHTTP, None
             # Apply encoding preprocessing to special feed content
             processed_youtube_feed = preprocess_feed_encoding(youtube_feed)
@@ -231,7 +444,7 @@ class FetchFeed:
                     % (self.feed.log_title[:30])
                 )
             self.fpf = feedparser.parse(processed_youtube_feed, sanitize_html=False)
-        elif re.match(r"(https?)?://twitter.com/\w+/?", qurl(address, remove=["_"])):
+        elif re.match(r"(https?)?://twitter.com/\w+/?", clean_address):
             twitter_feed = self.fetch_twitter(address)
             if not twitter_feed:
                 logging.debug(
@@ -246,7 +459,7 @@ class FetchFeed:
                     % (self.feed.log_title[:30])
                 )
             self.fpf = feedparser.parse(processed_twitter_feed)
-        elif re.match(r"(.*?)facebook.com/\w+/?$", qurl(address, remove=["_"])):
+        elif re.match(r"(.*?)facebook.com/\w+/?$", clean_address):
             facebook_feed = self.fetch_facebook()
             if not facebook_feed:
                 logging.debug(
@@ -261,8 +474,34 @@ class FetchFeed:
                     % (self.feed.log_title[:30])
                 )
             self.fpf = feedparser.parse(processed_facebook_feed)
+        elif re.match(r"(https?://)?(\w+\.)?reddit\.com/", clean_address):
+            reddit_feed, reddit_rate_limited, reddit_http_error_status = self.fetch_reddit()
+            if reddit_rate_limited:
+                # The shared 100 req/min Reddit budget is spent. Record the throttle so
+                # the feed backs off and the stall is visible in fetch history, instead
+                # of silently showing no new stories. See utils/reddit_fetcher.py.
+                logging.debug("   ***> [%-30s] ~FRReddit API rate limit reached" % (self.feed.log_title[:30]))
+                self.feed.save_feed_history(429, "Reddit API rate limit reached")
+                self.feed = self.feed.save()
+                return FEED_ERRHTTP, None
+            if not reddit_feed:
+                logging.debug(
+                    "   ***> [%-30s] ~FRReddit fetch failed: %s" % (self.feed.log_title[:30], address)
+                )
+                self.feed.save_feed_history(reddit_http_error_status or 404, "Reddit fetch failed")
+                self.feed = self.feed.save()
+                return FEED_ERRHTTP, None
+            # Apply encoding preprocessing to special feed content
+            processed_reddit_feed = preprocess_feed_encoding(reddit_feed)
+            if processed_reddit_feed != reddit_feed:
+                logging.debug(
+                    "   ---> [%-30s] ~FGApplied encoding correction to Reddit feed"
+                    % (self.feed.log_title[:30])
+                )
+            self.fpf = feedparser.parse(processed_reddit_feed)
         elif self.feed.is_forbidden:
-            # 10% chance to turn off is_forbidden flag before fetching
+            # 10% chance to turn off is_forbidden flag and fetch normally,
+            # ensuring we constantly re-check whether is_forbidden is still necessary
             if random.random() <= 0.1:
                 logging.debug(
                     "   ---> [%-30s] ~FG~SBTurning off forbidden flag (~FB10%%~FG chance) and fetching normally"
@@ -271,7 +510,6 @@ class FetchFeed:
                 self.feed.is_forbidden = False
                 self.feed = self.feed.save()
                 # Skip this branch and continue with normal fetch flow
-                # We don't need to do anything else here - just let the normal fetch flow continue
             else:
                 # Regular forbidden feed fetch
                 forbidden_status, forbidden_feed = self.fetch_forbidden()
@@ -287,6 +525,17 @@ class FetchFeed:
                         "   ***> [%-30s] ~FRForbidden feed fetch failed: %s"
                         % (self.feed.log_title[:30], address)
                     )
+                    # Record the failure so errors_since_good grows and the feed backs off
+                    # instead of spending a proxy credit at its normal cadence forever.
+                    # Enough of these in a row also stop the paid proxy, see fetch_forbidden.
+                    # A host over its daily credit cap, or a feed nobody active reads, wasn't
+                    # attempted at all, so it just waits for its next scheduled fetch.
+                    if not (
+                        self.skipped_for_credit_cap
+                        or self.skipped_for_dormant_subscriber
+                        or self.skipped_for_user_budget
+                    ):
+                        self.feed.save_feed_history(forbidden_status or 500, "Forbidden feed fetch failed")
                     return FEED_ERRHTTP, None
                 # Apply encoding preprocessing to special feed content
                 processed_forbidden_feed = preprocess_feed_encoding(forbidden_feed)
@@ -295,7 +544,13 @@ class FetchFeed:
                         "   ---> [%-30s] ~FGApplied encoding correction to forbidden feed"
                         % (self.feed.log_title[:30])
                     )
-                self.fpf = feedparser.parse(processed_forbidden_feed)
+                try:
+                    self.fpf = feedparser.parse(processed_forbidden_feed)
+                except FEEDPARSER_FETCH_ERRORS as e:
+                    logging.debug(
+                        "   ***> [%-30s] ~FRForbidden feed parse error: %s" % (self.feed.log_title[:30], e)
+                    )
+                self.inject_proxy_validators(forbidden_status)
 
         if not self.fpf:
             try:
@@ -334,39 +589,188 @@ class FetchFeed:
                     headers["If-Modified-Since"] = modified_header
                 if etag or modified:
                     headers["A-IM"] = "feed"
+                upgraded_to_https = False
                 try:
-                    raw_feed = requests.get(address, headers=headers, timeout=15)
-                except (requests.adapters.ConnectionError, TimeoutError):
+                    raw_feed = safe_requests_get(address, headers=headers, timeout=15)
+                except (UnsafeUrlError, requests.adapters.ConnectionError, TimeoutError):
                     raw_feed = None
-                if not raw_feed or raw_feed.status_code >= 400:
+                refused_http1 = raw_feed is not None and raw_feed.status_code == 426
+                # A plain http feed address, the kind the https probe below can upgrade. Archive
+                # fetches are left out: their address is a history page, not the feed.
+                plain_http_address = address.startswith("http://") and not self.options.get("archive_page")
+                # The direct retries further down switch to HTTP/2 once the site has answered
+                # over it, or each of them would get the same 426 and hide the real status.
+                direct_get = safe_requests_get
+                retry_address = self.feed.feed_address
+                if refused_http1 and not plain_http_address and raw_feed.url.startswith("https://"):
+                    # Forum #13858: dumbingofage.com answers every HTTP/1.1 request with 426
+                    # Upgrade Required and serves the feed only over HTTP/2, which requests
+                    # can't speak. Retry the same request once over HTTP/2 with the same
+                    # headers, so a 304 or a 200 there is handled like any other fetch. If the
+                    # HTTP/2 retry fails too, the 426 stays and the usual retries run. httpx
+                    # speaks HTTP/2 only over TLS, so this needs the 426 to have come over
+                    # https; a plain http address goes to the https probe below instead,
+                    # since a 426 on plain http is the server asking for TLS.
+                    # utils/feed_fetcher.py
+                    try:
+                        raw_feed = safe_http2_get(address, headers=headers, timeout=15)
+                        direct_get = safe_http2_get
+                        logging.debug(
+                            "   ---> [%-30s] ~FBHTTP/1.1 refused with 426, retry over %s answered %s"
+                            % (
+                                self.feed.log_title[:30],
+                                getattr(raw_feed, "http_version", "HTTP/2"),
+                                raw_feed.status_code,
+                            )
+                        )
+                    except (UnsafeUrlError, requests.RequestException, TimeoutError) as e:
+                        logging.debug(
+                            "   ***> [%-30s] ~FRHTTP/1.1 refused with 426 and HTTP/2 failed: %s"
+                            % (self.feed.log_title[:30], e)
+                        )
+                if (raw_feed is None or refused_http1) and plain_http_address:
+                    # Forum #13830: rss.cbc.ca dropped port 80 with no redirect, so every
+                    # http:// subscription went quiet. When the http address won't connect at
+                    # all, try the same path over https before the fake-header retry. A live
+                    # feed there is tagged on fpf (after parsing proves it is a feed) so
+                    # ProcessFeed.migrate_https_feed_address persists the https address.
+                    # Archive fetches are skipped: their address is a history page, not the
+                    # feed. The probe is unconditional so a healthy https copy can't answer
+                    # 304 and look dead. An http address refused with 426 (forum #13858) gets
+                    # the same probe over HTTP/2, since the site already refused HTTP/1.1.
+                    # utils/feed_fetcher.py
+                    https_address = "https://" + address[len("http://") :]
+                    probe_headers = {
+                        name: value
+                        for name, value in headers.items()
+                        if name not in ("If-None-Match", "If-Modified-Since", "A-IM")
+                    }
+                    fetch_https = safe_http2_get if refused_http1 else safe_requests_get
+                    try:
+                        https_feed = fetch_https(https_address, headers=probe_headers, timeout=15)
+                    except (UnsafeUrlError, requests.RequestException, TimeoutError):
+                        # Any failure of the optional probe (connection refused, read timeout,
+                        # redirect loop) just means the usual http retries run as before.
+                        https_feed = None
+                    if self.https_probe_is_a_feed(https_feed, https_address):
+                        logging.debug(
+                            "   ---> [%-30s] ~FBhttp address is dead, https answered: ~SB%s"
+                            % (self.feed.log_title[:30], https_address)
+                        )
+                        raw_feed = https_feed
+                        address = https_address
+                        upgraded_to_https = True
+                    elif https_feed is not None:
+                        logging.debug(
+                            "   ---> [%-30s] ~FYhttps answered without a feed, keeping the usual retries: %s"
+                            % (self.feed.log_title[:30], https_address)
+                        )
+                        if refused_http1:
+                            # The http address refused HTTP/1.1 and the https copy answered over
+                            # HTTP/2, just not with a feed (a 403 for the browser UA, say). The
+                            # http address can only ever answer 426, so the UA retries go to the
+                            # https copy over HTTP/2. Its address is saved only when a retry
+                            # there parses to a feed with stories, see the upgraded_to_https
+                            # gate below.
+                            direct_get = safe_http2_get
+                            retry_address = https_address
+                            address = https_address
+                            upgraded_to_https = True
+                if raw_feed and raw_feed.status_code == 304:
+                    logging.debug("   ---> [%-30s] ~FGFeed not modified (304)" % (self.feed.log_title[:30]))
+                    self.feed = self.feed.save()
+                    self.feed.save_feed_history(304, "Not modified")
+                    return FEED_SAME, None
+                # A requests.Response is falsy for any 4xx or 5xx, so these branches test
+                # for None: with plain truthiness a real 429 fell through to the timeout
+                # branch below and got the fake-header retry it is meant to be spared.
+                if raw_feed is None or raw_feed.status_code >= 400:
                     # Handle 429 rate limiting specially - don't retry immediately
-                    if raw_feed and raw_feed.status_code == 429:
+                    if raw_feed is not None and raw_feed.status_code == 429:
                         logging.debug(
                             "   ***> [%-30s] ~FRFeed fetch was 429 rate limited, respecting backoff: %s"
                             % (self.feed.log_title[:30], raw_feed.headers)
                         )
                         # Don't retry with fake user agent for 429 - respect the rate limit
                         # The Retry-After header will be processed below if present
-                    elif raw_feed:
-                        logging.debug(
-                            "   ***> [%-30s] ~FRFeed fetch was %s status code, trying fake user agent: %s"
-                            % (self.feed.log_title[:30], raw_feed.status_code, raw_feed.headers)
-                        )
-                        raw_feed = requests.get(
-                            self.feed.feed_address,
-                            headers=self.feed.fetch_headers(fake=True),
-                            timeout=15,
-                        )
+                    elif raw_feed is not None:
+                        if "openrss.org" in self.feed.feed_address:
+                            logging.debug(
+                                "   ***> [%-30s] ~FRopenrss.org feed returned %s, skipping fake UA retry"
+                                % (self.feed.log_title[:30], raw_feed.status_code)
+                            )
+                        else:
+                            logging.debug(
+                                "   ***> [%-30s] ~FRFeed fetch was %s status code, trying fake user agent: %s"
+                                % (self.feed.log_title[:30], raw_feed.status_code, raw_feed.headers)
+                            )
+                            raw_feed = direct_get(
+                                retry_address,
+                                headers=self.feed.fetch_headers(fake=True),
+                                timeout=15,
+                            )
                     else:
+                        if "openrss.org" in self.feed.feed_address:
+                            logging.debug(
+                                "   ***> [%-30s] ~FRopenrss.org feed timed out, skipping retries: %s"
+                                % (self.feed.log_title[:30], address)
+                            )
+                        else:
+                            logging.debug(
+                                "   ***> [%-30s] ~FRJson feed fetch timed out, trying fake headers: %s"
+                                % (self.feed.log_title[:30], address)
+                            )
+                            raw_feed = direct_get(
+                                retry_address,
+                                headers=self.feed.fetch_headers(fake=True),
+                                timeout=15,
+                            )
+
+                    if (
+                        raw_feed is not None
+                        and raw_feed.status_code in BLOCKED_BY_USER_AGENT_STATUSES
+                        and "openrss.org" not in self.feed.feed_address
+                    ):
+                        # Forum #13835: bugs.kde.org refuses any User-Agent that carries a
+                        # desktop browser string, which both the default UA and the fake
+                        # header retry above do, and serves the plain NewsBlur UA. That plain
+                        # UA was only ever tried in fetch_forbidden, which a feed reaches after
+                        # a paid proxy fetch succeeded once, so a one-subscriber feed over its
+                        # proxy budget sat at 403 forever. One more direct request is cheaper
+                        # than a proxy credit and needs no budget. utils/feed_fetcher.py
                         logging.debug(
-                            "   ***> [%-30s] ~FRJson feed fetch timed out, trying fake headers: %s"
-                            % (self.feed.log_title[:30], address)
+                            "   ***> [%-30s] ~FRFeed fetch was %s with a browser UA too, trying the plain one"
+                            % (self.feed.log_title[:30], raw_feed.status_code)
                         )
-                        raw_feed = requests.get(
-                            self.feed.feed_address,
-                            headers=self.feed.fetch_headers(fake=True),
+                        raw_feed = direct_get(
+                            retry_address,
+                            headers=self.feed.fetch_headers(plain=True),
                             timeout=15,
                         )
+
+                # Detect bot challenge pages (e.g., Anubis) that return 200 + text/html
+                # instead of RSS/XML. The fake browser UA in our default User-Agent
+                # triggers these challenges, so retry with just the plain NewsBlur UA.
+                if raw_feed and raw_feed.status_code == 200:
+                    response_ct = raw_feed.headers.get("Content-Type", "").lower()
+                    if "text/html" in response_ct:
+                        body_preview = raw_feed.text[:2000].lower()
+                        is_bot_challenge = (
+                            "not a bot" in body_preview
+                            or "anubis" in body_preview
+                            or "checking your browser" in body_preview
+                            or "cf-browser-verification" in body_preview
+                        )
+                        if is_bot_challenge:
+                            logging.debug(
+                                "   ***> [%-30s] ~FRBot challenge page detected, retrying without browser UA suffix"
+                                % (self.feed.log_title[:30])
+                            )
+                            raw_feed = direct_get(
+                                retry_address,
+                                headers=self.feed.fetch_headers(plain=True),
+                                timeout=15,
+                            )
 
                 json_feed_content_type = any(
                     json_feed in raw_feed.headers.get("Content-Type", "")
@@ -388,6 +792,14 @@ class FetchFeed:
                             % (self.feed.log_title[:30])
                         )
                     self.fpf = feedparser.parse(processed_json_feed)
+                    # Inject HTTP metadata for JSON feeds too
+                    self.fpf["status"] = raw_feed.status_code
+                    etag_header = raw_feed.headers.get("ETag")
+                    if etag_header:
+                        self.fpf["etag"] = etag_header
+                    modified_header = raw_feed.headers.get("Last-Modified")
+                    if modified_header:
+                        self.fpf["modified"] = modified_header
                 elif raw_feed.content and raw_feed.status_code < 400:
                     # Normalize header keys to lowercase for feedparser compatibility
                     # feedparser 6.0.12 has a bug where it does case-sensitive lookups for 'content-type'
@@ -401,27 +813,63 @@ class FetchFeed:
                         # Add UTF-8 charset to help feedparser detect encoding correctly
                         response_headers["content-type"] = f"{content_type}; charset=utf-8"
 
-                    # Decode the raw bytes as UTF-8 (smart_str defaults to UTF-8 for bytes)
-                    self.raw_feed = smart_str(raw_feed.content)
+                    # Decode the raw bytes as UTF-8 (smart_str defaults to UTF-8 for bytes).
+                    # A feed in another encoding (ISO-8859-1, Windows-1251) is not valid UTF-8:
+                    # hand feedparser the raw bytes so it honors the XML declaration and the
+                    # HTTP charset itself, instead of falling out to the feedparser URL
+                    # fallback, which cannot reach a feed that only answers over https
+                    # (forum #13830). utils/feed_fetcher.py
+                    try:
+                        self.raw_feed = smart_str(raw_feed.content)
+                    except (UnicodeDecodeError, DjangoUnicodeDecodeError):
+                        self.raw_feed = None
 
-                    # Preprocess feed to fix encoding issues before parsing with feedparser
-                    processed_feed = preprocess_feed_encoding(self.raw_feed)
-                    if processed_feed != self.raw_feed:
+                    if self.raw_feed is not None:
+                        # Preprocess feed to fix encoding issues before parsing with feedparser
+                        processed_feed = preprocess_feed_encoding(self.raw_feed)
+                        if processed_feed != self.raw_feed:
+                            logging.debug(
+                                "   ---> [%-30s] ~FGApplied encoding correction to feed with misencoded HTML entities"
+                                % (self.feed.log_title[:30])
+                            )
+                        self.fpf = feedparser.parse(processed_feed, response_headers=response_headers)
+                    else:
+                        self.fpf = feedparser.parse(raw_feed.content, response_headers=response_headers)
+                        detected = self.fpf.get("encoding") or "utf-8"
                         logging.debug(
-                            "   ---> [%-30s] ~FGApplied encoding correction to feed with misencoded HTML entities"
-                            % (self.feed.log_title[:30])
+                            "   ---> [%-30s] ~FBFeed is not UTF-8, parsed raw bytes as %s"
+                            % (self.feed.log_title[:30], detected)
                         )
-                    self.fpf = feedparser.parse(processed_feed, response_headers=response_headers)
+                        self.raw_feed = raw_feed.content.decode(detected, errors="replace")
+
+                    # When feedparser parses content (not a URL), it doesn't set status/etag/modified.
+                    # Inject these from the requests response so compare_feed_attribute_changes preserves them.
+                    self.fpf["status"] = raw_feed.status_code
+                    etag_header = raw_feed.headers.get("ETag")
+                    if etag_header:
+                        self.fpf["etag"] = etag_header
+                    modified_header = raw_feed.headers.get("Last-Modified")
+                    if modified_header:
+                        self.fpf["modified"] = modified_header
+                    if raw_feed.url != address:
+                        self.fpf["href"] = raw_feed.url
+
                     if self.options["verbose"]:
                         logging.debug(
                             " ---> [%-30s] ~FBFeed fetch status %s: %s length / %s"
                             % (
                                 self.feed.log_title[:30],
                                 raw_feed.status_code,
-                                len(smart_str(raw_feed.content)),
+                                len(raw_feed.content),
                                 raw_feed.headers,
                             )
                         )
+                # Only a parsed feed with stories earns the address migration, whether it came
+                # through the JSON or the XML branch. A 200 that parses to no entries (an error
+                # document, a landing page) is never saved as the feed's address.
+                if upgraded_to_https and self.fpf and self.fpf.entries:
+                    self.fpf["href"] = address
+                    self.fpf["upgraded_to_https"] = True
             except Exception as e:
                 logging.debug(
                     "   ***> [%-30s] ~FRFeed failed to fetch with request, trying feedparser: %s"
@@ -429,48 +877,72 @@ class FetchFeed:
                 )
                 # raise e
 
-        if not self.fpf or self.options.get("force_fp", False):
+        if (not self.fpf or self.options.get("force_fp", False)) and "openrss.org" not in address:
             try:
+                # Only HTTP(S) addresses can be SSRF vectors. Non-HTTP addresses
+                # (e.g. local file paths in test fixtures) are read directly by
+                # feedparser and must skip validation, matching the guard above.
+                if address.startswith("http"):
+                    validate_public_url(address)
                 # When feedparser fetches the URL itself, we cannot preprocess the content first
                 # We'll have to rely on feedparser's built-in handling here
                 self.fpf = feedparser.parse(address, agent=self.feed.user_agent, etag=etag, modified=modified)
-            except (
-                TypeError,
-                ValueError,
-                KeyError,
-                EOFError,
-                MemoryError,
-                urllib.error.URLError,
-                http.client.InvalidURL,
-                http.client.BadStatusLine,
-                http.client.IncompleteRead,
-                ConnectionResetError,
-                TimeoutError,
-            ) as e:
+            except FEEDPARSER_FETCH_ERRORS + (TimeoutError,) as e:
                 logging.debug("   ***> [%-30s] ~FRFeed fetch error: %s" % (self.feed.log_title[:30], e))
                 pass
 
-        if not self.fpf:
+        if not self.fpf and "openrss.org" not in address:
             try:
                 logging.debug(
                     "   ***> [%-30s] ~FRTurning off headers: %s" % (self.feed.log_title[:30], address)
                 )
+                # Only HTTP(S) addresses can be SSRF vectors. Non-HTTP addresses
+                # (e.g. local file paths in test fixtures) are read directly by
+                # feedparser and must skip validation, matching the guard above.
+                if address.startswith("http"):
+                    validate_public_url(address)
                 # Another direct URL fetch that bypasses our preprocessing
                 self.fpf = feedparser.parse(address, agent=self.feed.user_agent)
-            except (
-                TypeError,
-                ValueError,
-                KeyError,
-                EOFError,
-                MemoryError,
-                urllib.error.URLError,
-                http.client.InvalidURL,
-                http.client.BadStatusLine,
-                http.client.IncompleteRead,
-                ConnectionResetError,
-            ) as e:
+            except FEEDPARSER_FETCH_ERRORS as e:
                 logging.debug("   ***> [%-30s] ~FRFetch failed: %s." % (self.feed.log_title[:30], e))
-                return FEED_ERRHTTP, None
+
+        # ScrapingBee fallback: all normal fetch methods exhausted
+        if not self.fpf and not self.should_skip_paid_proxy():
+            logging.debug(
+                "   ***> [%-30s] ~FYAll fetch methods failed, trying ScrapingBee fallback"
+                % (self.feed.log_title[:30])
+            )
+            sb_status, sb_body = self.fetch_scrapingbee()
+            if sb_status == 304:
+                # The proxy reached the site and the feed hasn't changed while every direct
+                # fetch failed, so the site is blocking us: remember that and skip the parse.
+                if not self.feed.is_forbidden:
+                    self.feed = self.feed.set_is_forbidden()
+                self.feed.save_feed_history(304, "Not modified")
+                return FEED_SAME, None
+            if sb_status == 200 and sb_body:
+                processed_body = preprocess_feed_encoding(sb_body)
+                try:
+                    self.fpf = feedparser.parse(processed_body)
+                except FEEDPARSER_FETCH_ERRORS as e:
+                    logging.debug(
+                        "   ***> [%-30s] ~FRScrapingBee parse error: %s" % (self.feed.log_title[:30], e)
+                    )
+                    self.fpf = None
+                self.inject_proxy_validators(sb_status)
+                if self.fpf and (
+                    self.fpf.entries or getattr(self.fpf.feed, "title", None) or self.fpf.version
+                ):
+                    if not self.feed.is_forbidden:
+                        self.feed = self.feed.set_is_forbidden()
+                    logging.debug(
+                        "   ---> [%-30s] ~FGScrapingBee fallback succeeded" % (self.feed.log_title[:30])
+                    )
+                else:
+                    self.fpf = None
+
+        if not self.fpf:
+            return FEED_ERRHTTP, None
 
         logging.debug(
             "   ---> [%-30s] ~FYFeed fetch in ~FM%.4ss" % (self.feed.log_title[:30], time.time() - start)
@@ -495,9 +967,57 @@ class FetchFeed:
         facebook_fetcher = FacebookFetcher(self.feed, self.options)
         return facebook_fetcher.fetch()
 
+    def fetch_reddit(self):
+        # Preserve HTTP errors and local throttling for fetch history. See utils/reddit_fetcher.py.
+        reddit_fetcher = RedditFetcher(self.feed, self.options)
+        reddit_feed = reddit_fetcher.fetch()
+        return reddit_feed, reddit_fetcher.rate_limited, reddit_fetcher.http_error_status
+
     def fetch_json_feed(self, address, headers):
         json_fetcher = JSONFetcher(self.feed, self.options)
         return json_fetcher.fetch(address, headers)
+
+    def https_probe_is_a_feed(self, response, address):
+        """The https probe in fetch() is adopted only when its body parses to a feed with
+        at least one story. A 200 that merely looks like a feed (an XML or JSON error
+        document) is left alone so the fake-header, feedparser, and proxy retries still run
+        for the http address, and a JSON error object never reaches JSONFetcher's Atom
+        conversion with a bare version and no items. utils/feed_fetcher.py
+        """
+        if not self.https_probe_looks_like_a_feed(response):
+            return False
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        try:
+            if "json" in content_type:
+                body = self.fetch_json_feed(address, response)
+                if not body:
+                    return False
+                parsed = feedparser.parse(preprocess_feed_encoding(body))
+            else:
+                # Raw bytes, so feedparser honors the feed's own encoding declaration; a
+                # UTF-8 decode here would reject every valid ISO-8859-1 feed.
+                parsed = feedparser.parse(response.content)
+        except Exception as e:
+            logging.debug(
+                "   ***> [%-30s] ~FRhttps probe did not parse as a feed: %s" % (self.feed.log_title[:30], e)
+            )
+            return False
+        return bool(parsed and parsed.entries)
+
+    @staticmethod
+    def https_probe_looks_like_a_feed(response):
+        """Cheap gate for the https probe in fetch(): a 200 with a feed-ish content type or
+        body. Keeps an https landing page or error page from replacing the dead http fetch,
+        so the usual fake-header and proxy retries still run for it. The parsed result is
+        checked again before the address is tagged for migration. utils/feed_fetcher.py
+        """
+        if response is None or response.status_code != 200 or not response.content:
+            return False
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if any(marker in content_type for marker in ("xml", "rss", "atom", "json")):
+            return True
+        head = response.content.lstrip()[:200].lower()
+        return head.startswith(b"<?xml") or b"<rss" in head or b"<feed" in head or head.startswith(b"{")
 
     def fetch_youtube(self):
         youtube_fetcher = YoutubeFetcher(self.feed, self.options)
@@ -505,6 +1025,13 @@ class FetchFeed:
 
     def fetch_scrapingbee(self, js_scrape=False):
         url = "https://app.scrapingbee.com/api/v1"
+        try:
+            validate_public_url(self.feed.feed_address)
+        except UnsafeUrlError as e:
+            logging.debug(
+                "   ***> [%-30s] ~FRScrapingBee target URL rejected: %s" % (self.feed.log_title[:30], e)
+            )
+            return None, None
         params = {
             "api_key": settings.SCRAPINGBEE_API_KEY,
             "url": self.feed.feed_address,
@@ -512,15 +1039,20 @@ class FetchFeed:
             "return_page_source": "true",
         }
 
-        # Add etag and last-modified headers for conditional requests
-        # ScrapingBee requires spb- prefix and forward_headers enabled
+        # Conditional request headers. ScrapingBee forwards any spb-* request header to
+        # the site (with forward_headers enabled), so these have to be the request-side
+        # validators If-None-Match / If-Modified-Since. Sending spb-etag / spb-last-modified
+        # forwarded ETag / Last-Modified, which are response headers a site ignores, so no
+        # forbidden feed ever came back 304 and every fetch cost a credit.
+        # A forced refresh wants the full feed, so it sends no validators.
         headers = {}
-        if self.feed.etag or self.feed.last_modified:
+        send_validators = not self.options.get("force")
+        if send_validators and (self.feed.etag or self.feed.last_modified):
             params["forward_headers"] = "true"
 
-        if self.feed.etag:
-            headers["spb-etag"] = self.feed.etag
-        if self.feed.last_modified:
+        if send_validators and self.feed.etag:
+            headers["spb-if-none-match"] = self.feed.etag
+        if send_validators and self.feed.last_modified:
             modified = self.feed.last_modified.utctimetuple()[:7]
             short_weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
             months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -533,7 +1065,7 @@ class FetchFeed:
                 modified[4],
                 modified[5],
             )
-            headers["spb-last-modified"] = modified_header
+            headers["spb-if-modified-since"] = modified_header
 
         logging.debug(
             "   ***> [%-30s] ~FRForbidden feed fetch with ScrapingBee%s: %s"
@@ -542,19 +1074,41 @@ class FetchFeed:
 
         try:
             response = requests.get(url, params=params, headers=headers, timeout=15)
+            status_code = self.scrapingbee_status(response)
+            RScrapingBee.record(
+                "feed",
+                status_code,
+                url=self.feed.feed_address,
+                credits=RScrapingBee.credits_for_response(response),
+                user_ids=self.proxy_user_ids,
+            )
 
-            if response.status_code == 304:
+            # The site's own ETag / Last-Modified come back prefixed with Spb-. Keep them so
+            # inject_proxy_validators can put them on the parsed feed and the next fetch can
+            # send them back as If-None-Match / If-Modified-Since.
+            self.proxy_validators = {}
+            if response.headers.get("Spb-etag"):
+                self.proxy_validators["etag"] = response.headers.get("Spb-etag")
+            if response.headers.get("Spb-last-modified"):
+                self.proxy_validators["modified"] = response.headers.get("Spb-last-modified")
+
+            if status_code == 304:
                 logging.debug(
                     "   ***> [%-30s] ~FGScrapingBee returned 304 Not Modified" % (self.feed.log_title[:30],)
                 )
-                return response.status_code, None
+                return status_code, None
 
-            if response.status_code != 200:
+            if status_code != 200:
+                site_status = response.headers.get("Spb-initial-status-code")
                 logging.debug(
-                    "   ***> [%-30s] ~FRScrapingBee fetch failed with status %s"
-                    % (self.feed.log_title[:30], response.status_code)
+                    "   ***> [%-30s] ~FRScrapingBee fetch failed with status %s%s"
+                    % (
+                        self.feed.log_title[:30],
+                        status_code,
+                        " (site returned %s)" % site_status if site_status else "",
+                    )
                 )
-                return response.status_code, None
+                return status_code, None
 
             body = smart_str(response.content)
             if not body:
@@ -570,6 +1124,7 @@ class FetchFeed:
             )
             return response.status_code, body
         except Exception as e:
+            RScrapingBee.record("feed", None, url=self.feed.feed_address)
             logging.debug(
                 "   ***> [%-30s] ~FRScrapingBee fetch error: %s" % (self.feed.log_title[:30], str(e))
             )
@@ -579,6 +1134,13 @@ class FetchFeed:
         url = "https://scrapeninja.p.rapidapi.com/scrape"
         if js_scrape:
             url = "https://scrapeninja.p.rapidapi.com/scrape-js"
+        try:
+            validate_public_url(self.feed.feed_address)
+        except UnsafeUrlError as e:
+            logging.debug(
+                "   ***> [%-30s] ~FRScrapeNinja target URL rejected: %s" % (self.feed.log_title[:30], e)
+            )
+            return None, None
 
         payload = {"url": self.feed.feed_address}
 
@@ -656,7 +1218,114 @@ class FetchFeed:
             )
             return None, None
 
+    @staticmethod
+    def scrapingbee_status(response):
+        """
+        ScrapingBee answers 500 whenever the target site didn't return 2xx and reports the
+        site's real status in Spb-initial-status-code, so a 304 Not Modified arrives as a
+        500 (verified against the live API). Unwrap it so a conditional request that worked
+        counts as unchanged instead of as a failed fetch.
+        """
+        if response.status_code == 500 and response.headers.get("Spb-initial-status-code") == "304":
+            return 304
+        return response.status_code
+
+    def should_skip_paid_proxy(self):
+        """
+        Feeds that keep failing even through ScrapingBee (dead services, feeds that redirect
+        to a homepage, 404s) aren't worth a credit on every fetch. After a few consecutive
+        errors the paid proxies are skipped, with a small random chance to retry so a feed
+        that comes back is picked up again. Mirrors the 10% is_forbidden re-check in fetch().
+        A host that has already spent its daily credit cap (apps/statistics/rscrapingbee.py)
+        is skipped outright, and so is a feed whose only subscriber hasn't been seen in a
+        year (Feed.has_dormant_sole_subscriber): a credit for a reader who isn't reading.
+        Finally each reader has a share of the plan for the billing period
+        (RScrapingBee.users_over_budget); a feed read by a single active reader waits once
+        that reader has spent theirs. A feed shared by two or more active readers
+        (Feed.has_multiple_active_subscribers) is never rationed by its readers' budgets,
+        since one credit serves all of them; the fetch is still charged to them for the stats.
+        """
+        if RScrapingBee.host_over_budget(self.feed.feed_address):
+            RScrapingBee.record_capped("feed", url=self.feed.feed_address)
+            self.skipped_for_credit_cap = True
+            logging.debug(
+                "   ***> [%-30s] ~FYSkipping paid proxy, host is over its daily credit cap: %s"
+                % (self.feed.log_title[:30], self.feed.feed_address)
+            )
+            return True
+        if self.feed.has_dormant_sole_subscriber():
+            RScrapingBee.record_skip("feed", "dormant", url=self.feed.feed_address)
+            self.skipped_for_dormant_subscriber = True
+            logging.debug(
+                "   ***> [%-30s] ~FYSkipping paid proxy, only subscriber hasn't been seen in a year: %s"
+                % (self.feed.log_title[:30], self.feed.feed_address)
+            )
+            return True
+        self.proxy_user_ids = self.feed.proxy_budget_subscriber_ids()
+        if self.feed.has_multiple_active_subscribers():
+            logging.debug(
+                "   ---> [%-30s] ~FBShared by active readers, paid proxy not rationed: %s"
+                % (self.feed.log_title[:30], self.feed.feed_address)
+            )
+        elif RScrapingBee.users_over_budget(self.proxy_user_ids):
+            RScrapingBee.record_skip("feed", "user_budget", url=self.feed.feed_address)
+            self.skipped_for_user_budget = True
+            logging.debug(
+                "   ***> [%-30s] ~FYSkipping paid proxy, every subscriber spent their credit share this period: %s"
+                % (self.feed.log_title[:30], self.feed.feed_address)
+            )
+            return True
+        if (self.feed.errors_since_good or 0) < SCRAPINGBEE_SKIP_AFTER_ERRORS:
+            return False
+        if random.random() <= SCRAPINGBEE_RETRY_CHANCE:
+            return False
+        logging.debug(
+            "   ***> [%-30s] ~FYSkipping paid proxy after %s consecutive errors: %s"
+            % (self.feed.log_title[:30], self.feed.errors_since_good, self.feed.feed_address)
+        )
+        return True
+
+    def inject_proxy_validators(self, status_code):
+        """
+        feedparser.parse(string) never sets status/etag/modified, so after a proxy fetch they
+        are injected here from the Spb-* response headers kept by fetch_scrapingbee. Without
+        this, ProcessFeed.compare_feed_attribute_changes would wipe the stored validators and
+        the next conditional request would have nothing to send.
+        """
+        if not self.fpf:
+            return
+        self.fpf["status"] = status_code
+        if self.proxy_validators.get("etag"):
+            self.fpf["etag"] = self.proxy_validators["etag"]
+        if self.proxy_validators.get("modified"):
+            self.fpf["modified"] = self.proxy_validators["modified"]
+
     def fetch_forbidden(self, js_scrape=False):
+        # First, try plain UA without browser suffix. Feeds may have been
+        # incorrectly marked forbidden because the browser UA triggered a
+        # bot challenge (e.g., Anubis), while the plain feed fetcher UA works fine.
+        try:
+            plain_resp = safe_requests_get(
+                self.feed.feed_address,
+                headers=self.feed.fetch_headers(plain=True),
+                timeout=15,
+            )
+            if plain_resp and plain_resp.status_code == 200:
+                content_type = plain_resp.headers.get("Content-Type", "").lower()
+                if "xml" in content_type or "rss" in content_type or "atom" in content_type:
+                    logging.debug(
+                        "   ---> [%-30s] ~FGPlain UA fetch succeeded for forbidden feed, clearing forbidden flag"
+                        % (self.feed.log_title[:30])
+                    )
+                    self.feed.is_forbidden = False
+                    self.feed = self.feed.save()
+                    return plain_resp.status_code, smart_str(plain_resp.content)
+        except Exception:
+            pass
+
+        if self.should_skip_paid_proxy():
+            return None, None
+
         # Try ScrapingBee first
         status_code, body = self.fetch_scrapingbee(js_scrape=js_scrape)
         if status_code and (body or status_code == 304):
@@ -678,18 +1347,94 @@ class ProcessFeed:
         self.raw_feed = raw_feed
         self.feed_entries = []
         self.archive_seen_story_hashes = set()
+        # The hashes of the stories in this response, which an unread feed's trim keeps (utils/feed_fetcher.py)
+        self.fetched_story_hashes = []
         self.cache_control_max_age = None
+        # Set when the lease on the feed's merge lock ran out partway through the batch.
+        self.lease_lost = False
 
     def refresh_feed(self):
         self.feed = Feed.get_by_id(self.feed_id)
+        if self.feed is None:
+            return
         if self.feed_id != self.feed.pk:
             logging.debug(" ***> Feed has changed: from %s to %s" % (self.feed_id, self.feed.pk))
             self.feed_id = self.feed.pk
 
+    def migrate_openrss_feed_address(self):
+        """Persist the Open RSS /feed/ correction for a legacy feed cached at the
+        preview path, so it migrates once instead of re-correcting on every fetch.
+
+        FetchFeed downloads the /feed/ URL but is discarded, and the happy-path
+        saves here are field-scoped (update_fields), so the address is only
+        persisted by this full save. The full save recomputes the address hash and
+        merges into an existing /feed/ feed on collision, mirroring the 301/308
+        redirect handling. No-op once migrated. See utils/feed_functions.py.
+        """
+        corrected = rewrite_openrss_to_feed_address(self.feed.feed_address)
+        if corrected == self.feed.feed_address:
+            return
+        logging.debug(
+            "   ---> [%-30s] ~FBMigrating Open RSS feed address: ~SB%s~SN -> ~SB%s"
+            % (self.feed.log_title[:30], self.feed.feed_address, corrected)
+        )
+        self.feed.feed_address = corrected
+        saved_feed = self.feed.save()
+        if saved_feed:
+            self.feed = saved_feed
+            self.feed_id = self.feed.pk
+
+    def migrate_https_feed_address(self):
+        """Persist the https:// address FetchFeed fell back to when the http:// one stopped
+        connecting (fpf["upgraded_to_https"], see FetchFeed.fetch), so the feed migrates
+        once instead of knocking on the dead port every fetch.
+
+        Like migrate_openrss_feed_address, the full save recomputes the address hash and
+        merges into an existing https feed on collision, which is how a stale http feed
+        and its https twin become one. Locked addresses are left alone. Forum #13830.
+        utils/feed_fetcher.py
+        """
+        if self.fpf.get("upgraded_to_https") is not True:
+            return
+        https_address = self.fpf.get("href")
+        if not isinstance(https_address, str) or https_address == self.feed.feed_address:
+            return
+        if self.feed.feed_address_locked:
+            return
+        logging.debug(
+            "   ---> [%-30s] ~FBMigrating dead http feed address to https: ~SB%s~SN -> ~SB%s"
+            % (self.feed.log_title[:30], self.feed.feed_address, https_address)
+        )
+        self.feed.feed_address = https_address
+        saved_feed = self.feed.save()
+        if saved_feed:
+            self.feed = saved_feed
+            self.feed_id = self.feed.pk
+        if self.feed.feed_address != https_address and not self.feed.feed_address_locked:
+            # Feed.save merged into the https twin but kept this row because it had more
+            # subscribers, so the row still carries the dead http address. The twin is gone
+            # now, so a second save lands the https address without a collision.
+            logging.debug(
+                "   ---> [%-30s] ~FBSurvived the merge with the http address, saving https: ~SB%s"
+                % (self.feed.log_title[:30], https_address)
+            )
+            self.feed.feed_address = https_address
+            saved_feed = self.feed.save()
+            if saved_feed:
+                self.feed = saved_feed
+                self.feed_id = self.feed.pk
+
+    def load_existing_stories(self, story_hashes):
+        stories = MStory.objects(story_hash__in=story_hashes).order_by()
+        return {story.story_hash: story for story in stories}
+
     def process(self):
         """Downloads and parses a feed."""
         start = time.time()
+        self.lease_lost = False
         self.refresh_feed()
+        self.migrate_openrss_feed_address()
+        self.migrate_https_feed_address()
 
         if not self.options.get("archive_page", None):
             feed_status, ret_values = self.verify_feed_integrity()
@@ -726,18 +1471,30 @@ class ProcessFeed:
                             f"   ---> [{self.feed.log_title[:30]:<30}] ~FRCouldn't parse Retry-After header: {retry_after}"
                         )
 
-        self.feed_entries = self.fpf.entries
+        # A copy: pre_process_story rewrites each entry in place (the published string
+        # becomes a datetime, the guid is filled in), and an archive page processed again
+        # after a partial write must start from the response as parsed, not from entries
+        # the first pass already changed.
+        self.feed_entries = copy.deepcopy(self.fpf.entries)
 
-        # Check if this is a high-volume feed that can handle more stories
+        # Enrich Bluesky feeds with images from the AT Protocol API
+        if is_bluesky_feed(self.feed.feed_address):
+            enrich_bluesky_entries(self.feed.feed_address, self.feed_entries)
+
+        # Check if caller requested a specific max_stories limit (e.g. bootstrap_popular_feeds)
         max_entries = MAX_ENTRIES_TO_PROCESS
-        feed_address_lower = self.feed.feed_address.lower()
-        for high_volume_url in HIGH_VOLUME_FEED_URLS:
-            if high_volume_url in feed_address_lower:
-                max_entries = MAX_ENTRIES_HIGH_VOLUME
-                logging.debug(
-                    f"   ---> [{self.feed.log_title[:30]:<30}] High-volume feed detected ({high_volume_url}), allowing up to {max_entries} stories"
-                )
-                break
+        if self.options.get("max_stories"):
+            max_entries = self.options["max_stories"]
+        else:
+            # Check if this is a high-volume feed that can handle more stories
+            feed_address_lower = self.feed.feed_address.lower()
+            for high_volume_url in HIGH_VOLUME_FEED_URLS:
+                if high_volume_url in feed_address_lower:
+                    max_entries = MAX_ENTRIES_HIGH_VOLUME
+                    logging.debug(
+                        f"   ---> [{self.feed.log_title[:30]:<30}] High-volume feed detected ({high_volume_url}), allowing up to {max_entries} stories"
+                    )
+                    break
 
         # If there are more than max_entries, we should sort the entries in date descending order and cut them off
         if len(self.feed_entries) > max_entries:
@@ -745,9 +1502,149 @@ class ProcessFeed:
                 :max_entries
             ]
 
-        if not self.options.get("archive_page", None):
-            self.compare_feed_attribute_changes()
+        try:
+            ret_values, story_hashes = self.save_feed_and_stories()
+        except LockError as e:
+            if self.options.get("archive_page", None):
+                # An archive walk must not step past this page; it retries the page itself
+                # (FeedFetcherWorker.process_archive_page).
+                raise
+            # The feed is being merged or restored, or another fetch of it is still writing.
+            # Nothing was written and the validators are untouched, so the same response is
+            # fetched again in a few minutes. Internal contention, not a publisher failure:
+            # it must not reach the fetch history or the feed's error backoff.
+            logging.debug(
+                "   ---> [%-30s] ~FYFeed is locked by a merge or another fetch, deferring: %s"
+                % (self.feed.log_title[:30], e)
+            )
+            self.feed.defer_next_fetch(FETCH_LOCK_DEFERRAL_SECONDS)
+            return FEED_SAME, dict(new=0, updated=0, same=0, error=0)
+        if self.lease_lost:
+            # Part of the batch was stored; the rest comes with the next fetch, brought
+            # forward and kept there through Feed.update's own scheduling call.
+            self.feed.defer_next_fetch(FETCH_LOCK_DEFERRAL_SECONDS)
+        if ret_values is None:
+            return FEED_ERRHTTP, dict(new=0, updated=0, same=0, error=1)
 
+        # PubSubHubbub
+        if not self.options.get("archive_page", None):
+            self.check_feed_for_push()
+
+        # Push notifications
+        if ret_values["new"] > 0 and MUserFeedNotification.feed_has_users(self.feed.pk) > 0:
+            QueueNotifications.delay(self.feed.pk, ret_values["new"])
+        if ret_values["new"] > 0 and MUserClassifierNotification.feed_has_users(self.feed.pk):
+            QueueClassifierNotifications.delay(self.feed.pk, ret_values["new"])
+
+        # All Done
+        logging.debug(
+            "   ---> [%-30s] ~FYParsed Feed: %snew=%s~SN~FY %sup=%s~SN same=%s%s~SN %serr=%s~SN~FY total=~SB%s"
+            % (
+                self.feed.log_title[:30],
+                "~FG~SB" if ret_values["new"] else "",
+                ret_values["new"],
+                "~FY~SB" if ret_values["updated"] else "",
+                ret_values["updated"],
+                "~SB" if ret_values["same"] else "",
+                ret_values["same"],
+                "~FR~SB" if ret_values["error"] else "",
+                ret_values["error"],
+                len(self.feed_entries),
+            )
+        )
+        if self.cache_control_max_age:
+            logging.debug(
+                f"   ---> [{self.feed.log_title[:30]:<30}] ~FYScheduling next fetch with delay: ~SB{self.cache_control_max_age:.1f} minutes"
+            )
+        self.feed.update_all_statistics(
+            has_new_stories=bool(ret_values["new"]),
+            force=self.options["force"],
+            delay_fetch_sec=self.next_fetch_delay_seconds(),
+        )
+        fetch_date = datetime.datetime.now()
+        if ret_values["new"]:
+            if not getattr(settings, "TEST_DEBUG", False):
+                self.feed.trim_feed(fetched_story_hashes=self.fetched_story_hashes)
+                self.feed.expire_redis()
+            if MStatistics.get("raw_feed", None) == self.feed.pk:
+                self.feed.save_raw_feed(self.raw_feed, fetch_date)
+        self.feed.save_feed_history(200, "OK", date=fetch_date)
+
+        if self.options["verbose"]:
+            logging.debug(
+                "   ---> [%-30s] ~FBTIME: feed parse in ~FM%.4ss"
+                % (self.feed.log_title[:30], time.time() - start)
+            )
+
+        if self.options.get("archive_page", None) and not self.lease_lost:
+            # A page only partly stored is not seen: the archive walk retries it.
+            self.archive_seen_story_hashes.update(story_hashes)
+
+        return FEED_OK, ret_values
+
+    def next_fetch_delay_seconds(self):
+        """How soon the next fetch is due: the deferral when the lease ran out partway
+        through this batch (the rest of the response is still to be stored), else whatever
+        Cache-Control or Retry-After asked for. utils/feed_fetcher.py"""
+        if self.lease_lost:
+            return FETCH_LOCK_DEFERRAL_SECONDS
+        return self.cache_control_max_age * 60 if self.cache_control_max_age else None
+
+    def save_feed_and_stories(self):
+        """Writes the stories, then the response's validators and feed attributes, under the
+        merge lock of the feed they belong to. Returns (ret_values, story_hashes), or
+        (None, []) when the feed is gone and the batch is dropped.
+
+        A merge of this feed running at the same time waits on the lock, and feed_write_lock
+        looks the feed up again once the lock is ours: a feed merged away while this fetch
+        was in flight resolves to its survivor, whose own lock is then taken instead. Only
+        then are the story hashes built, from the locked feed's id, so the survivor's
+        existing stories are found and updated rather than re-inserted as unchanged. The
+        lease is short (a worker killed mid-write never releases the lock) and
+        add_update_stories renews it before every story.
+
+        The validators (ETag, Last-Modified) are saved last: saved first, a lock timeout or a
+        failed write would leave them in place and the next poll could answer 304 for a batch
+        that was never stored. utils/feed_fetcher.py
+        """
+        with feed_write_lock(
+            self.feed.pk, timeout=FETCH_LOCK_TIMEOUT_SECONDS, blocking_timeout=FETCH_LOCK_BLOCKING_SECONDS
+        ) as feed:
+            if feed is None:
+                logging.debug(" ***> Feed %s is gone, dropping its stories" % self.feed_id)
+                return None, []
+            if feed.pk != self.feed_id:
+                logging.debug(" ***> Feed has changed: from %s to %s" % (self.feed_id, feed.pk))
+            self.feed, self.feed_id = feed, feed.pk
+            stories, story_hashes = self.build_stories()
+            existing_stories = self.load_existing_stories(story_hashes)
+            # if len(existing_stories) == 0:
+            #     existing_stories = dict((s.story_hash, s) for s in MStory.objects(
+            #         story_date__gte=start_date,
+            #         story_feed_id=self.feed.pk
+            #     ))
+
+            ret_values = self.feed.add_update_stories(
+                stories,
+                existing_stories,
+                verbose=self.options["verbose"],
+                updates_off=self.options["updates_off"],
+            )
+            if ret_values.get("lease_lost"):
+                # Part of the batch is stored and goes on to its unread counts and
+                # notifications; the validators stay as they were so the next fetch, brought
+                # forward below, brings the rest of this same response.
+                self.lease_lost = True
+                return ret_values, story_hashes
+            if not self.options.get("archive_page", None):
+                self.compare_feed_attribute_changes()
+            return ret_values, story_hashes
+
+    def build_stories(self):
+        """The parsed entries as stories hashed under the feed's current id, with the hashes
+        of the feed's recent stories added so unchanged and updated stories are matched
+        against what is already stored. Runs under the merge lock, after the feed is
+        resolved, since the hashes carry the feed id. utils/feed_fetcher.py"""
         # Determine if stories aren't valid and replace broken guids
         guids_seen = set()
         permalinks_seen = set()
@@ -801,6 +1698,7 @@ class ProcessFeed:
             story_hashes.append(story.get("story_hash"))
 
         original_story_hash_count = len(story_hashes)
+        self.fetched_story_hashes = list(story_hashes)
         story_hashes_in_unread_cutoff = self.feed.story_hashes_in_unread_cutoff[:original_story_hash_count]
         story_hashes.extend(story_hashes_in_unread_cutoff)
         story_hashes = list(set(story_hashes))
@@ -814,80 +1712,7 @@ class ProcessFeed:
                     len(story_hashes_in_unread_cutoff),
                 )
             )
-
-        existing_stories = dict(
-            (s.story_hash, s)
-            for s in MStory.objects(
-                story_hash__in=story_hashes,
-                # story_date__gte=start_date,
-                # story_feed_id=self.feed.pk
-            )
-        )
-        # if len(existing_stories) == 0:
-        #     existing_stories = dict((s.story_hash, s) for s in MStory.objects(
-        #         story_date__gte=start_date,
-        #         story_feed_id=self.feed.pk
-        #     ))
-
-        ret_values = self.feed.add_update_stories(
-            stories,
-            existing_stories,
-            verbose=self.options["verbose"],
-            updates_off=self.options["updates_off"],
-        )
-
-        # PubSubHubbub
-        if not self.options.get("archive_page", None):
-            self.check_feed_for_push()
-
-        # Push notifications
-        if ret_values["new"] > 0 and MUserFeedNotification.feed_has_users(self.feed.pk) > 0:
-            QueueNotifications.delay(self.feed.pk, ret_values["new"])
-
-        # All Done
-        logging.debug(
-            "   ---> [%-30s] ~FYParsed Feed: %snew=%s~SN~FY %sup=%s~SN same=%s%s~SN %serr=%s~SN~FY total=~SB%s"
-            % (
-                self.feed.log_title[:30],
-                "~FG~SB" if ret_values["new"] else "",
-                ret_values["new"],
-                "~FY~SB" if ret_values["updated"] else "",
-                ret_values["updated"],
-                "~SB" if ret_values["same"] else "",
-                ret_values["same"],
-                "~FR~SB" if ret_values["error"] else "",
-                ret_values["error"],
-                len(self.feed_entries),
-            )
-        )
-        if self.cache_control_max_age:
-            logging.debug(
-                f"   ---> [{self.feed.log_title[:30]:<30}] ~FYScheduling next fetch with delay: ~SB{self.cache_control_max_age:.1f} minutes"
-            )
-        self.feed.update_all_statistics(
-            has_new_stories=bool(ret_values["new"]),
-            force=self.options["force"],
-            delay_fetch_sec=self.cache_control_max_age * 60 if self.cache_control_max_age else None,
-        )
-        fetch_date = datetime.datetime.now()
-        if ret_values["new"]:
-            if not getattr(settings, "TEST_DEBUG", False):
-                self.feed.trim_feed()
-                self.feed.expire_redis()
-            if MStatistics.get("raw_feed", None) == self.feed.pk:
-                self.feed.save_raw_feed(self.raw_feed, fetch_date)
-        self.feed.save_feed_history(200, "OK", date=fetch_date)
-
-        if self.options["verbose"]:
-            logging.debug(
-                "   ---> [%-30s] ~FBTIME: feed parse in ~FM%.4ss"
-                % (self.feed.log_title[:30], time.time() - start)
-            )
-
-        if self.options.get("archive_page", None):
-            self.archive_seen_story_hashes.update(story_hashes)
-
-        return FEED_OK, ret_values
+        return stories, story_hashes
 
     def verify_feed_integrity(self):
         """Ensures stories come through and any abberant status codes get saved
@@ -917,14 +1742,17 @@ class ProcessFeed:
             # 302 and 307: Temporary redirect: ignore
             # 301 and 308: Permanent redirect: save it (after 10 tries)
             if self.fpf.status == 301 or self.fpf.status == 308:
-                if self.fpf.href.endswith("feedburner.com/atom.xml"):
+                redirect_address = self.fpf.get("href")
+                if not redirect_address:
+                    return FEED_ERRHTTP, ret_values
+                if redirect_address.endswith("feedburner.com/atom.xml"):
                     return FEED_ERRHTTP, ret_values
                 redirects, non_redirects = self.feed.count_redirects_in_history("feed")
                 self.feed.save_feed_history(
                     self.fpf.status, "HTTP Redirect (%d to go)" % (10 - len(redirects))
                 )
                 if len(redirects) >= 10 or len(non_redirects) == 0:
-                    address = self.fpf.href
+                    address = redirect_address
                     if self.options["force"] and address:
                         address = qurl(address, remove=["_"])
                     self.feed.feed_address = strip_underscore_from_feed_address(address)
@@ -1054,7 +1882,13 @@ class ProcessFeed:
         if not self.feed.feed_link_locked:
             new_feed_link = self.fpf.feed.get("link") or self.fpf.feed.get("id") or self.feed.feed_link
             if self.options["force"] and new_feed_link:
-                new_feed_link = qurl(new_feed_link, remove=["_"])
+                try:
+                    new_feed_link = qurl(new_feed_link, remove=["_"])
+                except ValueError:
+                    # Malformed bracketed hosts (an empty or non-IP [...] netloc) make
+                    # urlparse raise, so keep the link exactly as the feed published it,
+                    # matching the clean_address fallback in FetchFeed.fetch.
+                    pass
             if new_feed_link != self.feed.feed_link:
                 logging.debug(
                     "   ---> [%-30s] ~SB~FRFeed's page is different: %s to %s"
@@ -1073,11 +1907,13 @@ class ProcessFeed:
         hub_url = None
         self_url = self.feed.feed_address
         for link in self.fpf.feed.links:
-            if link["rel"] == "hub" and not hub_url:
-                hub_url = link["href"]
-            elif link["rel"] == "self":
-                self_url = link["href"]
-        if not hub_url and "youtube.com" in self_url:
+            if not isinstance(link, dict):
+                continue
+            if link.get("rel") == "hub" and not hub_url:
+                hub_url = link.get("href")
+            elif link.get("rel") == "self":
+                self_url = link.get("href")
+        if not hub_url and is_youtube_feed_address(self_url):
             hub_url = "https://pubsubhubbub.appspot.com/subscribe"
             channel_id = self_url.split("channel_id=")
             if len(channel_id) > 1:
@@ -1142,11 +1978,22 @@ class FeedFetcherWorker:
         connection._connection_settings = {}
         connection._dbs = {}
         settings.MONGODB = connect(settings.MONGO_DB_NAME, **settings.MONGO_DB)
-        settings.MONGOANALYTICSDB = connect(
-            db=settings.MONGO_ANALYTICS_DB["name"],
-            host=settings.MONGO_ANALYTICS_DB['host'],
-            alias="nbanalytics",
-        )
+        # Same fail-fast timeouts as newsblur_web/settings.py: analytics is
+        # optional, so it must never hold up a feed fetch when it's unreachable.
+        if "username" in settings.MONGO_ANALYTICS_DB:
+            settings.MONGOANALYTICSDB = connect(
+                db=settings.MONGO_ANALYTICS_DB["name"],
+                host=f"mongodb://{settings.MONGO_ANALYTICS_DB['username']}:{settings.MONGO_ANALYTICS_DB['password']}@{settings.MONGO_ANALYTICS_DB['host']}/?authSource=admin",
+                alias="nbanalytics",
+                **settings.MONGO_ANALYTICS_TIMEOUTS,
+            )
+        else:
+            settings.MONGOANALYTICSDB = connect(
+                db=settings.MONGO_ANALYTICS_DB["name"],
+                host=f"mongodb://{settings.MONGO_ANALYTICS_DB['host']}/",
+                alias="nbanalytics",
+                **settings.MONGO_ANALYTICS_TIMEOUTS,
+            )
 
     def process_feed_wrapper(self, feed_queue):
         self.reset_database_connections()
@@ -1214,22 +2061,21 @@ class FeedFetcherWorker:
                 elif False and feed.feed_address.startswith("http://news.google.com/news"):
                     skip = True
 
-                # Check for openrss.org rate limiting
+                # Check for openrss.org rate limiting - enforce minimum 3s gap between requests
                 if not skip and "openrss.org" in feed.feed_address and not self.options.get("force"):
                     r = redis.Redis(connection_pool=settings.REDIS_FEED_UPDATE_POOL)
-                    current_timestamp = int(time.time())
-                    openrss_key = f"openrss_fetch:{current_timestamp}"
+                    current_time = time.time()
+                    openrss_key = "openrss_last_fetch"
 
-                    # Try to set the key with 5 minutes expiration, only if it doesn't exist
-                    was_set = r.set(openrss_key, 1, nx=True, ex=300)
-
-                    if not was_set:
-                        # Another openrss.org feed was fetched in this same second
+                    last_fetch = r.get(openrss_key)
+                    if last_fetch and (current_time - float(last_fetch)) < 3:
                         skip = True
                         logging.debug(
-                            f"   ---> [{feed.log_title[:30]:<30}] ~FYSkipping openrss.org fetch, another openrss feed fetched in last second"
+                            f"   ---> [{feed.log_title[:30]:<30}] ~FYSkipping openrss.org fetch, "
+                            f"last fetch was {current_time - float(last_fetch):.1f}s ago"
                         )
                     else:
+                        r.set(openrss_key, current_time, ex=60)
                         logging.debug(
                             f"   ---> [{feed.log_title[:30]:<30}] ~FGProceeding with openrss.org fetch"
                         )
@@ -1270,7 +2116,11 @@ class FeedFetcherWorker:
                                 % (feed.log_title[:30], time.time() - start_cleanup)
                             )
                         try:
-                            self.count_unreads_for_subscribers(feed)
+                            self.count_unreads_for_subscribers(
+                                feed,
+                                new_story_count=ret_entries.get("new", 0),
+                                new_story_hashes=ret_entries.get("new_story_hashes"),
+                            )
                         except TimeoutError:
                             logging.debug(
                                 "   ---> [%-30s] Unread count took too long..." % (feed.log_title[:30],)
@@ -1336,6 +2186,15 @@ class FeedFetcherWorker:
             if not feed:
                 continue
 
+            # utils/feed_fetcher.py: pull the feed's self-declared images (Atom <icon>/<logo>)
+            # from the parsed feed before the page fetch (which can reset fetched_feed) so
+            # IconImporter can prefer them over a site-derived favicon. (forum #13719)
+            declared_icon_url = ""
+            declared_logo_url = ""
+            if fetched_feed and hasattr(fetched_feed, "feed"):
+                declared_icon_url = feed_image_url(fetched_feed.feed.get("icon"))
+                declared_logo_url = feed_image_url(fetched_feed.feed.get("logo"))
+
             if (
                 (self.options["force"])
                 or (random.random() > 0.9)
@@ -1379,7 +2238,13 @@ class FeedFetcherWorker:
                 force = self.options["force"]
                 if random.random() > 0.99:
                     force = True
-                icon_importer = IconImporter(feed, page_data=page_data, force=force)
+                icon_importer = IconImporter(
+                    feed,
+                    page_data=page_data,
+                    force=force,
+                    declared_icon_url=declared_icon_url,
+                    declared_logo_url=declared_logo_url,
+                )
                 try:
                     icon_importer.save()
                     icon_duration = time.time() - start_duration
@@ -1456,6 +2321,74 @@ class FeedFetcherWorker:
             return feed
 
         # time_taken = datetime.datetime.utcnow() - self.time_start
+
+    def process_archive_page(self, pfeed, feed):
+        """Process one archive page, trying the same page again when the feed's merge lock
+        is held (a merge or a live fetch of the feed). Deferring the page the way a normal
+        fetch is deferred would let the walk step past it: a numbered walk stops once a page
+        adds nothing and a linked walk moves on to the next link, and no later refresh ever
+        comes back for a historical page. Returns whether the page was processed; the walk
+        stops at this page otherwise, so nothing is skipped. utils/feed_fetcher.py"""
+        for attempt in range(ARCHIVE_PAGE_LOCK_ATTEMPTS):
+            try:
+                ret_feed, ret_values = pfeed.process()
+            except LockError as e:
+                logging.debug(
+                    "   ---> [%-30s] ~FYArchive page waiting for the feed's lock (try %s of %s): %s"
+                    % (feed.log_title[:30], attempt + 1, ARCHIVE_PAGE_LOCK_ATTEMPTS, e)
+                )
+            else:
+                if not (ret_values or {}).get("lease_lost"):
+                    return True
+                # The lease ran out partway through the page: what was stored stays, the
+                # rest is stored when the same page is processed again.
+                logging.debug(
+                    "   ---> [%-30s] ~FYArchive page only partly stored before the lease ran out (try %s of %s)"
+                    % (feed.log_title[:30], attempt + 1, ARCHIVE_PAGE_LOCK_ATTEMPTS)
+                )
+            if attempt + 1 < ARCHIVE_PAGE_LOCK_ATTEMPTS:
+                time.sleep(ARCHIVE_PAGE_LOCK_WAIT_SECONDS)
+        logging.info(
+            "   ---> [%-30s] ~FRArchive page still locked after %s tries, stopping this archive walk here so "
+            "no page is skipped" % (feed.log_title[:30], ARCHIVE_PAGE_LOCK_ATTEMPTS)
+        )
+        self.reschedule_archive_walk(feed)
+        return False
+
+    def reschedule_archive_walk(self, feed):
+        """Queue the archive import for this feed again, once the walk that stopped has let go
+        of the feed: the walk stopped at a page the feed's lock kept it from storing, and no
+        ordinary refresh ever comes back for historical pages. The walk restarts from the
+        first page; pages already stored are matched as unchanged. utils/feed_fetcher.py"""
+        from apps.profile.tasks import FetchArchiveFeedsChunk
+
+        r = redis.Redis(connection_pool=settings.REDIS_FEED_UPDATE_POOL)
+        requeue_key = "archive_walk_requeues:%s" % feed.pk
+        requeues = r.eval(
+            ARCHIVE_WALK_REQUEUE_COUNT_SCRIPT, 1, requeue_key, ARCHIVE_WALK_REQUEUE_WINDOW_SECONDS
+        )
+        if requeues > ARCHIVE_WALK_MAX_REQUEUES:
+            logging.info(
+                "   ---> [%-30s] ~FRArchive import already queued again %s times, not queuing it again"
+                % (feed.log_title[:30], ARCHIVE_WALK_MAX_REQUEUES)
+            )
+            return
+
+        # Back on the archive queue with the archive time limits, the same as the backfill
+        # (apps/reader/models.py dispatch_archive_backfill). On the default queue it ran on
+        # the work servers under the 360 second global limit, which a long walk never finishes in.
+        FetchArchiveFeedsChunk.apply_async(
+            args=[[feed.pk]],
+            kwargs={"user_id": None},
+            queue="search_indexer",
+            countdown=ARCHIVE_WALK_REQUEUE_DELAY_SECONDS,
+            time_limit=settings.MAX_SECONDS_ARCHIVE_FETCH_SINGLE_FEED,
+            soft_time_limit=settings.MAX_SECONDS_ARCHIVE_FETCH_SINGLE_FEED - 30,
+        )
+        logging.info(
+            "   ---> [%-30s] ~FYArchive import queued again in %s seconds"
+            % (feed.log_title[:30], ARCHIVE_WALK_REQUEUE_DELAY_SECONDS)
+        )
 
     def fetch_and_process_archive_pages(self, feed_id):
         feed = Feed.get_by_id(feed_id)
@@ -1560,7 +2493,8 @@ class FeedFetcherWorker:
 
                         # Process the feed BEFORE checking for more links
                         before_story_hashes = len(seen_story_hashes)
-                        pfeed.process()
+                        if not self.process_archive_page(pfeed, feed):
+                            break
                         seen_story_hashes.update(pfeed.archive_seen_story_hashes)
                         after_story_hashes = len(seen_story_hashes)
 
@@ -1621,7 +2555,8 @@ class FeedFetcherWorker:
                         if not first_seen_feed:
                             first_seen_feed = pfeed.fpf
                         before_story_hashes = len(seen_story_hashes)
-                        pfeed.process()
+                        if not self.process_archive_page(pfeed, feed):
+                            break
                         seen_story_hashes.update(pfeed.archive_seen_story_hashes)
                         after_story_hashes = len(seen_story_hashes)
 
@@ -1645,7 +2580,7 @@ class FeedFetcherWorker:
         except redis.ConnectionError:
             logging.debug("   ***> [%-30s] ~BMRedis is unavailable for real-time." % (feed.log_title[:30],))
 
-    def count_unreads_for_subscribers(self, feed):
+    def count_unreads_for_subscribers(self, feed, new_story_count=0, new_story_hashes=None):
         subscriber_expire = datetime.datetime.now() - datetime.timedelta(days=settings.SUBSCRIBER_EXPIRE)
 
         user_subs = UserSubscription.objects.filter(
@@ -1655,18 +2590,36 @@ class FeedFetcherWorker:
         if not user_subs.count():
             return
 
-        for sub in user_subs:
-            if not sub.needs_unread_recalc:
-                sub.needs_unread_recalc = True
-                sub.save()
+        # Set the recalc flag with an atomic UPDATE instead of full-model saves: a
+        # save() writes back every field from an instance read moments earlier, so
+        # one landing just after a user's mark_feed_read (apps/reader/models.py)
+        # reverts their mark_read_date wholesale and resurrects read stories as
+        # unread. The queryset stays unevaluated here, so calculate_feed_scores
+        # below also runs on instances fetched after the flag update, not before.
+        user_subs.filter(needs_unread_recalc=False).update(needs_unread_recalc=True)
 
         if self.options["compute_scores"]:
             r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
-            stories = MStory.objects(story_feed_id=feed.pk, story_date__gte=feed.unread_cutoff)
+            # Bound the prefetch window to DAYS_OF_UNREAD instead of the feed's own
+            # unread_cutoff. A single archive subscriber drags feed.unread_cutoff back
+            # to DAYS_OF_UNREAD_ARCHIVE (27 years), which made this format the feed's
+            # entire archive on every fetch with new stories — ~18s for a 10k story
+            # feed — when a subscriber's *effective* window (profile unread_cutoff
+            # clamped by mark_read_date) almost never reaches past 30 days. The rare
+            # subscriber whose window is older falls back to a targeted per-user
+            # query inside calculate_feed_scores; see stories_cutoff there.
+            stories_cutoff = max(
+                feed.unread_cutoff,
+                datetime.datetime.utcnow() - datetime.timedelta(days=settings.DAYS_OF_UNREAD),
+            )
+            stories = MStory.objects(story_feed_id=feed.pk, story_date__gte=stories_cutoff)
             stories = Feed.format_stories(stories, feed.pk)
+            # The zF reconciliation must use the same bound: on archive feeds the zF
+            # zset never expires, so an unbounded range would flag every archived
+            # story as "missing" and re-fetch the whole archive from the primary.
             story_hashes = r.zrangebyscore(
                 "zF:%s" % feed.pk,
-                int(feed.unread_cutoff.strftime("%s")),
+                int(stories_cutoff.strftime("%s")),
                 int(time.time() + 60 * 60 * 24),
             )
             missing_story_hashes = set(story_hashes) - set([s["story_hash"] for s in stories])
@@ -1685,7 +2638,13 @@ class FeedFetcherWorker:
                         len(stories),
                     )
                 )
-            cache.set("S:v3:%s" % feed.pk, stories, 60)
+            # S:v4 carries the coverage cutoff alongside the stories so readers can
+            # tell whether the prefetch covers their window. The key is versioned
+            # (v3 -> v4) because the payload changed shape from a bare list to a
+            # dict: during a deploy, old readers keep reading S:v3 (which simply
+            # goes cold and falls back to a targeted query) instead of crashing on
+            # an unexpected dict.
+            cache.set("S:v4:%s" % feed.pk, {"stories": stories, "cutoff": stories_cutoff}, 60)
             logging.debug(
                 "   ---> [%-30s] ~FYComputing scores: ~SB%s stories~SN with ~SB%s subscribers ~SN(%s/%s/%s)"
                 % (
@@ -1697,7 +2656,30 @@ class FeedFetcherWorker:
                     feed.premium_subscribers,
                 )
             )
-            self.calculate_feed_scores_with_stories(user_subs, stories)
+            # Scoring and AI classification are independent of each other, so a slow
+            # scoring pass must not cancel classification. calculate_feed_scores_with_stories
+            # carries its own 10 second limit and blows it routinely on feeds with many
+            # subscribers and many stories. That TimeoutError used to unwind this whole
+            # method, so the classification below was skipped on exactly the busiest
+            # feeds — the ones most likely to have new stories to classify.
+            try:
+                self.calculate_feed_scores_with_stories(user_subs, stories, stories_cutoff)
+            except TimeoutError:
+                logging.debug(
+                    "   ---> [%-30s] ~BR~FRScoring took too long, still classifying" % (feed.log_title[:30],)
+                )
+
+            # AI prompt classifiers: classify only new stories for subscribers with prompts
+            if new_story_count > 0:
+                try:
+                    self.classify_stories_for_subscribers(
+                        feed, stories, new_story_count, new_story_hashes=new_story_hashes
+                    )
+                except TimeoutError:
+                    logging.debug(
+                        "   ---> [%-30s] ~BR~FRAI classification took too long, skipping"
+                        % (feed.log_title[:30],)
+                    )
         elif self.options.get("mongodb_replication_lag"):
             logging.debug(
                 "   ---> [%-30s] ~BR~FYSkipping computing scores: ~SB%s seconds~SN of mongodb lag"
@@ -1705,10 +2687,48 @@ class FeedFetcherWorker:
             )
 
     @timelimit(10)
-    def calculate_feed_scores_with_stories(self, user_subs, stories):
+    def calculate_feed_scores_with_stories(self, user_subs, stories, stories_cutoff=None):
         for sub in user_subs:
             silent = False if getattr(self.options, "verbose", 0) >= 2 else True
-            sub.calculate_feed_scores(silent=silent, stories=stories)
+            sub.calculate_feed_scores(silent=silent, stories=stories, stories_cutoff=stories_cutoff)
+
+    @timelimit(30)
+    def classify_stories_for_subscribers(self, feed, stories, new_story_count, new_story_hashes=None):
+        """Classify only new stories with AI prompt classifiers for applicable subscribers.
+
+        Only classifies stories that arrived in this fetch (no backlog).
+        Runs inline during feed processing so results are cached before users read.
+        """
+        from apps.analyzer.models import MClassifierPrompt
+
+        user_ids = MClassifierPrompt.feed_has_prompt_subscribers(feed.pk)
+        if not user_ids:
+            return
+
+        # Only classify stories that are new from this fetch, not the backlog.
+        # add_update_stories reports exactly which hashes it created; prefer those.
+        # Picking the newest N by date instead misses genuinely new stories whenever
+        # a feed publishes out of order (a story dated behind ones already stored),
+        # which left a large share of stories permanently unclassified.
+        if new_story_hashes:
+            wanted = set(new_story_hashes)
+            new_stories = [story for story in stories if story.get("story_hash") in wanted]
+        else:
+            # Older callers don't report hashes, so fall back to the newest N.
+            new_stories = sorted(stories, key=lambda s: s.get("story_date", ""), reverse=True)[
+                :new_story_count
+            ]
+
+        if not new_stories:
+            return
+
+        logging.debug(
+            "   ---> [%-30s] ~FC~SBClassifying ~SB%s~SN new stories for ~SB%s~SN prompt users"
+            % (feed.log_title[:30], len(new_stories), len(user_ids))
+        )
+
+        for user_id in user_ids:
+            MClassifierPrompt.classify_stories(user_id, new_stories, feed_ids=[feed.pk])
 
 
 class Dispatcher:

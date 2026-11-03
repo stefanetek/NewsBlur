@@ -1,0 +1,75 @@
+{% extends 'base.html' %}
+{% load i18n %}
+{% load utils_tags %}
+{% block bodyclass %}NB-static NB-static-features NB-static-feature-search{% endblock %}
+{% block title %}{% trans "Full-Text Search - NewsBlur" %}{% endblock %}
+{% block nav_title %}{% trans "Full-Text Search" %}{% endblock %}
+{% block head %}
+    <meta name="description" content="Search across all your subscriptions with Elasticsearch-powered full-text search. Find stories by keyword, phrase, or combination. Save searches as feeds for ongoing monitoring.">
+    <meta property="og:title" content="Full-Text Search - NewsBlur">
+    <meta property="og:description" content="Search across all your subscriptions with Elasticsearch-powered full-text search.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://www.newsblur.com{{ request.path }}">
+    <meta property="og:image" content="https://www.newsblur.com/media/img/features/search.jpg">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:site" content="@newsblur">
+    <meta name="twitter:title" content="Full-Text Search - NewsBlur">
+    <meta name="twitter:description" content="Search across all your subscriptions with Elasticsearch-powered full-text search.">
+    <meta name="twitter:image" content="https://www.newsblur.com/media/img/features/search.jpg">
+{% endblock %}
+
+{% block content %}
+
+<div class="NB-feature-detail-container">
+
+    <div class="NB-feature-detail-hero">
+        <div class="NB-feature-section-badge NB-feature-badge-premium">{% trans "Premium" %}</div>
+        <h1 class="NB-feature-detail-title">{% trans "Full-Text Search" %}</h1>
+        <p class="NB-feature-detail-subtitle">{% trans "Search across all your subscriptions with Elasticsearch-powered full-text search." %}</p>
+    </div>
+
+    <div class="NB-feature-detail-screenshots NB-feature-detail-screenshots-single">
+        <div class="NB-feature-detail-screenshot">
+            <img src="{{ MEDIA_URL }}img/features/search.jpg" alt="{% trans 'Search results across subscriptions with highlighted terms' %}">
+            <div class="NB-feature-detail-caption">{% trans "Search results across subscriptions" %}</div>
+        </div>
+    </div>
+
+    <div class="NB-feature-detail-how">
+        <h2>{% trans "How it works" %}</h2>
+        <ol class="NB-feature-detail-steps">
+            <li class="NB-feature-detail-step">{% trans "Press the search icon or use the keyboard shortcut" %}</li>
+            <li class="NB-feature-detail-step">{% trans "Type keywords, phrases, or combinations" %}</li>
+            <li class="NB-feature-detail-step">{% trans "Search within a single feed, a folder, or across everything" %}</li>
+            <li class="NB-feature-detail-step">{% trans "Results show matching stories with highlighted terms" %}</li>
+            <li class="NB-feature-detail-step">{% trans "Save searches as feeds for ongoing monitoring" %}</li>
+        </ol>
+    </div>
+
+    <div class="NB-feature-detail-faq">
+        <div class="NB-feature-detail-faq-item">
+            <h3 class="NB-feature-detail-faq-q">{% trans "What plan do I need for search?" %}</h3>
+            <p class="NB-feature-detail-faq-a">{% trans "Full-text search requires Premium ($36/year) or higher." %}</p>
+        </div>
+        <div class="NB-feature-detail-faq-item">
+            <h3 class="NB-feature-detail-faq-q">{% trans "Can I search saved stories?" %}</h3>
+            <p class="NB-feature-detail-faq-a">{% trans "Yes, saved stories and their tags are fully searchable." %}</p>
+        </div>
+        <div class="NB-feature-detail-faq-item">
+            <h3 class="NB-feature-detail-faq-q">{% trans "How far back does search go?" %}</h3>
+            <p class="NB-feature-detail-faq-a">{% trans "On Premium, search covers your recent stories. On Premium Archive, every story ever archived is searchable." %}</p>
+        </div>
+        <div class="NB-feature-detail-faq-item">
+            <h3 class="NB-feature-detail-faq-q">{% trans "Can I save a search as a feed?" %}</h3>
+            <p class="NB-feature-detail-faq-a">{% trans "Yes, save any search as a feed to get ongoing results." %}</p>
+        </div>
+    </div>
+
+    {% include "static/_feature_crosslinks.xhtml" %}
+
+</div>
+
+{% endblock content %}
+{% block footer %}
+    {% render_footer "features" %}
+{% endblock footer %}

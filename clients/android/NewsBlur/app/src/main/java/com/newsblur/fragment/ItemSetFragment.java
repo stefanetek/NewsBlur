@@ -1,25 +1,33 @@
 package com.newsblur.fragment;
 
-import android.database.Cursor;
-import android.graphics.Typeface;
+import android.content.res.ColorStateList;
+import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.graphics.Rect;
+import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Parcelable;
-
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-import androidx.lifecycle.ViewModelProvider;
-import androidx.recyclerview.widget.GridLayoutManager;
-import androidx.recyclerview.widget.RecyclerView;
-import android.view.GestureDetector;
+import android.view.HapticFeedbackConstants;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.ViewTreeObserver.OnGlobalLayoutListener;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver.OnGlobalLayoutListener;
+import android.view.VelocityTracker;
+import android.view.ViewConfiguration;
 import android.widget.FrameLayout;
 
-import com.google.android.material.progressindicator.LinearProgressIndicator;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.lifecycle.ViewModelProvider;
+import androidx.recyclerview.widget.GridLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
 import com.newsblur.R;
 import com.newsblur.activity.ItemsList;
 import com.newsblur.activity.NbActivity;
@@ -29,20 +37,33 @@ import com.newsblur.databinding.FragmentItemgridBinding;
 import com.newsblur.databinding.RowFleuronBinding;
 import com.newsblur.di.IconLoader;
 import com.newsblur.di.ThumbnailLoader;
+import com.newsblur.domain.CustomIcon;
+import com.newsblur.domain.Feed;
 import com.newsblur.domain.Story;
-import com.newsblur.service.NBSyncService;
+import com.newsblur.preference.PrefsRepo;
+import com.newsblur.service.SyncServiceState;
+import com.newsblur.util.AppConstants;
+import com.newsblur.util.CustomIconRenderer;
 import com.newsblur.util.CursorFilters;
 import com.newsblur.util.FeedSet;
 import com.newsblur.util.FeedUtils;
+import com.newsblur.util.GestureAction;
 import com.newsblur.util.ImageLoader;
-import com.newsblur.util.PrefsUtils;
+import com.newsblur.util.PrefConstants;
 import com.newsblur.util.ReadFilter;
+import com.newsblur.util.Session;
 import com.newsblur.util.SpacingStyle;
 import com.newsblur.util.StoryListStyle;
 import com.newsblur.util.ThumbnailStyle;
+import com.newsblur.util.NetworkUtils;
 import com.newsblur.util.UIUtils;
 import com.newsblur.util.ViewUtils;
 import com.newsblur.viewModel.StoriesViewModel;
+
+import org.jetbrains.annotations.NotNull;
+
+import java.util.Collections;
+import java.util.List;
 
 import javax.inject.Inject;
 
@@ -50,6 +71,11 @@ import dagger.hilt.android.AndroidEntryPoint;
 
 @AndroidEntryPoint
 public class ItemSetFragment extends NbFragment {
+    private static final float STORY_LIST_BACK_GESTURE_TRIGGER_RATIO = 0.33f;
+    private static final float STORY_LIST_BACK_GESTURE_DIRECTION_RATIO = 1.2f;
+    private static final float BOTTOM_NEXT_FEED_REVEAL_DP = 72f;
+    private static final float BOTTOM_NEXT_FEED_ACTIVATION_OFFSET_DP = 82f;
+    private static final float BOTTOM_NEXT_FEED_ACTIVATION_DISTANCE_DP = 68f;
 
     @Inject
     FeedUtils feedUtils;
@@ -65,9 +91,15 @@ public class ItemSetFragment extends NbFragment {
     @ThumbnailLoader
     ImageLoader thumbnailLoader;
 
+    @Inject
+    PrefsRepo prefsRepo;
+
+    @Inject
+    SyncServiceState syncServiceState;
+
     private static final String BUNDLE_GRIDSTATE = "gridstate";
 
-    private boolean cursorSeenYet = false; // have we yet seen a valid cursor for our particular feedset?
+    private boolean dataSeenYet = false;
 
     /**
      * Flag used to ensure that when the adapter resumes,
@@ -91,15 +123,13 @@ public class ItemSetFragment extends NbFragment {
     // loading indicator for when stories are absent or stale (at top of list)
     // R.id.top_loading_throb
 
-    // loading indicator for when stories are present and fresh (at bottom of list)
-    protected LinearProgressIndicator bottomProgressView;
-
     // the fleuron has padding that can't be calculated until after layout, but only changes
     // rarely thereafter
     private boolean fleuronResized = false;
 
-    // de-dupe the massive stream of scrolling data to auto-mark read
-    private int lastAutoMarkIndex = -1;
+    // track the last auto-marked story by hash so unread-only list shrinkage doesn't renumber us
+    @Nullable
+    private String lastAutoMarkStoryHash;
 
     public int indexOfLastUnread = -1;
     public boolean fullFlingComplete = false;
@@ -107,13 +137,47 @@ public class ItemSetFragment extends NbFragment {
     private FragmentItemgridBinding binding;
     private RowFleuronBinding fleuronBinding;
     private StoriesViewModel storiesViewModel;
+    private int bottomNextFeedRevealPx;
+    private int bottomNextFeedActivationOffsetPx;
+    private int bottomNextFeedActivationDistancePx;
+    private int bottomNextFeedBaseBottomMarginPx;
+    @Nullable
+    private View floatingStoryHeader;
+    // ItemSetFragment.java keeps the last stories scrollable above Listen's mini player (ListenMiniPlayerHost.kt).
+    private int listenMiniPlayerInsetPx = 0;
+    private int gridBaseBottomPaddingPx = -1;
+    private final View.OnLayoutChangeListener floatingStoryHeaderLayoutListener =
+            (view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> updateBottomNextFeedBottomInset();
+    private int storyListScrollState = RecyclerView.SCROLL_STATE_IDLE;
+    private final RecyclerView.OnScrollListener storyScrollListener = new RecyclerView.OnScrollListener() {
+        @Override
+        public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState) {
+            ItemSetFragment.this.onScrollStateChanged(recyclerView, newState);
+        }
 
-	public static ItemSetFragment newInstance() {
-		ItemSetFragment fragment = new ItemSetFragment();
-		Bundle arguments = new Bundle();
-		fragment.setArguments(arguments);
-		return fragment;
-	}
+        @Override
+        public void onScrolled(@NonNull RecyclerView recyclerView, int dx, int dy) {
+            ItemSetFragment.this.onScrolled(dy);
+            updateBottomNextFeedControl();
+        }
+    };
+    private int bottomNextFeedActiveDragStartOffsetY;
+    private int bottomNextFeedActivationAnchorOffsetY;
+    private boolean hasBottomNextFeedActiveDragStartOffset;
+    private boolean hasBottomNextFeedActivationAnchorOffset;
+    private boolean bottomNextFeedReady;
+    private boolean bottomNextFeedButtonPressActive;
+    private boolean bottomNextFeedHapticFired;
+    private boolean interactiveStoryListSwipeRendering;
+    @Nullable
+    private String bottomNextFeedLastTargetKey;
+
+    public static ItemSetFragment newInstance() {
+        ItemSetFragment fragment = new ItemSetFragment();
+        Bundle arguments = new Bundle();
+        fragment.setArguments(arguments);
+        return fragment;
+    }
 
     @Override
     public void onCreate(@Nullable Bundle savedInstanceState) {
@@ -126,7 +190,7 @@ public class ItemSetFragment extends NbFragment {
         // a pause/resume cycle will depopulate and repopulate the list and trigger bad scroll
         // readings and cause zero-index refreshes, wasting massive cycles. hold the refresh logic
         // until the loaders reset
-        cursorSeenYet = false;
+        dataSeenYet = false;
         skipBackFillingStories = true;
         super.onPause();
     }
@@ -148,9 +212,9 @@ public class ItemSetFragment extends NbFragment {
         // data are ready.
     }
 
-	@Override
-	public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
-		View v = inflater.inflate(R.layout.fragment_itemgrid, null);
+    @Override
+    public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
+        View v = inflater.inflate(R.layout.fragment_itemgrid, container, false);
         binding = FragmentItemgridBinding.bind(v);
         View fleuronView = inflater.inflate(R.layout.row_fleuron, null);
         fleuronBinding = RowFleuronBinding.bind(fleuronView);
@@ -159,13 +223,15 @@ public class ItemSetFragment extends NbFragment {
         boolean isDisableAnimations = ViewUtils.isPowerSaveMode(requireContext());
 
         binding.topLoadingIndicator.setEnabled(!isDisableAnimations);
-
-        View footerView = inflater.inflate(R.layout.row_loading_indicator, null);
-        bottomProgressView = footerView.findViewById(R.id.itemlist_loading);
-        bottomProgressView.setEnabled(!isDisableAnimations);
+        binding.topLoadingIndicator.setTheme(prefsRepo.getResolvedTheme(requireContext()));
+        fleuronBinding.bottomLoadingIndicator.setEnabled(!isDisableAnimations);
+        fleuronBinding.bottomLoadingIndicator.setTheme(prefsRepo.getResolvedTheme(requireContext()));
 
         fleuronBinding.getRoot().setVisibility(View.INVISIBLE);
         fleuronBinding.containerSubscribe.setOnClickListener(view -> UIUtils.startSubscriptionActivity(requireContext()));
+        fleuronBinding.buttonUpgrade.setOnClickListener(view -> UIUtils.startSubscriptionActivity(requireContext()));
+        styleUpgradeBanner();
+        setupBottomNextFeedControl();
 
         binding.itemgridfragmentGrid.getViewTreeObserver().addOnGlobalLayoutListener(new OnGlobalLayoutListener() {
             @Override
@@ -176,7 +242,7 @@ public class ItemSetFragment extends NbFragment {
             }
         });
 
-        StoryListStyle listStyle = PrefsUtils.getStoryListStyle(getActivity(), getFeedSet());
+        StoryListStyle listStyle = prefsRepo.getStoryListStyle(getFeedSet());
 
         calcColumnCount(listStyle);
         layoutManager = new GridLayoutManager(getActivity(), columnCount);
@@ -191,10 +257,18 @@ public class ItemSetFragment extends NbFragment {
             }
         });
 
-        adapter = new StoryViewAdapter(((NbActivity) getActivity()), this, getFeedSet(), listStyle, iconLoader, thumbnailLoader, feedUtils, getOnStoryClickListener());
-        adapter.addFooterView(footerView);
+        adapter = new StoryViewAdapter(((NbActivity) getActivity()), getFeedSet(), listStyle, iconLoader, thumbnailLoader, feedUtils, prefsRepo, getOnStoryClickListener());
         adapter.addFooterView(fleuronBinding.getRoot());
         binding.itemgridfragmentGrid.setAdapter(adapter);
+        binding.emptyViewText.setOnClickListener(view -> {
+            com.newsblur.service.TryFeedRefreshStatus status = syncServiceState.getTryFeedRefreshStatus(getFeedSet());
+            if (!hasStories() && (status == com.newsblur.service.TryFeedRefreshStatus.EMPTY || status == com.newsblur.service.TryFeedRefreshStatus.FAILED)) {
+                ItemsList activity = (ItemsList) getActivity();
+                if (activity != null) activity.restartReadingSession();
+            }
+        });
+        binding.emptyViewText.setClickable(false);
+        binding.emptyViewText.setFocusable(false);
 
         // the layout manager needs to know that the footer rows span all the way across
         layoutManager.setSpanSizeLookup(new GridLayoutManager.SpanSizeLookup() {
@@ -209,22 +283,22 @@ public class ItemSetFragment extends NbFragment {
             }
         });
 
-        binding.itemgridfragmentGrid.addOnScrollListener(new RecyclerView.OnScrollListener() {
-            @Override
-            public void onScrolled(RecyclerView recyclerView, int dx, int dy) {
-                ItemSetFragment.this.onScrolled(recyclerView, dx, dy);
-            }
-        });
+        binding.itemgridfragmentGrid.addOnScrollListener(storyScrollListener);
+        binding.itemgridfragmentGrid.addOnItemTouchListener(new StoryListBackTouchListener());
 
-        setupGestureDetector(binding.itemgridfragmentGrid);
-
-		return v;
-	}
+        return v;
+    }
 
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
-        storiesViewModel.getActiveStoriesLiveData().observe(getViewLifecycleOwner(), this::setCursor);
+        if (prefsRepo.isStoryToolbarAtBottom()) {
+            floatingStoryHeader = requireActivity().findViewById(R.id.itemlist_story_header);
+            if (floatingStoryHeader != null) floatingStoryHeader.addOnLayoutChangeListener(floatingStoryHeaderLayoutListener);
+            binding.getRoot().addOnLayoutChangeListener(floatingStoryHeaderLayoutListener);
+            binding.itemgridfragmentGrid.setClipToPadding(false);
+        }
+        storiesViewModel.getActiveStories().observe(getViewLifecycleOwner(), this::setStories);
 
         FeedSet fs = getFeedSet();
         if (fs == null) {
@@ -237,19 +311,65 @@ public class ItemSetFragment extends NbFragment {
         }
     }
 
+    @Override
+    public void onDestroyView() {
+        if (floatingStoryHeader != null) {
+            floatingStoryHeader.removeOnLayoutChangeListener(floatingStoryHeaderLayoutListener);
+            floatingStoryHeader = null;
+        }
+        binding.getRoot().removeOnLayoutChangeListener(floatingStoryHeaderLayoutListener);
+        super.onDestroyView();
+    }
+
+    private void setStories(StoriesViewModel.@NotNull StoryBatch storyBatch) {
+        FeedSet currentFeedSet = getFeedSet();
+        if (currentFeedSet == null || !storyBatch.getFeedSet().equals(currentFeedSet)) {
+            com.newsblur.util.Log.i(this.getClass().getName(), "stale story list load");
+            return;
+        }
+
+        if (!dbHelper.isFeedSetReady(getFeedSet())) {
+            com.newsblur.util.Log.i(this.getClass().getName(), "stale load");
+            updateAdapter(Collections.emptyList(), storyBatch.getLoadId(), -1);
+            triggerRefresh(1, null);
+        } else {
+            dataSeenYet = true;
+            updateAdapter(storyBatch.getStories(), storyBatch.getLoadId(), storyBatch.getIndexOfLastUnread());
+            if (storyBatch.getStories().isEmpty()) {
+                triggerRefresh(1, 0);
+            }
+        }
+        updateLoadingIndicators();
+    }
+
     protected void triggerRefresh(int desiredStoryCount, Integer totalSeen) {
         // ask the sync service for as many stories as we want
-        boolean gotSome = NBSyncService.requestMoreForFeed(getFeedSet(), desiredStoryCount, totalSeen);
-        // if the service thinks it can get more, or if we haven't even seen a cursor yet, start the service
-        if (gotSome || (totalSeen == null)) triggerSync();
+        FeedSet fs = getFeedSet();
+        if (fs != null) {
+            boolean gotSome = syncServiceState.requestMoreForFeed(fs, desiredStoryCount, totalSeen);
+            // if the service thinks it can get more, or if we haven't even seen a cursor yet, start the service
+            if (gotSome || (totalSeen == null)) triggerSync();
+        }
     }
 
     /**
      * Indicate that the DB was cleared.
      */
     public void resetEmptyState() {
-        updateAdapter(null);
-        cursorSeenYet = false;
+        if (binding != null) {
+            binding.itemgridfragmentGrid.stopScroll();
+            binding.itemgridfragmentGrid.setVisibility(View.INVISIBLE);
+            binding.emptyView.setVisibility(View.VISIBLE);
+        }
+        if (adapter != null) {
+            adapter.updateFeedSet(getFeedSet());
+            adapter.clearStoriesNow();
+        }
+        gridState = null;
+        dataSeenYet = false;
+        skipBackFillingStories = false;
+        updateLoadingIndicators();
+        hideBottomNextFeedControl();
     }
 
     /**
@@ -257,7 +377,7 @@ public class ItemSetFragment extends NbFragment {
      * some info about the story list when it is ready.
      */
     public void storyThawCompleted(int indexOfLastUnread) {
-        this.indexOfLastUnread = indexOfLastUnread;
+        this.indexOfLastUnread = (indexOfLastUnread >= 0) ? adapter.getDisplayPositionForStoryIndex(indexOfLastUnread) : -1;
         this.fullFlingComplete = false;
         // we don't actually calculate list speed until it has some stories
         setupAnimSpeeds();
@@ -267,99 +387,507 @@ public class ItemSetFragment extends NbFragment {
         layoutManager.scrollToPositionWithOffset(0, 0);
     }
 
-    public void scrollToPosition(int position) {
-        int layoutTotalPositions = layoutManager.getItemCount() - 1;
-        if (position > 0 && position <= layoutTotalPositions) {
-            layoutManager.scrollToPosition(position);
+    public void setInteractiveStoryListSwipeRendering(boolean active) {
+        if (binding == null || interactiveStoryListSwipeRendering == active) {
+            return;
         }
+
+        interactiveStoryListSwipeRendering = active;
+        RecyclerView recyclerView = binding.itemgridfragmentGrid;
+        for (int i = 0; i < recyclerView.getChildCount(); i++) {
+            View child = recyclerView.getChildAt(i);
+            if (active) {
+                child.setTag(R.id.story_list_back_swipe_original_layer_type, child.getLayerType());
+                if (child.getLayerType() == View.LAYER_TYPE_HARDWARE) {
+                    child.setLayerType(View.LAYER_TYPE_NONE, null);
+                }
+            } else {
+                Object originalLayerType = child.getTag(R.id.story_list_back_swipe_original_layer_type);
+                if (originalLayerType instanceof Integer) {
+                    child.setLayerType((Integer) originalLayerType, null);
+                    child.setTag(R.id.story_list_back_swipe_original_layer_type, null);
+                }
+            }
+        }
+        recyclerView.invalidate();
+    }
+
+    public void scrollToPosition(int position) {
+        int layoutPosition = adapter.getDisplayPositionForStoryIndex(position);
+        int layoutTotalPositions = layoutManager.getItemCount() - 1;
+        if (layoutPosition > 0 && layoutPosition <= layoutTotalPositions) {
+            layoutManager.scrollToPosition(layoutPosition);
+        }
+    }
+
+    public void scrollToStoryHashIfOffScreen(@Nullable String storyHash) {
+        requestStoryReturn(storyHash, true);
+    }
+
+    public void prepareReturnToStory(@Nullable String storyHash) {
+        requestStoryReturn(storyHash, false);
+    }
+
+    public void followReadingStory(@Nullable String storyHash) {
+        if (binding == null || adapter == null) return;
+        adapter.followReadingStory(storyHash, binding.itemgridfragmentGrid);
+    }
+
+    private void requestStoryReturn(@Nullable String storyHash, boolean presentationReady) {
+        if (binding == null || adapter == null) return;
+        // ItemSetFragment.java handles an already committed list as well as later database batches.
+        adapter.requestStoryReturn(storyHash, binding.itemgridfragmentGrid, presentationReady);
     }
 
     protected FeedSet getFeedSet() {
         return ((ItemsList) requireActivity()).getFeedSet();
     }
 
-	public void hasUpdated() {
+    public void hasUpdated() {
+        // A tablet's launch story list loads nothing until a feed is picked (ItemsList.EXTRA_DEFER_STORIES).
+        if (isAdded() && ((ItemsList) requireActivity()).areStoriesDeferred()) return;
         FeedSet fs = getFeedSet();
         if (isAdded() && fs != null) {
-            storiesViewModel.getActiveStories(fs, new CursorFilters(requireContext(), fs));
+            storiesViewModel.loadActiveStories(fs, new CursorFilters(prefsRepo, fs));
         }
-	}
-
-    protected void updateAdapter(@Nullable Cursor cursor) {
-        adapter.swapCursor(cursor, binding.itemgridfragmentGrid, gridState, skipBackFillingStories);
-        gridState = null;
-        adapter.updateFeedSet(getFeedSet());
-        if ((cursor != null) && (cursor.getCount() > 0)) {
-            binding.emptyView.setVisibility(View.INVISIBLE);
-        } else {
-            binding.emptyView.setVisibility(View.VISIBLE);
-        }
-
-        // though we have stories, we might not yet have as many as we want
-        ensureSufficientStories();
     }
 
-    private void setCursor(@Nullable Cursor cursor) {
-        if (cursor != null) {
-            if (!dbHelper.isFeedSetReady(getFeedSet())) {
-                // the DB hasn't caught up yet from the last story list; don't display stale stories.
-                com.newsblur.util.Log.i(this.getClass().getName(), "stale load");
-                updateAdapter(null);
-                triggerRefresh(1, null);
-            } else {
-                cursorSeenYet = true;
-                com.newsblur.util.Log.d(this.getClass().getName(), "loaded cursor with count: " + cursor.getCount());
-                updateAdapter(cursor);
-                if (cursor.getCount() < 1) {
-                    triggerRefresh(1, 0);
-                }
-            }
-		}
+    public void refreshLoadingIndicators() {
+        if (!isAdded() || binding == null) return;
         updateLoadingIndicators();
+    }
+
+    public boolean hasStories() {
+        return (adapter != null) && (adapter.getRawStoryCount() > 0);
+    }
+
+    private void updateAdapter(@NonNull List<Story> stories, Long loadId, int lastUnreadIndex) {
+        FeedSet submittedFeed = FeedSet.fromCompactSerial(getFeedSet().toCompactSerial());
+        RecyclerView submittedGrid = binding.itemgridfragmentGrid;
+        adapter.updateFeedSet(submittedFeed);
+        adapter.submitStories(stories, loadId, submittedGrid, gridState, skipBackFillingStories, () -> {
+            if (!isAdded() || binding == null || binding.itemgridfragmentGrid != submittedGrid ||
+                    submittedGrid.getAdapter() != adapter || !submittedFeed.equals(getFeedSet())) return;
+
+            // ItemSetFragment.java must use committed rows: a pre-diff zero count makes
+            // SyncServiceState.kt restart pagination, producing another batch that cancels the initial diff.
+            boolean empty = adapter.getRawStoryCount() == 0;
+            submittedGrid.setVisibility(empty ? View.INVISIBLE : View.VISIBLE);
+            binding.emptyView.setVisibility(empty ? View.VISIBLE : View.INVISIBLE);
+            storyThawCompleted(lastUnreadIndex);
+            ensureSufficientStories();
+            updateLoadingIndicators();
+            updateBottomNextFeedControl();
+            ItemsList activity = (ItemsList) getActivity();
+            if (activity != null) activity.refreshStoryStatusIndicators();
+        });
+        gridState = null;
     }
 
     private void updateLoadingIndicators() {
         calcFleuronPadding();
-
-        if (cursorSeenYet && adapter.getRawStoryCount() > 0 && UIUtils.needsSubscriptionAccess(requireContext(), getFeedSet())) {
-            fleuronBinding.getRoot().setVisibility(View.VISIBLE);
-            fleuronBinding.containerSubscribe.setVisibility(View.VISIBLE);
+        boolean hasStories = hasStories();
+        boolean isOffline = !NetworkUtils.isOnline(requireContext());
+        boolean waitingForApiResult = !hasStories && !syncServiceState.isFeedSetExhausted(getFeedSet());
+        com.newsblur.util.StoryLoadingState loading = com.newsblur.util.StoryLoadingState.resolve(
+                hasStories, dataSeenYet, syncServiceState.isFeedSetSyncing(getFeedSet()),
+                syncServiceState.isFeedSetExhausted(getFeedSet()), !isOffline);
+        boolean loadingNextPage = loading == com.newsblur.util.StoryLoadingState.NEXT_PAGE;
+        fleuronBinding.bottomLoadingIndicator.setVisibility(loadingNextPage ? View.VISIBLE : View.GONE);
+        fleuronBinding.fleuron.setVisibility(loadingNextPage ? View.GONE : View.VISIBLE);
+        binding.emptyViewText.setVisibility(View.VISIBLE);
+        com.newsblur.service.TryFeedRefreshStatus tryFeedStatus = syncServiceState.getTryFeedRefreshStatus(getFeedSet());
+        boolean canRetryTryFeed = !hasStories && (tryFeedStatus == com.newsblur.service.TryFeedRefreshStatus.EMPTY || tryFeedStatus == com.newsblur.service.TryFeedRefreshStatus.FAILED);
+        binding.emptyViewText.setClickable(canRetryTryFeed);
+        binding.emptyViewText.setFocusable(canRetryTryFeed);
+        if (canRetryTryFeed) {
+            binding.emptyViewText.setText(tryFeedStatus == com.newsblur.service.TryFeedRefreshStatus.FAILED ? R.string.try_feed_fetch_failed : R.string.try_feed_empty);
+            binding.emptyViewText.setTypeface(binding.emptyViewText.getTypeface(), Typeface.NORMAL);
+            binding.emptyViewText.setAlpha(1.0f);
+            binding.emptyViewImage.setVisibility(View.VISIBLE);
             binding.topLoadingIndicator.setVisibility(View.INVISIBLE);
-            bottomProgressView.setVisibility(View.INVISIBLE);
-            fleuronResized = false;
+            fleuronBinding.containerSubscribe.setVisibility(View.GONE);
+            fleuronBinding.getRoot().setVisibility(View.INVISIBLE);
+            updateBottomNextFeedControl();
             return;
         }
 
-        if ( (!cursorSeenYet) || NBSyncService.isFeedSetSyncing(getFeedSet(), getActivity()) ) {
-            binding.emptyViewText.setText(R.string.empty_list_view_loading);
-            binding.emptyViewText.setTypeface(binding.emptyViewText.getTypeface(), Typeface.ITALIC);
+        if (dataSeenYet && adapter.getRawStoryCount() > 0 && UIUtils.needsSubscriptionAccess(getFeedSet(), prefsRepo)) {
+            fleuronBinding.getRoot().setVisibility(View.VISIBLE);
+            fleuronBinding.containerSubscribe.setVisibility(View.VISIBLE);
+            updateUpgradeBannerText();
+            binding.topLoadingIndicator.setVisibility(View.INVISIBLE);
+            fleuronBinding.bottomLoadingIndicator.setVisibility(View.GONE);
+            fleuronBinding.fleuron.setVisibility(View.VISIBLE);
+            fleuronResized = false;
+            hideBottomNextFeedControl();
+            return;
+        }
+
+        if ((!dataSeenYet) || syncServiceState.isFeedSetSyncing(getFeedSet()) || waitingForApiResult) {
+            binding.emptyViewText.setText(isOffline ? R.string.sync_status_offline : R.string.empty_list_view_no_stories);
+            binding.emptyViewText.setVisibility(isOffline ? View.VISIBLE : View.GONE);
+            binding.emptyViewText.setTypeface(binding.emptyViewText.getTypeface(), Typeface.NORMAL);
+            binding.emptyViewText.setAlpha(1.0f);
             binding.emptyViewImage.setVisibility(View.INVISIBLE);
 
-            if (NBSyncService.isFeedSetStoriesFresh(getFeedSet())) {
-                binding.topLoadingIndicator.setVisibility(View.INVISIBLE);
-                bottomProgressView.setVisibility(View.VISIBLE);
-            } else {
-                binding.topLoadingIndicator.setVisibility(View.VISIBLE);
-                bottomProgressView.setVisibility(View.GONE);
-            }
-            fleuronBinding.getRoot().setVisibility(View.INVISIBLE);
+            binding.topLoadingIndicator.setVisibility(loading == com.newsblur.util.StoryLoadingState.INITIAL ? View.VISIBLE : View.INVISIBLE);
+            fleuronBinding.containerSubscribe.setVisibility(View.GONE);
+            fleuronBinding.getRoot().setVisibility(loadingNextPage ? View.VISIBLE : View.INVISIBLE);
         } else {
-            ReadFilter readFilter = PrefsUtils.getReadFilter(getActivity(), getFeedSet());
+            ReadFilter readFilter = prefsRepo.getReadFilter(getFeedSet());
             if (readFilter == ReadFilter.UNREAD) {
                 binding.emptyViewText.setText(R.string.empty_list_view_no_stories_unread);
             } else {
                 binding.emptyViewText.setText(R.string.empty_list_view_no_stories);
             }
             binding.emptyViewText.setTypeface(binding.emptyViewText.getTypeface(), Typeface.NORMAL);
+            binding.emptyViewText.setAlpha(1.0f);
             binding.emptyViewImage.setVisibility(View.VISIBLE);
 
             binding.topLoadingIndicator.setVisibility(View.INVISIBLE);
-            bottomProgressView.setVisibility(View.INVISIBLE);
-            if (cursorSeenYet && NBSyncService.isFeedSetExhausted(getFeedSet()) && (adapter.getRawStoryCount() > 0)) {
+            fleuronBinding.getRoot().setVisibility(View.INVISIBLE);
+            if (dataSeenYet && syncServiceState.isFeedSetExhausted(getFeedSet()) && (adapter.getRawStoryCount() > 0)) {
                 fleuronBinding.containerSubscribe.setVisibility(View.GONE);
                 fleuronBinding.getRoot().setVisibility(View.VISIBLE);
             }
         }
+        updateBottomNextFeedControl();
+    }
+
+    private void setupBottomNextFeedControl() {
+        bottomNextFeedRevealPx = Math.round(UIUtils.dp2px(requireContext(), BOTTOM_NEXT_FEED_REVEAL_DP));
+        bottomNextFeedActivationOffsetPx = Math.round(UIUtils.dp2px(requireContext(), BOTTOM_NEXT_FEED_ACTIVATION_OFFSET_DP));
+        bottomNextFeedActivationDistancePx = Math.round(UIUtils.dp2px(requireContext(), BOTTOM_NEXT_FEED_ACTIVATION_DISTANCE_DP));
+        ViewGroup.LayoutParams params = binding.bottomNextFeedControl.getLayoutParams();
+        if (params instanceof ViewGroup.MarginLayoutParams) {
+            bottomNextFeedBaseBottomMarginPx = ((ViewGroup.MarginLayoutParams) params).bottomMargin;
+        }
+        binding.getRoot().post(this::updateBottomNextFeedBottomInset);
+        binding.bottomNextFeedControl.applyTheme(prefsRepo.getResolvedTheme(requireContext()));
+        binding.bottomNextFeedControl.setOnClickListener(view -> openBottomNextStoryListSession());
+        binding.bottomNextFeedControl.setOnTouchListener(new BottomNextFeedButtonTouchListener());
+    }
+
+    private void updateBottomNextFeedBottomInset() {
+        if (binding == null) return;
+        WindowInsetsCompat rootInsets = ViewCompat.getRootWindowInsets(binding.getRoot());
+        if (rootInsets == null) return;
+        Insets navBarInsets = rootInsets.getInsets(WindowInsetsCompat.Type.navigationBars());
+        ViewGroup.LayoutParams params = binding.bottomNextFeedControl.getLayoutParams();
+        if (!(params instanceof ViewGroup.MarginLayoutParams)) return;
+        ViewGroup.MarginLayoutParams marginParams = (ViewGroup.MarginLayoutParams) params;
+        int targetBottomMargin = bottomNextFeedBaseBottomMarginPx + navBarInsets.bottom + listenMiniPlayerInsetPx;
+        RecyclerView grid = binding.itemgridfragmentGrid;
+        if (gridBaseBottomPaddingPx < 0) gridBaseBottomPaddingPx = grid.getPaddingBottom();
+        if (floatingStoryHeader != null && floatingStoryHeader.isLaidOut()) {
+            // ItemSetFragment.java draws stories beneath the footer while allowing the final row to scroll above it.
+            int[] listLocation = new int[2];
+            int[] headerLocation = new int[2];
+            grid.getLocationOnScreen(listLocation);
+            floatingStoryHeader.getLocationOnScreen(headerLocation);
+            int overlap = Math.max(0, listLocation[1] + grid.getHeight() - headerLocation[1]);
+            int bottomPadding = overlap + UIUtils.dp2px(requireContext(), 8) + listenMiniPlayerInsetPx;
+            if (grid.getPaddingBottom() != bottomPadding) {
+                grid.setPaddingRelative(grid.getPaddingStart(), grid.getPaddingTop(), grid.getPaddingEnd(), bottomPadding);
+            }
+            // ItemSetFragment.java keeps the next-feed control above both search and the floating action capsules.
+            targetBottomMargin = bottomNextFeedBaseBottomMarginPx + overlap + listenMiniPlayerInsetPx;
+        } else {
+            // With the story toolbar at the top, only the mini player covers the list's last rows.
+            int bottomPadding = gridBaseBottomPaddingPx + listenMiniPlayerInsetPx;
+            if (grid.getPaddingBottom() != bottomPadding) {
+                grid.setClipToPadding(false);
+                grid.setPaddingRelative(grid.getPaddingStart(), grid.getPaddingTop(), grid.getPaddingEnd(), bottomPadding);
+            }
+        }
+        if (marginParams.bottomMargin == targetBottomMargin) return;
+        marginParams.bottomMargin = targetBottomMargin;
+        binding.bottomNextFeedControl.setLayoutParams(marginParams);
+    }
+
+    /** ItemsList.java reports how much of the list Listen's mini player covers, or 0 while it is hidden. */
+    public void setListenMiniPlayerInset(int insetPx) {
+        if (listenMiniPlayerInsetPx == insetPx) return;
+        listenMiniPlayerInsetPx = insetPx;
+        updateBottomNextFeedBottomInset();
+    }
+
+    private void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState) {
+        if (adapter != null) adapter.onStoryListScrollStateChanged(newState);
+        int oldState = storyListScrollState;
+        storyListScrollState = newState;
+
+        if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
+            hasBottomNextFeedActiveDragStartOffset = true;
+            bottomNextFeedActiveDragStartOffsetY = recyclerView.computeVerticalScrollOffset();
+            bottomNextFeedHapticFired = false;
+        } else if (oldState == RecyclerView.SCROLL_STATE_DRAGGING) {
+            if (bottomNextFeedReady && !bottomNextFeedButtonPressActive) {
+                openBottomNextStoryListSession();
+                return;
+            }
+            resetBottomNextFeedDragState();
+        } else if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+            resetBottomNextFeedDragState();
+        }
+
+        updateBottomNextFeedControl();
+    }
+
+    private void updateBottomNextFeedControl() {
+        if (!isAdded() || binding == null || adapter == null || layoutManager == null) return;
+        updateBottomNextFeedBottomInset();
+
+        Session target = getBottomNextFeedTarget();
+        if (!canShowBottomNextFeedControl(target)) {
+            hideBottomNextFeedControl();
+            return;
+        }
+
+        float visibilityProgress = bottomNextFeedButtonPressActive ? 1f : getBottomNextFeedVisibilityProgress();
+        if (visibilityProgress <= 0.01f) {
+            binding.bottomNextFeedControl.setAlpha(0f);
+            binding.bottomNextFeedControl.setVisibility(View.GONE);
+            bottomNextFeedReady = false;
+            binding.bottomNextFeedControl.configure("site", null, false);
+            return;
+        }
+
+        boolean ready = bottomNextFeedButtonPressActive || isBottomNextFeedScrollReady(visibilityProgress);
+        if (ready && !bottomNextFeedReady && !bottomNextFeedButtonPressActive && !bottomNextFeedHapticFired) {
+            binding.bottomNextFeedControl.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            bottomNextFeedHapticFired = true;
+        } else if (!ready) {
+            bottomNextFeedHapticFired = false;
+        }
+        bottomNextFeedReady = ready;
+
+        configureBottomNextFeedTarget(target, ready);
+        binding.bottomNextFeedControl.setVisibility(View.VISIBLE);
+        binding.bottomNextFeedControl.setAlpha(visibilityProgress);
+    }
+
+    private void hideBottomNextFeedControl() {
+        bottomNextFeedReady = false;
+        bottomNextFeedButtonPressActive = false;
+        resetBottomNextFeedDragState();
+        bottomNextFeedLastTargetKey = null;
+        if (binding == null) return;
+        binding.bottomNextFeedControl.animate().cancel();
+        binding.bottomNextFeedControl.configure("site", null, false);
+        binding.bottomNextFeedControl.setAlpha(0f);
+        binding.bottomNextFeedControl.setVisibility(View.GONE);
+    }
+
+    private void resetBottomNextFeedDragState() {
+        hasBottomNextFeedActiveDragStartOffset = false;
+        bottomNextFeedActiveDragStartOffsetY = 0;
+        hasBottomNextFeedActivationAnchorOffset = false;
+        bottomNextFeedActivationAnchorOffsetY = 0;
+        bottomNextFeedHapticFired = false;
+    }
+
+    @Nullable
+    private Session getBottomNextFeedTarget() {
+        ItemsList activity = (ItemsList) getActivity();
+        if (activity == null) return null;
+        return activity.peekNextStoryListSession();
+    }
+
+    private boolean canShowBottomNextFeedControl(@Nullable Session target) {
+        if (target == null || binding == null || adapter == null) return false;
+        FeedSet fs = getFeedSet();
+        return dataSeenYet &&
+                fs != null &&
+                !UIUtils.needsSubscriptionAccess(fs, prefsRepo) &&
+                syncServiceState.isFeedSetExhausted(fs);
+    }
+
+    private float getBottomNextFeedVisibilityProgress() {
+        int storyCount = adapter.getStoryCount();
+        if (storyCount > 0) {
+            View lastStoryView = layoutManager.findViewByPosition(storyCount - 1);
+            if (lastStoryView != null) {
+                int midpoint = lastStoryView.getTop() + lastStoryView.getHeight() / 2;
+                if (bottomNextFeedRevealPx <= 0) return midpoint <= 0 ? 1f : 0f;
+                return Math.max(0f, Math.min(1f, (bottomNextFeedRevealPx - midpoint) / (float) bottomNextFeedRevealPx));
+            }
+
+            if (layoutManager.findFirstVisibleItemPosition() > storyCount - 1) {
+                return 1f;
+            }
+
+            return 0f;
+        }
+
+        int revealDistance = getBottomNextFeedRevealDistance();
+        if (bottomNextFeedRevealPx <= 0) return revealDistance > 0 ? 1f : 0f;
+        return Math.max(0f, Math.min(1f, revealDistance / (float) bottomNextFeedRevealPx));
+    }
+
+    private int getBottomNextFeedRevealDistance() {
+        if (binding == null || adapter == null || layoutManager == null) return 0;
+        View footerView = layoutManager.findViewByPosition(adapter.getStoryCount());
+        if (footerView != null) {
+            return Math.max(0, binding.itemgridfragmentGrid.getHeight() - footerView.getTop());
+        }
+        if (!binding.itemgridfragmentGrid.canScrollVertically(1)) {
+            return bottomNextFeedRevealPx;
+        }
+        return 0;
+    }
+
+    private boolean isBottomNextFeedScrollReady(float visibilityProgress) {
+        if (storyListScrollState != RecyclerView.SCROLL_STATE_DRAGGING ||
+                !hasBottomNextFeedActiveDragStartOffset ||
+                binding == null) {
+            return false;
+        }
+
+        int scrollOffset = binding.itemgridfragmentGrid.computeVerticalScrollOffset();
+        int footerStartOffset = scrollOffset - getBottomNextFeedRevealDistance();
+        int activationStartOffset = footerStartOffset + bottomNextFeedActivationOffsetPx;
+        int dynamicStartOffset = Math.max(activationStartOffset, bottomNextFeedActiveDragStartOffsetY);
+        if (visibilityProgress < 0.98f) {
+            hasBottomNextFeedActivationAnchorOffset = false;
+            return false;
+        }
+
+        if (!hasBottomNextFeedActivationAnchorOffset) {
+            bottomNextFeedActivationAnchorOffsetY = Math.max(scrollOffset, dynamicStartOffset);
+            hasBottomNextFeedActivationAnchorOffset = true;
+            return false;
+        }
+
+        int effectiveActivationStartOffset = Math.max(dynamicStartOffset, bottomNextFeedActivationAnchorOffsetY);
+        return scrollOffset - effectiveActivationStartOffset >= bottomNextFeedActivationDistancePx;
+    }
+
+    private void configureBottomNextFeedTarget(@NonNull Session target, boolean ready) {
+        Feed feed = target.getFeed();
+        boolean isFolder = feed == null;
+        String title = isFolder ? getBottomNextFolderTitle(target.getFolderName()) : feed.title;
+        String targetKey = isFolder ? "folder:" + target.getFolderName() : "feed:" + feed.feedId;
+
+        if (!targetKey.equals(bottomNextFeedLastTargetKey)) {
+            bottomNextFeedLastTargetKey = targetKey;
+            updateBottomNextFeedTargetIcon(target);
+        }
+
+        binding.bottomNextFeedControl.configure(isFolder ? "folder" : "site", title, ready);
+    }
+
+    private String getBottomNextFolderTitle(@Nullable String folderName) {
+        if (AppConstants.ALL_STORIES_GROUP_KEY.equals(folderName)) {
+            return getString(R.string.all_stories_title);
+        } else if (AppConstants.ROOT_FOLDER.equals(folderName)) {
+            return getString(R.string.top_level);
+        } else if (folderName == null || folderName.trim().isEmpty()) {
+            return getString(R.string.feed_list);
+        }
+        return com.newsblur.network.FolderPath.leaf(folderName);
+    }
+
+    private void updateBottomNextFeedTargetIcon(@NonNull Session target) {
+        Feed feed = target.getFeed();
+        if (feed != null) {
+            CustomIcon customIcon = BlurDatabaseHelper.getFeedIcon(feed.feedId);
+            Bitmap iconBitmap = renderBottomNextFeedIcon(customIcon);
+            if (iconBitmap != null) {
+                binding.bottomNextFeedControl.setTargetIconBitmap(iconBitmap);
+            } else {
+                binding.bottomNextFeedControl.loadTargetIcon(iconLoader, feed.faviconUrl, R.drawable.ic_world);
+            }
+            return;
+        }
+
+        String folderName = target.getFolderName();
+        if (AppConstants.ALL_STORIES_GROUP_KEY.equals(folderName)) {
+            binding.bottomNextFeedControl.setTargetIconResource(R.drawable.ic_all_stories);
+            return;
+        }
+
+        CustomIcon customIcon = folderName == null ? null : BlurDatabaseHelper.getFolderIcon(folderName);
+        Bitmap iconBitmap = renderBottomNextFeedIcon(customIcon);
+        if (iconBitmap != null) {
+            binding.bottomNextFeedControl.setTargetIconBitmap(iconBitmap);
+        } else {
+            binding.bottomNextFeedControl.setTargetIconResource(R.drawable.ic_folder_closed);
+        }
+    }
+
+    @Nullable
+    private Bitmap renderBottomNextFeedIcon(@Nullable CustomIcon customIcon) {
+        if (customIcon == null) return null;
+        int iconSize = UIUtils.dp2px(requireContext(), 22);
+        return CustomIconRenderer.renderIcon(requireContext(), customIcon, iconSize);
+    }
+
+    private boolean openBottomNextStoryListSession() {
+        ItemsList activity = (ItemsList) getActivity();
+        if (activity == null) return false;
+        boolean opened = activity.openNextStoryListSession();
+        if (opened) {
+            bottomNextFeedButtonPressActive = false;
+            bottomNextFeedReady = false;
+            resetBottomNextFeedDragState();
+            hideBottomNextFeedControl();
+        } else {
+            updateBottomNextFeedControl();
+        }
+        return opened;
+    }
+
+    private boolean isTouchInside(@NonNull View view, @NonNull MotionEvent event) {
+        return event.getX() >= 0f &&
+                event.getX() <= view.getWidth() &&
+                event.getY() >= 0f &&
+                event.getY() <= view.getHeight();
+    }
+
+    private void styleUpgradeBanner() {
+        int cardBg, strokeColor, textColor, buttonBg;
+        int goldColor = ContextCompat.getColor(requireContext(), R.color.premium_gold);
+
+        PrefConstants.ThemeValue theme = prefsRepo.getResolvedTheme(requireContext());
+        boolean isDark = theme == PrefConstants.ThemeValue.DARK || theme == PrefConstants.ThemeValue.BLACK;
+
+        if (theme == PrefConstants.ThemeValue.SEPIA) {
+            cardBg = ContextCompat.getColor(requireContext(), R.color.item_background_sepia);
+            strokeColor = ContextCompat.getColor(requireContext(), R.color.row_border_sepia);
+            textColor = ContextCompat.getColor(requireContext(), R.color.text_sepia);
+            buttonBg = goldColor;
+        } else if (isDark) {
+            cardBg = Color.parseColor("#2C2C2E");
+            strokeColor = Color.parseColor("#48484A");
+            textColor = ContextCompat.getColor(requireContext(), R.color.gray85);
+            buttonBg = goldColor;
+        } else {
+            cardBg = ContextCompat.getColor(requireContext(), R.color.white);
+            strokeColor = ContextCompat.getColor(requireContext(), R.color.gray85);
+            textColor = Color.parseColor("#1C1C1E");
+            buttonBg = goldColor;
+        }
+
+        fleuronBinding.containerSubscribe.setCardBackgroundColor(cardBg);
+        fleuronBinding.containerSubscribe.setStrokeColor(strokeColor);
+        fleuronBinding.textSubscription.setTextColor(textColor);
+        fleuronBinding.imgPremiumIcon.setImageTintList(ColorStateList.valueOf(goldColor));
+        fleuronBinding.buttonUpgrade.setBackgroundTintList(ColorStateList.valueOf(buttonBg));
+    }
+
+    private void updateUpgradeBannerText() {
+        FeedSet fs = getFeedSet();
+        int textRes;
+        if (fs.isAllNormal()) {
+            textRes = R.string.premium_subscribers_allstories;
+        } else if (fs.isSingleSavedTag()) {
+            textRes = R.string.premium_subscribers_saved_tag;
+        } else {
+            textRes = R.string.premium_subscribers_folder;
+        }
+        fleuronBinding.textSubscription.setText(textRes);
     }
 
     public void notifyContentPrefsChanged() {
@@ -367,13 +895,13 @@ public class ItemSetFragment extends NbFragment {
     }
 
     public void updateThumbnailStyle() {
-        ThumbnailStyle thumbnailStyle = PrefsUtils.getThumbnailStyle(requireContext());
+        ThumbnailStyle thumbnailStyle = prefsRepo.getThumbnailStyle();
         adapter.setThumbnailStyle(thumbnailStyle);
         adapter.notifyAllItemsChanged();
     }
 
     public void updateListStyle() {
-        StoryListStyle listStyle = PrefsUtils.getStoryListStyle(getActivity(), getFeedSet());
+        StoryListStyle listStyle = prefsRepo.getStoryListStyle(getFeedSet());
         calcColumnCount(listStyle);
         calcGridSpacing(listStyle);
         layoutManager.setSpanCount(columnCount);
@@ -382,13 +910,13 @@ public class ItemSetFragment extends NbFragment {
     }
 
     public void updateSpacingStyle() {
-        SpacingStyle spacingStyle = PrefsUtils.getSpacingStyle(requireContext());
+        SpacingStyle spacingStyle = prefsRepo.getSpacingStyle();
         adapter.setSpacingStyle(spacingStyle);
         adapter.notifyAllItemsChanged();
     }
 
     public void updateTextSize() {
-        float textSize = PrefsUtils.getListTextSize(requireContext());
+        float textSize = prefsRepo.getListTextSize();
         adapter.setTextSize(textSize);
         adapter.notifyAllItemsChanged();
     }
@@ -408,7 +936,7 @@ public class ItemSetFragment extends NbFragment {
             // sanity check the counts are strictly increasing
             if (colsCoarse < 1) colsCoarse = 1;
             if (colsMed <= colsCoarse) colsMed = colsCoarse + 1;
-            if (colsFine <= colsMed) colsFine = colsMed +1;
+            if (colsFine <= colsMed) colsFine = colsMed + 1;
         }
 
         if (listStyle == StoryListStyle.GRID_F) {
@@ -445,34 +973,35 @@ public class ItemSetFragment extends NbFragment {
         }
 
         RecyclerView.ItemAnimator anim = binding.itemgridfragmentGrid.getItemAnimator();
-        anim.setAddDuration((anim.getAddDuration() + targetAddDuration)/2L);
-        anim.setMoveDuration((anim.getMoveDuration() + targetMovDuration)/2L);
+        anim.setAddDuration((anim.getAddDuration() + targetAddDuration) / 2L);
+        anim.setMoveDuration((anim.getMoveDuration() + targetMovDuration) / 2L);
     }
 
-    private void onScrolled(RecyclerView recyclerView, int dx, int dy) {
+    private void onScrolled(int dy) {
         // the framework likes to trigger this on init before we even known counts, so disregard those
-        if (!cursorSeenYet) return;
+        if (!dataSeenYet) return;
 
         // don't bother checking on scroll up
         if (dy < 1) return;
 
         // skip fetching more stories if premium access is required
-        if (UIUtils.needsSubscriptionAccess(requireContext(), getFeedSet()) && adapter.getItemCount() >= 3) return;
+        if (UIUtils.needsSubscriptionAccess(getFeedSet(), prefsRepo) && adapter.getItemCount() >= 3)
+            return;
 
         ensureSufficientStories();
 
         // the list can be scrolled past the last item thanks to the offset footer, but don't fling
         // past the last item, which can be confusing to users who don't know about or need the offset
-        if ( (!fullFlingComplete) &&
-             (layoutManager.findLastCompletelyVisibleItemPosition() >= adapter.getStoryCount()) ) {
+        if (!adapter.isFollowingReadingStory() && (!fullFlingComplete) &&
+                (layoutManager.findLastCompletelyVisibleItemPosition() >= adapter.getStoryCount())) {
             binding.itemgridfragmentGrid.stopScroll();
             // but after halting at the end once, do allow scrolling past the bottom
             fullFlingComplete = true;
         }
 
         // if flinging downwards, pause at the last unread as a convenience
-        if ( (indexOfLastUnread >= 0) &&
-             (layoutManager.findLastCompletelyVisibleItemPosition() >= indexOfLastUnread) ) {
+        if (!adapter.isFollowingReadingStory() && (indexOfLastUnread >= 0) &&
+                (layoutManager.findLastCompletelyVisibleItemPosition() >= indexOfLastUnread)) {
             // but don't interrupt if already past the last unread
             if (indexOfLastUnread >= layoutManager.findFirstCompletelyVisibleItemPosition()) {
                 binding.itemgridfragmentGrid.stopScroll();
@@ -480,16 +1009,23 @@ public class ItemSetFragment extends NbFragment {
             indexOfLastUnread = -1;
         }
 
-        if (PrefsUtils.isMarkReadOnFeedScroll(requireContext())) {
-            // we want the top row of stories that is partially obscured. go back one from the first fully visible
-            int markEnd = layoutManager.findFirstCompletelyVisibleItemPosition() - 1;
-            if (markEnd > lastAutoMarkIndex) {
-                lastAutoMarkIndex = markEnd;
-                // iterate backwards through that row, marking read
-                for (int i=0; i<columnCount; i++) {
-                    int index = markEnd - i;
-                    Story story = adapter.getStory(index);
+        if (prefsRepo.isMarkReadOnFeedScroll()) {
+            // Mark a story as read either when it has fully scrolled off the top, or when
+            // it's the topmost partially-visible row and its vertical midpoint has crossed
+            // the bottom of the feed bar (the top edge of the RecyclerView). The halfway
+            // threshold lets users actually see the unread-to-read transition instead of
+            // missing it.
+            int firstVisible = layoutManager.findFirstVisibleItemPosition();
+            int storyCount = adapter.getStoryCount();
+            int lastAutoMarkPosition = getLastAutoMarkPosition();
+            boolean topRowHalfwayPastFold = isTopRowHalfwayPastFold(firstVisible, storyCount);
+            int markEnd = AutoMarkReadRangeDecider.findMarkEnd(firstVisible, topRowHalfwayPastFold, storyCount);
+            if (markEnd > lastAutoMarkPosition) {
+                // mark all stories between the previous mark position and the new one
+                for (int i = lastAutoMarkPosition + 1; i <= markEnd; i++) {
+                    Story story = adapter.getStory(i);
                     if (story != null) {
+                        lastAutoMarkStoryHash = story.storyHash;
                         feedUtils.markStoryAsRead(story, requireContext());
                     }
                 }
@@ -497,44 +1033,39 @@ public class ItemSetFragment extends NbFragment {
         }
     }
 
+    private int getLastAutoMarkPosition() {
+        if (lastAutoMarkStoryHash == null) return -1;
+        return adapter.getDisplayPositionForStoryHash(lastAutoMarkStoryHash);
+    }
+
+    /**
+     * Returns true if the topmost partially-visible story row has its vertical midpoint
+     * at or above the top edge of the RecyclerView (the bottom of the feed bar). Used by
+     * mark-read-on-scroll so a story flips to read once half of it is obscured by the
+     * feed bar, while the other half is still visible for the user to see.
+     */
+    private boolean isTopRowHalfwayPastFold(int firstVisible, int storyCount) {
+        if (firstVisible < 0 || firstVisible >= storyCount) return false;
+        View row = layoutManager.findViewByPosition(firstVisible);
+        if (row == null) return false;
+        int rowHeight = row.getHeight();
+        if (rowHeight <= 0) return false;
+        int rowMidInList = row.getTop() + rowHeight / 2;
+        return rowMidInList <= 0;
+    }
+
     private void ensureSufficientStories() {
+        // StoryViewAdapter.kt may have committed an intermediate snapshot while a fresher one is queued.
+        if (adapter.isUpdatingStories()) return;
         // don't ask the list for how many rows it actually has - it may still be thawing from the cursor
         int totalCount = adapter.getRawStoryCount();
         int visibleCount = layoutManager.getChildCount();
         int lastVisible = layoutManager.findLastVisibleItemPosition();
-        
+
         // load an extra page worth of stories past the viewport plus at least two rows to prime the height calc
-        int desiredStoryCount = lastVisible + (visibleCount*2) + (columnCount*2);
+        int desiredStoryCount = lastVisible + (visibleCount * 2) + (columnCount * 2);
         triggerRefresh(desiredStoryCount, totalCount);
         //com.newsblur.util.Log.d(this, String.format(" total:%d  bound:%d  last%d  desire:%d", totalCount, visibleCount, lastVisible, desiredStoryCount));
-    }
-
-    private void setupGestureDetector(RecyclerView v) {
-        final GestureDetector gestureDetector = new GestureDetector(getActivity(), new SwipeBackGestureDetector());
-        v.addOnItemTouchListener(new RecyclerView.SimpleOnItemTouchListener() {
-            public boolean onInterceptTouchEvent(RecyclerView rv, MotionEvent e) {
-                return gestureDetector.onTouchEvent(e);
-            }
-        });
-    }
-
-    /**
-     * A detector for the standard "swipe back out of activity" Android gesture.  Note that this does
-     * not necessarily wait for an UP event, as RecyclerViews like to capture them.
-     */
-    class SwipeBackGestureDetector extends GestureDetector.SimpleOnGestureListener {
-        @Override
-        public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
-            if (e1 == null) return false;
-            if ((e1.getX() < 60f) &&                  // the gesture should start from the left bezel and
-                ((e2.getX()-e1.getX()) > 90f) &&      // move horizontally to the right and
-                (Math.abs(e1.getY()-e2.getY()) < 40f) // have minimal vertical travel, so we don't capture scrolling gestures
-                ) {
-                ItemSetFragment.this.getActivity().finish();
-                return true;
-            }
-            return false;
-        }
     }
 
     /**
@@ -550,7 +1081,7 @@ public class ItemSetFragment extends NbFragment {
         int marginPx_4dp = UIUtils.dp2px(requireContext(), 4);
         int fleuronFooterHeightPx = fleuronBinding.getRoot().getMeasuredHeight();
         if (listHeight > 1) {
-            newLayout.setMargins(0, marginPx_4dp, 0, listHeight-fleuronFooterHeightPx);
+            newLayout.setMargins(0, marginPx_4dp, 0, listHeight - fleuronFooterHeightPx);
             fleuronResized = true;
         } else {
             int defaultPx_100dp = UIUtils.dp2px(requireContext(), 100);
@@ -566,10 +1097,195 @@ public class ItemSetFragment extends NbFragment {
         };
     }
 
+    private boolean isInteractiveStoryListSwipeEnabled() {
+        ItemsList activity = (ItemsList) getActivity();
+        // A tablet's root story list swipes the feed list over it instead (FeedListDrawer.kt).
+        return activity != null &&
+                (!activity.isTaskRoot() || activity.slidesOverFeedDrawer()) &&
+                prefsRepo.getLeftToRightGestureAction() == GestureAction.GEST_ACTION_BACK;
+    }
+
+    private final class BottomNextFeedButtonTouchListener implements View.OnTouchListener {
+        @Override
+        public boolean onTouch(View view, MotionEvent event) {
+            if (!canShowBottomNextFeedControl(getBottomNextFeedTarget())) return false;
+
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    bottomNextFeedButtonPressActive = true;
+                    view.setPressed(true);
+                    updateBottomNextFeedControl();
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    bottomNextFeedButtonPressActive = isTouchInside(view, event);
+                    view.setPressed(bottomNextFeedButtonPressActive);
+                    updateBottomNextFeedControl();
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    boolean shouldOpen = bottomNextFeedButtonPressActive && isTouchInside(view, event);
+                    bottomNextFeedButtonPressActive = false;
+                    view.setPressed(false);
+                    if (shouldOpen) {
+                        view.performClick();
+                    } else {
+                        updateBottomNextFeedControl();
+                    }
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    bottomNextFeedButtonPressActive = false;
+                    view.setPressed(false);
+                    updateBottomNextFeedControl();
+                    return true;
+                default:
+                    return true;
+            }
+        }
+    }
+
+    private final class StoryListBackTouchListener implements RecyclerView.OnItemTouchListener {
+        private final int touchSlopPx = ViewConfiguration.get(requireContext()).getScaledTouchSlop();
+        private final int minimumFlingVelocityPx = ViewConfiguration.get(requireContext()).getScaledMinimumFlingVelocity();
+        @Nullable
+        private VelocityTracker velocityTracker;
+        private float downRawX;
+        private float downRawY;
+        private boolean isDragging;
+        private boolean gestureEligible;
+
+        @Override
+        public boolean onInterceptTouchEvent(@NonNull RecyclerView recyclerView, @NonNull MotionEvent event) {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    ItemsList storyList = (ItemsList) getActivity();
+                    gestureEligible = (storyList != null && (!storyList.isTaskRoot() || storyList.slidesOverFeedDrawer())) &&
+                            (isNearStartEdge(recyclerView, event) ||
+                             (prefsRepo.isStorySwipesEnabled() && isInteractiveStoryListSwipeEnabled()));
+
+                    isDragging = false;
+                    downRawX = event.getRawX();
+                    downRawY = event.getRawY();
+                    resetVelocityTracker();
+                    velocityTracker = VelocityTracker.obtain();
+                    trackMovement(event);
+                    break;
+                case MotionEvent.ACTION_MOVE:
+                    if (!gestureEligible) return false;
+                    trackMovement(event);
+                    // deltaX counts toward the end edge, so the swipe mirrors in right-to-left layouts.
+                    float deltaX = towardEnd(event.getRawX() - downRawX);
+                    float deltaY = event.getRawY() - downRawY;
+                    if (!isDragging && Math.abs(deltaY) > touchSlopPx && Math.abs(deltaY) >= Math.abs(deltaX)) {
+                        gestureEligible = false;
+                        return false;
+                    }
+                    if (!isDragging &&
+                            deltaX > touchSlopPx &&
+                            deltaX > Math.abs(deltaY) * STORY_LIST_BACK_GESTURE_DIRECTION_RATIO) {
+                        isDragging = true;
+                        ItemsList activity = (ItemsList) getActivity();
+                        if (activity != null) {
+                            activity.beginInteractiveStoryListSwipe();
+                            activity.updateInteractiveStoryListSwipe(deltaX);
+                        }
+                        recyclerView.requestDisallowInterceptTouchEvent(true);
+                        return true;
+                    }
+                    break;
+                case MotionEvent.ACTION_POINTER_DOWN:
+                case MotionEvent.ACTION_CANCEL:
+                case MotionEvent.ACTION_UP:
+                    resetGestureState();
+                    break;
+                default:
+                    break;
+            }
+            return false;
+        }
+
+        @Override
+        public void onTouchEvent(@NonNull RecyclerView recyclerView, @NonNull MotionEvent event) {
+            if (!isDragging) return;
+            trackMovement(event);
+
+            ItemsList activity = (ItemsList) getActivity();
+            if (activity == null) {
+                resetGestureState();
+                return;
+            }
+
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_MOVE:
+                    activity.updateInteractiveStoryListSwipe(towardEnd(event.getRawX() - downRawX));
+                    break;
+                case MotionEvent.ACTION_UP:
+                    float totalDeltaX = Math.max(0f, towardEnd(event.getRawX() - downRawX));
+                    float xVelocity = getXVelocity();
+                    boolean shouldComplete = totalDeltaX >= recyclerView.getWidth() * STORY_LIST_BACK_GESTURE_TRIGGER_RATIO;
+                    if (!shouldComplete && xVelocity > minimumFlingVelocityPx * 4f) {
+                        shouldComplete = true;
+                    }
+                    if (shouldComplete) {
+                        activity.completeInteractiveStoryListSwipe();
+                    } else {
+                        activity.cancelInteractiveStoryListSwipe();
+                    }
+                    resetGestureState();
+                    break;
+                case MotionEvent.ACTION_CANCEL:
+                    activity.cancelInteractiveStoryListSwipe();
+                    resetGestureState();
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        @Override
+        public void onRequestDisallowInterceptTouchEvent(boolean disallowIntercept) {
+        }
+
+        private float towardEnd(float physicalDeltaX) {
+            return physicalDeltaX * UIUtils.towardEndSign(requireContext());
+        }
+
+        // ItemSetFragment.java starts the back swipe from the start edge, the right edge in Arabic and Hebrew.
+        private boolean isNearStartEdge(@NonNull RecyclerView recyclerView, @NonNull MotionEvent event) {
+            int edge = UIUtils.dp2px(requireContext(), 24);
+            return UIUtils.towardEndSign(requireContext()) < 0f ? event.getX() > recyclerView.getWidth() - edge : event.getX() < edge;
+        }
+
+        private float getXVelocity() {
+            if (velocityTracker == null) return 0f;
+            velocityTracker.computeCurrentVelocity(1000);
+            return towardEnd(velocityTracker.getXVelocity());
+        }
+
+        private void trackMovement(@NonNull MotionEvent event) {
+            if (velocityTracker == null) return;
+            MotionEvent screenEvent = MotionEvent.obtain(event);
+            screenEvent.offsetLocation(event.getRawX() - event.getX(), event.getRawY() - event.getY());
+            velocityTracker.addMovement(screenEvent);
+            screenEvent.recycle();
+        }
+
+        private void resetGestureState() {
+            isDragging = false;
+            gestureEligible = false;
+            resetVelocityTracker();
+        }
+
+        private void resetVelocityTracker() {
+            if (velocityTracker != null) {
+                velocityTracker.recycle();
+                velocityTracker = null;
+            }
+        }
+    }
+
     @Override
-    public void onSaveInstanceState (Bundle outState) {
-        super.onSaveInstanceState(outState);
-        outState.putParcelable(BUNDLE_GRIDSTATE, binding.itemgridfragmentGrid.getLayoutManager().onSaveInstanceState());
+    public void onSaveInstanceState(@NonNull Bundle savedInstanceState) {
+        super.onSaveInstanceState(savedInstanceState);
+        savedInstanceState.putParcelable(BUNDLE_GRIDSTATE, binding.itemgridfragmentGrid.getLayoutManager().onSaveInstanceState());
     }
 
 }

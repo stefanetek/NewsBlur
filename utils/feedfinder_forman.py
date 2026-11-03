@@ -12,11 +12,11 @@ except NameError:
 if not __FEEDFINDER2_SETUP__:
     __all__ = ["find_feeds"]
 
-    import requests
     from bs4 import BeautifulSoup
     from six.moves.urllib import parse as urlparse
 
     from utils import log as logging
+    from utils.url_safety import safe_requests_get
 
 
 def coerce_url(url):
@@ -39,14 +39,14 @@ class FeedFinder(object):
 
     def get_feed(self, url, skip_user_agent=False):
         try:
-            r = requests.get(
+            r = safe_requests_get(
                 url, headers={"User-Agent": self.user_agent if not skip_user_agent else None}, timeout=15
             )
         except Exception as e:
             logging.warning("Error while getting '{0}'".format(url))
             logging.warning("{0}".format(e))
             return None
-        if not skip_user_agent and r.status_code in [403, 204]:
+        if not skip_user_agent and (r.status_code in [403, 204, 202] or not r.text.strip()):
             return self.get_feed(url, skip_user_agent=True)
         self.text = r.text
         return self.text
@@ -55,7 +55,17 @@ class FeedFinder(object):
         data = text.lower()
         if data and data[:100].count("<html"):
             return False
+        if self.is_wp_json_data(text):
+            return True
         return data.count("<rss") + data.count("<rdf") + data.count("<feed") + data.count("jsonfeed.org")
+
+    def is_wp_json_data(self, text):
+        """Check if text looks like a WordPress REST API JSON response."""
+        text = text.strip()
+        if not text.startswith("["):
+            return False
+        snippet = text[:2000]
+        return '"rendered"' in snippet and '"link"' in snippet and '"type"' in snippet
 
     def is_feed(self, url):
         text = self.get_feed(url)
@@ -68,6 +78,24 @@ class FeedFinder(object):
 
     def is_feedlike_url(self, url):
         return any(map(url.lower().count, ["rss", "rdf", "xml", "atom", "feed", "json"]))
+
+
+def url_is_feed(url, user_agent=None):
+    """Return True only when the document at this URL is itself a feed.
+
+    Unlike find_feeds(), this does NOT scrape <link>/<a> tags for a feed that a
+    web *page* merely references -- it answers the narrower question "is the thing
+    served at this URL already an RSS/Atom/JSON feed?" Used to short-circuit the
+    Web Feed page-monitoring flow: when a user pastes a real feed URL we route
+    them to a normal (free) subscription, but a page that only links to a feed is
+    left alone because that referenced feed may not be the one they want.
+    utils/feedfinder_forman.py
+    """
+    finder = FeedFinder(user_agent=user_agent)
+    text = finder.get_feed(coerce_url(url))
+    if not text:
+        return False
+    return bool(finder.is_feed_data(text))
 
 
 def find_feeds(url, check_all=False, user_agent=None):

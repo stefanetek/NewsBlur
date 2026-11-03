@@ -94,12 +94,12 @@ services:
   newsblur_db_elasticsearch:
     container_name: newsblur_db_elasticsearch
     image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
-    mem_limit: 1200m
+    mem_limit: 2g
     mem_reservation: 512m
     restart: unless-stopped
     environment:
       - discovery.type=single-node
-      - "ES_JAVA_OPTS=-Xms384m -Xmx384m -XX:UseSVE=0"
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g -XX:UseSVE=0"
       - "CLI_JAVA_OPTS=-XX:UseSVE=0"
       - cluster.routing.allocation.disk.threshold_enabled=false
       - xpack.security.enabled=false
@@ -118,6 +118,6 @@ services:
     restart: unless-stopped
     ports:
       - 29019:29019
-    command: mongod --port 29019 --nojournal --wiredTigerEngineConfigString="checkpoint=(wait=0),file_manager=(close_idle_time=0),verbose=(recovery_progress)"
+    command: mongod --port 29019 --wiredTigerEngineConfigString="checkpoint=(wait=60),file_manager=(close_idle_time=0)"
     volumes:
       - ./docker/volumes/db_mongo:/data/db

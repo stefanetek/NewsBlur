@@ -1,3 +1,10 @@
+"""Social models: shared stories, comments, follows, interactions, and blurblogs.
+
+MSocialProfile stores user social identity. MSocialSubscription tracks follows.
+MSharedStory stores shared stories with comments. MInteraction and MActivity
+track social events (replies, reshares, follows).
+"""
+
 import datetime
 import hashlib
 import html as pyhtml
@@ -24,6 +31,7 @@ from django.template.defaultfilters import slugify
 from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils.encoding import smart_bytes, smart_str
+from django.utils.translation import gettext
 from mongoengine.queryset import Q
 
 from apps.analyzer.models import (
@@ -32,24 +40,34 @@ from apps.analyzer.models import (
     MClassifierTag,
     MClassifierText,
     MClassifierTitle,
+    MClassifierUrl,
     apply_classifier_authors,
     apply_classifier_feeds,
     apply_classifier_tags,
     apply_classifier_texts,
     apply_classifier_titles,
+    apply_classifier_url_regex,
+    apply_classifier_urls,
 )
 from apps.profile.models import MSentEmail, Profile
 from apps.reader.models import RUserStory, UserSubscription
-from apps.rss_feeds.models import Feed, MStory
+from apps.rss_feeds.models import Feed, MStory, renew_merge_feeds_locks
 from apps.rss_feeds.page_importer import PageImporter
 from apps.rss_feeds.text_importer import TextImporter
+from apps.social.discovery import discovery_excluded_pairs
 from utils import json_functions as json
 from utils import log as logging
 from utils import s3_utils
 from utils.feed_functions import chunks, relative_timesince
 from utils.image_functions import ImageOps
+from utils.languages import account_translation
 from utils.scrubber import SelectiveScriptScrubber
-from utils.story_functions import linkify, strip_tags, truncate_chars
+from utils.story_functions import (
+    linkify,
+    strip_tags,
+    strip_tags_preserve_blockquote,
+    truncate_chars,
+)
 from vendor import facebook
 
 try:
@@ -184,6 +202,12 @@ class MSocialProfile(mongo.Document):
         try:
             profile = cls.objects.get(user_id=user_id)
         except cls.DoesNotExist:
+            # Don't conjure a profile for a user_id with no django User behind
+            # it. create() runs save() -> import_user_fields(), which raises
+            # User.DoesNotExist from deep inside mongoengine; raise it here
+            # instead so callers can see what actually went wrong.
+            if not User.objects.filter(pk=user_id).exists():
+                raise User.DoesNotExist("No user with id %s" % user_id)
             profile = cls.objects.create(user_id=user_id)
             profile.save()
 
@@ -209,9 +233,9 @@ class MSocialProfile(mongo.Document):
         if self.bio:
             self.bio = strip_tags(self.bio)
         if self.website:
-            self.website = strip_tags(self.website)
+            self.website = strip_tags(self.website)[: MSocialProfile.website.max_length]
         if self.location:
-            self.location = strip_tags(self.location)
+            self.location = strip_tags(self.location)[: MSocialProfile.location.max_length]
         if self.custom_css:
             self.custom_css = strip_tags(self.custom_css)
 
@@ -703,14 +727,18 @@ class MSocialProfile(mongo.Document):
             "common_followings": common_followings,
         }
 
-        text = render_to_string("mail/email_new_follower.txt", data)
-        html = render_to_string("mail/email_new_follower.xhtml", data)
-        subject = "%s is now following your Blurblog on NewsBlur!" % follower_profile.user.username
+        with account_translation(user.profile):
+            text = render_to_string("mail/email_new_follower.txt", data)
+            html = render_to_string("mail/email_new_follower.xhtml", data)
+            subject = gettext("%(username)s is now following your Blurblog on NewsBlur!") % {
+                "username": follower_profile.user.username
+            }
         msg = EmailMultiAlternatives(
             subject,
             text,
             from_email="NewsBlur <%s>" % settings.HELLO_EMAIL,
             to=["%s <%s>" % (user.username, user.email)],
+            headers=user.profile.email_unsubscribe_headers(),
         )
         msg.attach_alternative(html, "text/html")
         msg.send()
@@ -761,14 +789,18 @@ class MSocialProfile(mongo.Document):
             "common_followings": common_followings,
         }
 
-        text = render_to_string("mail/email_follow_request.txt", data)
-        html = render_to_string("mail/email_follow_request.xhtml", data)
-        subject = "%s has requested to follow your Blurblog on NewsBlur" % follower_profile.user.username
+        with account_translation(user.profile):
+            text = render_to_string("mail/email_follow_request.txt", data)
+            html = render_to_string("mail/email_follow_request.xhtml", data)
+            subject = gettext("%(username)s has requested to follow your Blurblog on NewsBlur") % {
+                "username": follower_profile.user.username
+            }
         msg = EmailMultiAlternatives(
             subject,
             text,
             from_email="NewsBlur <%s>" % settings.HELLO_EMAIL,
             to=["%s <%s>" % (user.username, user.email)],
+            headers=user.profile.email_unsubscribe_headers(),
         )
         msg.attach_alternative(html, "text/html")
         msg.send()
@@ -811,29 +843,34 @@ class MSocialProfile(mongo.Document):
         total = 0
         month_count = 0
 
-        # Count stories, aggregate by year and month. Map Reduce!
-        map_f = """
-            function() {
-                var date = (this.shared_date.getFullYear()) + "-" + (this.shared_date.getMonth()+1);
-                var hour = this.shared_date.getHours();
-                var day = this.shared_date.getDay();
-                emit(this.story_hash, {'month': date, 'hour': hour, 'day': day});
-            }
-        """
-        reduce_f = """
-            function(key, values) {
-                return values;
-            }
-        """
+        # Count stories grouped by year/month/hour/day using aggregation pipeline
         dates = defaultdict(int)
         hours = defaultdict(int)
         days = defaultdict(int)
-        results = MSharedStory.objects(user_id=self.user_id).map_reduce(map_f, reduce_f, output="inline")
-        for result in results:
-            dates[result.value["month"]] += 1
-            hours[str(int(result.value["hour"]))] += 1
-            days[str(int(result.value["day"]))] += 1
-            year = int(re.findall(r"(\d{4})-\d{1,2}", result.value["month"])[0])
+        pipeline = [
+            {"$match": {"user_id": self.user_id}},
+            {
+                "$group": {
+                    "_id": {
+                        "year": {"$year": "$shared_date"},
+                        "month": {"$month": "$shared_date"},
+                        "hour": {"$hour": "$shared_date"},
+                        "day": {"$dayOfWeek": "$shared_date"},
+                    },
+                    "count": {"$sum": 1},
+                }
+            },
+        ]
+        for result in MSharedStory._get_collection().aggregate(pipeline):
+            year = result["_id"]["year"]
+            month = result["_id"]["month"]
+            hour = result["_id"]["hour"]
+            day = result["_id"]["day"] - 1  # $dayOfWeek 1=Sun..7=Sat -> 0=Sun..6=Sat
+            count = result["count"]
+            key = "%s-%s" % (year, month)
+            dates[key] += count
+            hours[str(hour)] += count
+            days[str(day)] += count
             if year < min_year:
                 min_year = year
 
@@ -859,32 +896,21 @@ class MSocialProfile(mongo.Document):
 
     def save_classifier_counts(self):
         def calculate_scores(cls, facet):
-            map_f = """
-                function() {
-                    emit(this["%s"], {
-                        pos: this.score>0 ? this.score : 0, 
-                        neg: this.score<0 ? Math.abs(this.score) : 0
-                    });
-                }
-            """ % (
-                facet
-            )
-            reduce_f = """
-                function(key, values) {
-                    var result = {pos: 0, neg: 0};
-                    values.forEach(function(value) {
-                        result.pos += value.pos;
-                        result.neg += value.neg;
-                    });
-                    return result;
-                }
-            """
+            pipeline = [
+                {"$match": {"social_user_id": self.user_id}},
+                {
+                    "$group": {
+                        "_id": "$" + facet,
+                        "pos": {"$sum": {"$cond": [{"$gt": ["$score", 0]}, "$score", 0]}},
+                        "neg": {"$sum": {"$cond": [{"$lt": ["$score", 0]}, {"$abs": "$score"}, 0]}},
+                    }
+                },
+            ]
             scores = []
-            res = cls.objects(social_user_id=self.user_id).map_reduce(map_f, reduce_f, output="inline")
-            for r in res:
-                facet_values = dict([(k, int(v)) for k, v in list(r.value.items())])
-                facet_values[facet] = r.key
-                scores.append(facet_values)
+            for r in cls._get_collection().aggregate(pipeline):
+                pos = int(r["pos"])
+                neg = int(r["neg"])
+                scores.append({"pos": pos, "neg": neg, facet: r["_id"]})
             scores = sorted(scores, key=lambda v: v["neg"] - v["pos"])
 
             return scores
@@ -993,13 +1019,19 @@ class MSocialSubscription(mongo.Document):
             social_profiles = MSocialProfile.profile_feeds(social_user_ids)
             for social_sub in social_subs:
                 user_id = social_sub.subscription_user_id
-                if social_profiles[user_id]["shared_stories_count"] <= 0:
+                # A subscription can outlive the blurblog's profile (deleted/never created),
+                # in which case profile_feeds returns nothing for it. Skip it rather than
+                # 500 the whole feed load. (apps/social/models.py)
+                profile = social_profiles.get(user_id)
+                if not profile:
+                    continue
+                if profile["shared_stories_count"] <= 0:
                     continue
                 if update_counts and social_sub.needs_unread_recalc:
                     social_sub.calculate_feed_scores()
 
                 # Combine subscription read counts with feed/user info
-                feed = dict(list(social_sub.canonical().items()) + list(social_profiles[user_id].items()))
+                feed = dict(list(social_sub.canonical().items()) + list(profile.items()))
                 social_feeds.append(feed)
 
         return social_feeds
@@ -1292,7 +1324,6 @@ class MSocialSubscription(mongo.Document):
         cutoff_date=None,
         date_filter_start=None,
         date_filter_end=None,
-        dashboard_global=False,
     ):
         rt = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_TEMP_POOL)
 
@@ -1309,12 +1340,7 @@ class MSocialSubscription(mongo.Document):
 
         ranked_stories_keys = "zU:%s:social" % (user_id)
         unread_ranked_stories_keys = "zhU:%s:social" % (user_id)
-        if (
-            (offset or dashboard_global)
-            and cache
-            and rt.exists(ranked_stories_keys)
-            and rt.exists(unread_ranked_stories_keys)
-        ):
+        if offset and cache and rt.exists(ranked_stories_keys) and rt.exists(unread_ranked_stories_keys):
             story_hashes_and_dates = range_func(ranked_stories_keys, offset, limit, withscores=True)
             if not story_hashes_and_dates:
                 return [], [], []
@@ -1501,7 +1527,11 @@ class MSocialSubscription(mongo.Document):
                 # XXX TODO: Real-time notification, just for this user
         return data
 
-    def mark_feed_read(self, cutoff_date=None):
+    def mark_feed_read(self, cutoff_date=None, force=False):
+        # force exists for signature parity with UserSubscription.mark_feed_read in
+        # apps/reader/models.py: mark_all_as_read and mark_feed_as_read pass
+        # force=True to both subscription types. Social subs have no zero-badge
+        # early return to bypass, so the flag changes nothing here.
         user_profile = Profile.objects.get(user_id=self.user_id)
         recount = True
 
@@ -1611,6 +1641,9 @@ class MSocialSubscription(mongo.Document):
         classifier_texts = list(
             MClassifierText.objects(user_id=self.user_id, social_user_id=self.subscription_user_id)
         )
+        classifier_urls = list(
+            MClassifierUrl.objects(user_id=self.user_id, social_user_id=self.subscription_user_id)
+        )
         # Merge with feed specific classifiers
         if story_feed_ids:
             classifier_feeds = classifier_feeds + list(
@@ -1628,6 +1661,9 @@ class MSocialSubscription(mongo.Document):
             classifier_texts = classifier_texts + list(
                 MClassifierText.objects(user_id=self.user_id, feed_id__in=story_feed_ids)
             )
+            classifier_urls = classifier_urls + list(
+                MClassifierUrl.objects(user_id=self.user_id, feed_id__in=story_feed_ids)
+            )
 
         for story in stories:
             scores = {
@@ -1642,10 +1678,28 @@ class MSocialSubscription(mongo.Document):
                     if user_profile.premium_available_text_classifiers
                     else 0
                 ),
+                "url": apply_classifier_urls(classifier_urls, story, user_is_premium=user_profile.is_premium),
+                "url_regex": (
+                    apply_classifier_url_regex(classifier_urls, story) if user_profile.is_pro else 0
+                ),
             }
 
-            max_score = max(scores["author"], scores["tags"], scores["title"], scores["text"])
-            min_score = min(scores["author"], scores["tags"], scores["title"], scores["text"])
+            max_score = max(
+                scores["author"],
+                scores["tags"],
+                scores["title"],
+                scores["text"],
+                scores["url"],
+                scores["url_regex"],
+            )
+            min_score = min(
+                scores["author"],
+                scores["tags"],
+                scores["title"],
+                scores["text"],
+                scores["url"],
+                scores["url_regex"],
+            )
 
             if max_score > 0:
                 feed_scores["positive"] += 1
@@ -1833,7 +1887,7 @@ class MSharedStory(mongo.DynamicDocument):
         self.story_title = strip_tags(self.story_title)
         self.story_hash = self.feed_guid_hash
 
-        self.comments = linkify(strip_tags(self.comments))
+        self.comments = linkify(strip_tags_preserve_blockquote(self.comments))
         for reply in self.replies:
             reply.comments = linkify(strip_tags(reply.comments))
 
@@ -2048,6 +2102,8 @@ class MSharedStory(mongo.DynamicDocument):
         shared_stories = cls.objects.filter(story_feed_id=duplicate_feed_id)
         logging.info(" ---> %s shared stories" % shared_stories.count())
         for story in shared_stories:
+            # Keeps the merge's locks alive on a feed with many shares. apps/social/models.py
+            renew_merge_feeds_locks()
             story.story_feed_id = original_feed_id
             story.save()
 
@@ -2061,46 +2117,44 @@ class MSharedStory(mongo.DynamicDocument):
             shared_feed_ids = []
         # shared_stories_count = sum(json.decode(MStatistics.get('stories_shared')))
         # cutoff = cutoff or max(math.floor(.025 * shared_stories_count), 3)
-        today = datetime.datetime.now() - datetime.timedelta(days=days)
+        now = datetime.datetime.now()
+        today = now - datetime.timedelta(days=days)
 
-        map_f = """
-            function() {
-                emit(this.story_hash, {
-                    'story_hash': this.story_hash, 
-                    'feed_id': this.story_feed_id, 
-                    'title': this.story_title,
-                    'count': 1
-                });
-            }
-        """
-        reduce_f = """
-            function(key, values) {
-                var r = {'story_hash': key, 'count': 0};
-                for (var i=0; i < values.length; i++) {
-                    r.feed_id = values[i].feed_id;
-                    r.title = values[i].title;
-                    r.count += values[i].count;
+        excluded_feed_ids = [int(fid) for fid in shared_feed_ids if fid.isdigit()]
+        eligible_shares = {"shared_date": {"$gte": today}}
+        excluded_pairs = discovery_excluded_pairs(now=now)
+        if excluded_pairs:
+            eligible_shares["$nor"] = [
+                {"user_id": user_id, "story_feed_id": feed_id} for user_id, feed_id in sorted(excluded_pairs)
+            ]
+        pipeline = [
+            {"$match": eligible_shares},
+            {
+                "$group": {
+                    "_id": "$story_hash",
+                    "feed_id": {"$first": "$story_feed_id"},
+                    "title": {"$first": "$story_title"},
+                    "users": {"$addToSet": "$user_id"},
                 }
-                return r;
+            },
+            {"$addFields": {"count": {"$size": "$users"}}},
+            {"$match": {"count": {"$gte": cutoff}}},
+        ]
+        if excluded_feed_ids:
+            pipeline.append({"$match": {"feed_id": {"$nin": excluded_feed_ids}}})
+        stories = {}
+        for r in cls._get_collection().aggregate(pipeline):
+            title = r.get("title", "") or ""
+            english_title = re.sub(r"[^\x32-\x7f]", "", title)
+            if len(english_title) < 5:
+                continue
+            story_hash = r["_id"]
+            stories[story_hash] = {
+                "story_hash": story_hash,
+                "feed_id": r["feed_id"],
+                "title": title,
+                "count": r["count"],
             }
-        """
-        finalize_f = """
-            function(key, value) {
-                if (value.count >= %(cutoff)s && [%(shared_feed_ids)s].indexOf(value.feed_id) == -1) {
-                    var english_title = value.title.replace(/[^\\062-\\177]/g, "");
-                    if (english_title.length < 5) return;
-            
-                    return value;
-                }
-            }
-        """ % {
-            "cutoff": cutoff,
-            "shared_feed_ids": ", ".join(shared_feed_ids),
-        }
-        res = cls.objects(shared_date__gte=today).map_reduce(
-            map_f, reduce_f, finalize_f=finalize_f, output="inline"
-        )
-        stories = dict([(r.key, r.value) for r in res if r.value])
         return stories, cutoff
 
     @classmethod
@@ -2553,7 +2607,6 @@ class MSharedStory(mongo.DynamicDocument):
             profile_user_ids.add(self.source_user_id)
         profiles = MSocialProfile.objects.filter(user_id__in=list(profile_user_ids))
         profiles = [profile.canonical(compact=True) for profile in profiles]
-        comment = MSharedStory.attach_users_to_comment(comment, profiles)
 
         for user_id in notify_user_ids:
             user = User.objects.get(pk=user_id)
@@ -2575,23 +2628,31 @@ class MSharedStory(mongo.DynamicDocument):
                     },
                 ),
             )
-            data = {
-                "reply_user_profile": reply_user_profile,
-                "comment": comment,
-                "shared_story": self,
-                "story_feed": story_feed,
-                "mute_url": mute_url,
-            }
             story_title = self.decoded_story_title.replace("\n", " ")
 
-            text = render_to_string("mail/email_reply.txt", data)
-            html = pynliner.fromString(render_to_string("mail/email_reply.xhtml", data))
-            subject = '%s replied to you on "%s" on NewsBlur' % (reply_user.username, story_title)
+            # social/models.py writes each recipient's email, including the comment's relative dates,
+            # in their own language.
+            with account_translation(user.profile):
+                comment = MSharedStory.attach_users_to_comment(self.comments_with_author(), profiles)
+                data = {
+                    "reply_user_profile": reply_user_profile,
+                    "comment": comment,
+                    "shared_story": self,
+                    "story_feed": story_feed,
+                    "mute_url": mute_url,
+                }
+                text = render_to_string("mail/email_reply.txt", data)
+                html = pynliner.fromString(render_to_string("mail/email_reply.xhtml", data))
+                subject = gettext('%(username)s replied to you on "%(story_title)s" on NewsBlur') % {
+                    "username": reply_user.username,
+                    "story_title": story_title,
+                }
             msg = EmailMultiAlternatives(
                 subject,
                 text,
                 from_email="NewsBlur <%s>" % settings.HELLO_EMAIL,
                 to=["%s <%s>" % (user.username, user.email)],
+                headers=user.profile.email_unsubscribe_headers(),
             )
             msg.attach_alternative(html, "text/html")
             msg.send()
@@ -2639,7 +2700,6 @@ class MSharedStory(mongo.DynamicDocument):
             profile_user_ids.add(self.source_user_id)
         profiles = MSocialProfile.objects.filter(user_id__in=list(profile_user_ids))
         profiles = [profile.canonical(compact=True) for profile in profiles]
-        comment = MSharedStory.attach_users_to_comment(comment, profiles)
 
         mute_url = "http://%s%s" % (
             Site.objects.get_current().domain,
@@ -2651,24 +2711,30 @@ class MSharedStory(mongo.DynamicDocument):
                 },
             ),
         )
-        data = {
-            "comment": comment,
-            "shared_story": self,
-            "reshare_user_profile": reshare_user_profile,
-            "original_shared_story": original_shared_story,
-            "story_feed": story_feed,
-            "mute_url": mute_url,
-        }
         story_title = self.decoded_story_title.replace("\n", " ")
 
-        text = render_to_string("mail/email_reshare.txt", data)
-        html = pynliner.fromString(render_to_string("mail/email_reshare.xhtml", data))
-        subject = '%s re-shared "%s" from you on NewsBlur' % (reshare_user.username, story_title)
+        with account_translation(original_user.profile):
+            comment = MSharedStory.attach_users_to_comment(self.comments_with_author(), profiles)
+            data = {
+                "comment": comment,
+                "shared_story": self,
+                "reshare_user_profile": reshare_user_profile,
+                "original_shared_story": original_shared_story,
+                "story_feed": story_feed,
+                "mute_url": mute_url,
+            }
+            text = render_to_string("mail/email_reshare.txt", data)
+            html = pynliner.fromString(render_to_string("mail/email_reshare.xhtml", data))
+            subject = gettext('%(username)s re-shared "%(story_title)s" from you on NewsBlur') % {
+                "username": reshare_user.username,
+                "story_title": story_title,
+            }
         msg = EmailMultiAlternatives(
             subject,
             text,
             from_email="NewsBlur <%s>" % settings.HELLO_EMAIL,
             to=["%s <%s>" % (original_user.username, original_user.email)],
+            headers=original_user.profile.email_unsubscribe_headers(),
         )
         msg.attach_alternative(html, "text/html")
         msg.send()
@@ -2737,8 +2803,15 @@ class MSharedStory(mongo.DynamicDocument):
 
         return image_sizes
 
+    drop_cached_google_consent_text = MStory.drop_cached_google_consent_text
+
     def fetch_original_text(self, force=False, request=None, debug=False):
         original_text_z = self.original_text_z
+        # Same consent-wall cache cleanup as MStory.fetch_original_text (forum #13827):
+        # find_story falls back to shared stories once the feed story ages out.
+        original_text_z, dropped_consent_cache = self.drop_cached_google_consent_text(
+            original_text_z, force=force, request=request
+        )
         feed = Feed.get_by_id(self.story_feed_id)
 
         if not original_text_z or force:

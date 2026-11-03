@@ -1,32 +1,32 @@
 body, span, table, td, p, div, li {
-	background-color: #1A1A1A !important;
-	color: #FFF !important;
+	background-color: #444444 !important;
+	color: #eeeeee !important;
 }
 
 a, a span {
 	color: #319DC5 !important;
-	background-color: #1A1A1A !important;
+	background-color: #444444 !important;
 }
 
 a:visited, a:visited span {
 	color: #319DC5 !important;
-	background-color: #1A1A1A !important;
+	background-color: #444444 !important;
 }
 
 pre, blockquote, code {
-    background-color: #4C4C4C;
+    background-color: #6c696a;
 }
 
 blockquote *, pre *, code * {
-    background-color: #4C4C4C !important;
+    background-color: #6c696a !important;
 }
 
 blockquote a, blockquote a span {
-    background-color: #4C4C4C !important;
+    background-color: #6c696a !important;
 }
 
 .NB-story > table {
-    background-color: #4C4C4C !important;
+    background-color: #6c696a !important;
 }
 
 ins {
@@ -44,4 +44,23 @@ del {
 
 .NB-story del {
     background-color: #920000;
+}
+
+.NB-starred-story-selection-highlight {
+  background: rgba(255, 214, 10, 0.35);
+  padding: 0 .06em;
+  border-radius: .20em;
+  box-shadow: 0 0 0 1px rgba(255, 214, 10, 0.40);
+}
+
+.NB-classifier-highlight-positive {
+    background-color: #2d5a2b !important;
+}
+
+.NB-classifier-highlight-negative {
+    background-color: #6b2a2a !important;
+}
+
+.NB-classifier-highlight-super-negative {
+    background-color: #5a1a1a !important;
 }

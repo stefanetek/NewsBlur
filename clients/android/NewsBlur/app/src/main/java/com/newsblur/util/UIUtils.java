@@ -5,8 +5,6 @@ import java.util.Map;
 import java.util.Objects;
 
 import static android.graphics.Bitmap.Config.ARGB_8888;
-import static com.google.android.material.appbar.AppBarLayout.LayoutParams.SCROLL_FLAG_SCROLL;
-import static com.google.android.material.appbar.AppBarLayout.LayoutParams.SCROLL_FLAG_SNAP;
 
 import android.app.Activity;
 import android.app.SearchManager;
@@ -23,7 +21,6 @@ import android.graphics.Shader;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Handler;
 import android.util.Log;
 import android.util.TypedValue;
 import android.text.Html;
@@ -31,7 +28,9 @@ import android.text.Spanned;
 import android.text.TextUtils;
 import android.view.ContextMenu;
 import android.view.MenuInflater;
+import android.view.Menu;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.ImageView;
 import android.widget.TextView;
 
@@ -41,9 +40,9 @@ import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.browser.customtabs.CustomTabColorSchemeParams;
 import androidx.browser.customtabs.CustomTabsIntent;
+import androidx.constraintlayout.widget.ConstraintLayout;
 import androidx.core.content.ContextCompat;
 
-import com.google.android.material.appbar.AppBarLayout;
 import com.google.android.material.appbar.MaterialToolbar;
 import com.google.android.material.color.MaterialColors;
 import com.google.android.material.snackbar.Snackbar;
@@ -51,6 +50,10 @@ import com.newsblur.R;
 import com.newsblur.activity.*;
 import com.newsblur.domain.Classifier;
 import com.newsblur.domain.Story;
+import com.newsblur.preference.PrefsRepo;
+import com.newsblur.util.PrefConstants;
+
+import dagger.hilt.android.internal.managers.FragmentComponentManager;
 
 public class UIUtils {
 
@@ -139,15 +142,25 @@ public class UIUtils {
             return null;
         }
     }
-	
+
 	/*
 	 * Convert from device-independent-pixels to pixels for use in custom view drawing, as
-	 * used throughout Android. 
-	 * See: http://bit.ly/MfsAUZ (Romain Guy's comment)  
+	 * used throughout Android.
+	 * See: http://bit.ly/MfsAUZ (Romain Guy's comment)
 	 */
 	public static int dp2px(Context context, int dp) {
 		float scale = context.getResources().getDisplayMetrics().density;
 		return (int) (dp * scale + 0.5f);
+	}
+
+	/**
+	 * The sign of a horizontal movement toward the layout's end edge: 1 when the interface reads left
+	 * to right, -1 in Arabic and Hebrew. UIUtils.java lets the back swipes and the feed list slide-over
+	 * multiply their translations by it, so they mirror along with the layouts. It reads the
+	 * configuration rather than a view, because views ask before they are attached.
+	 */
+	public static float towardEndSign(Context context) {
+		return context.getResources().getConfiguration().getLayoutDirection() == View.LAYOUT_DIRECTION_RTL ? -1f : 1f;
 	}
 
 	public static float dp2px(Context context, float dp) {
@@ -190,17 +203,15 @@ public class UIUtils {
         iconView.setImageResource(imageId);
     }
 
+    public static void setupToolbar(AppCompatActivity activity, Bitmap iconBitmap, String title, boolean showHomeEnabled) {
+        ImageView iconView = setupCustomToolbar(activity, title, showHomeEnabled);
+        iconView.setImageBitmap(iconBitmap);
+    }
+
     private static ImageView setupCustomToolbar(final AppCompatActivity activity, String title, boolean showHomeEnabled) {
         MaterialToolbar toolbar = activity.findViewById(R.id.toolbar);
         if (toolbar == null) {
             return new ImageView(activity);
-        }
-
-        // enabled scrolling app bar only for reading
-        if (activity instanceof Reading) {
-            AppBarLayout.LayoutParams p = (AppBarLayout.LayoutParams) toolbar.getLayoutParams();
-            p.setScrollFlags(SCROLL_FLAG_SCROLL | SCROLL_FLAG_SNAP);
-            toolbar.setLayoutParams(p);
         }
 
         activity.setSupportActionBar(toolbar);
@@ -208,37 +219,40 @@ public class UIUtils {
         activity.getSupportActionBar().setDisplayShowHomeEnabled(false);
 
         ImageView arrowView = activity.findViewById(R.id.toolbar_arrow);
-        arrowView.setVisibility(showHomeEnabled ? View.VISIBLE : View.GONE);
+        boolean showBackArrow = showHomeEnabled || (activity instanceof Reading) || (activity instanceof ItemsList);
+        arrowView.setVisibility(showBackArrow ? View.VISIBLE : View.INVISIBLE);
         TextView titleView = activity.findViewById(R.id.toolbar_text);
         titleView.setText(title);
         ImageView iconView = activity.findViewById(R.id.toolbar_icon);
+        ViewGroup.LayoutParams iconLayoutParams = iconView.getLayoutParams();
+        if (iconLayoutParams instanceof ConstraintLayout.LayoutParams) {
+            ConstraintLayout.LayoutParams params = (ConstraintLayout.LayoutParams) iconLayoutParams;
+            params.horizontalBias = activity instanceof ItemsList ? 0.5f : 0f;
+            iconView.setLayoutParams(params);
+        }
+        View settingsButton = activity.findViewById(R.id.toolbar_settings_button);
+        if (settingsButton != null) {
+            settingsButton.setVisibility(activity instanceof Reading ? View.VISIBLE : View.INVISIBLE);
+        }
         // using a custom view breaks the system-standard ability to tap the icon or title to return
         // to the previous activity. Re-implement that here.
-        arrowView.setOnClickListener(v0 -> activity.finish());
-        titleView.setOnClickListener(v1 -> activity.finish());
-        iconView.setOnClickListener(v12 -> activity.finish());
+        // UIUtils.java lets a tablet's root story list slide the feed list over instead of closing.
+        View.OnClickListener onBack = activity instanceof ItemsList
+                ? v -> ((ItemsList) activity).backToFeedList()
+                : v -> activity.finish();
+        arrowView.setOnClickListener(onBack);
+        titleView.setOnClickListener(onBack);
+        iconView.setOnClickListener(onBack);
         return iconView;
     }
 
     /**
-     * Restart an activity. See http://stackoverflow.com/a/11651252/70795
-     * We post this on the Handler to allow onResume to finish before the activity restarts
-     * and avoid an exception.
+     * Recreate an activity in place so Android can restore fragment and scroll state.
      */
     public static void restartActivity(final Activity activity) {
-        new Handler().post(new Runnable() {
-
-            @Override
-            public void run() {
-                Intent intent = activity.getIntent();
-                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
-                PendingTransitionUtils.overrideNoExitTransition(activity);
-                activity.finish();
-
-                PendingTransitionUtils.overrideNoEnterTransition(activity);
-                activity.startActivity(intent);
-            }
-        });
+        PendingTransitionUtils.overrideNoExitTransition(activity);
+        activity.recreate();
+        PendingTransitionUtils.overrideNoEnterTransition(activity);
     }
 
     public static void startReadingActivity(Context context, FeedSet fs, String startingHash) {
@@ -246,6 +260,16 @@ public class UIUtils {
     }
 
     public static void startReadingActivity(Context context, FeedSet fs, String startingHash, @Nullable ActivityResultLauncher<Intent> readingActivityLauncher) {
+        startReadingActivity(context, fs, startingHash, readingActivityLauncher, isReaderToolbarHidden(context));
+    }
+
+    public static boolean isReaderToolbarHidden(Context context) {
+        // UIUtils.java receives Hilt-wrapped fragment contexts as well as activity contexts.
+        Context activity = FragmentComponentManager.findActivity(context);
+        return activity instanceof Reading && ((Reading) activity).isToolbarHidden();
+    }
+
+    public static void startReadingActivity(Context context, FeedSet fs, String startingHash, @Nullable ActivityResultLauncher<Intent> readingActivityLauncher, boolean toolbarHidden) {
         Class activityClass;
 		if (fs.isAllSaved()) {
             activityClass = SavedStoriesReading.class;
@@ -267,6 +291,14 @@ public class UIUtils {
             activityClass = ReadStoriesReading.class;
         } else if (fs.isInfrequent()) {
             activityClass = InfrequentReading.class;
+        } else if (fs.isWidelyReadStories()) {
+            activityClass = WidelyReadStoriesReading.class;
+        } else if (fs.isLongReads()) {
+            activityClass = LongReadsReading.class;
+        } else if (fs.isGoodReads()) {
+            activityClass = GoodReadsReading.class;
+        } else if (fs.isDailyBriefing()) {
+            activityClass = DailyBriefingReading.class;
         } else {
             Log.e(UIUtils.class.getName(), "can't launch reading activity for unknown feedset type");
             return;
@@ -274,6 +306,13 @@ public class UIUtils {
         Intent i = new Intent(context, activityClass);
         i.putExtra(Reading.EXTRA_FEEDSET, fs);
         i.putExtra(Reading.EXTRA_STORY_HASH, startingHash);
+        i.putExtra(Reading.EXTRA_TOOLBAR_HIDDEN, toolbarHidden);
+        // UIUtils.java: a reader opening in a tablet split's reader pane cuts in and fades its
+        // story in (Reading.kt) instead of rising from the bottom of the pane.
+        Context launchingActivity = FragmentComponentManager.findActivity(context);
+        if (launchingActivity instanceof Activity && StorySplitView.isInSplit((Activity) launchingActivity)) {
+            i.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
+        }
         if (readingActivityLauncher != null) readingActivityLauncher.launch(i);
         else context.startActivity(i);
     }
@@ -360,29 +399,23 @@ public class UIUtils {
     public static void setViewBackground(View v, Drawable background) {
         // due to a framework bug, the below modification of background resource also resets the declared
         // padding on the view.  save a copy of said padding so it can be re-applied after the change.
-        int oldPadL = v.getPaddingLeft();
+        int oldPadStart = v.getPaddingStart();
         int oldPadT = v.getPaddingTop();
-        int oldPadR = v.getPaddingRight();
+        int oldPadEnd = v.getPaddingEnd();
         int oldPadB = v.getPaddingBottom();
 
         v.setBackground(background);
 
-        v.setPadding(oldPadL, oldPadT, oldPadR, oldPadB);
+        v.setPaddingRelative(oldPadStart, oldPadT, oldPadEnd, oldPadB);
     }
 
-    // API 24 introduced a more customizable impl of fromHtml but also *immediately* deprecated the
-    // default version in the same release, so it is necessary to wrap this is plat-specific helper
-    @SuppressWarnings("deprecation")
     public static Spanned fromHtml(String html) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            return Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY);
-        } else {
-            return Html.fromHtml(html);
-        }
+        return Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY);
     }
-    
+
     private static final String POSIT_HILITE_FORMAT = "<span style=\"color: #33AA33\">%s</span>";
     private static final String NEGAT_HILITE_FORMAT = "<span style=\"color: #AA3333\">%s</span>";
+    private static final String SUPER_NEGAT_HILITE_FORMAT = "<span style=\"color: #6B0001\">%s</span>";
 
     /**
      * Alter a story title string to highlight intel training hits as positive or negative based
@@ -393,8 +426,9 @@ public class UIUtils {
         for (Map.Entry<String, Integer> rule : c.title.entrySet()) {
             if (rule.getValue() == Classifier.LIKE) {
                 result = result.replace(rule.getKey(), String.format(POSIT_HILITE_FORMAT, rule.getKey()));
-            }
-            if (rule.getValue() == Classifier.DISLIKE) {
+            } else if (rule.getValue() == Classifier.SUPER_DISLIKE) {
+                result = result.replace(rule.getKey(), String.format(SUPER_NEGAT_HILITE_FORMAT, rule.getKey()));
+            } else if (rule.getValue() == Classifier.DISLIKE) {
                 result = result.replace(rule.getKey(), String.format(NEGAT_HILITE_FORMAT, rule.getKey()));
             }
         }
@@ -416,8 +450,15 @@ public class UIUtils {
             classifier.put(key, Classifier.DISLIKE);
             colourIntelDialogRow(row, classifier, key);
         });
+        row.findViewById(R.id.intel_row_super_dislike).setOnClickListener(v -> {
+            classifier.put(key, Classifier.SUPER_DISLIKE);
+            colourIntelDialogRow(row, classifier, key);
+        });
         row.findViewById(R.id.intel_row_clear).setOnClickListener(v -> {
-            if (Objects.equals(classifier.get(key), Classifier.DISLIKE)) {
+            Integer current = classifier.get(key);
+            if (Integer.valueOf(Classifier.SUPER_DISLIKE).equals(current)) {
+                classifier.put(key, Classifier.CLEAR_SUPER_DISLIKE);
+            } else if (Integer.valueOf(Classifier.DISLIKE).equals(current)) {
                 classifier.put(key, Classifier.CLEAR_DISLIKE);
             } else {
                 classifier.put(key, Classifier.CLEAR_LIKE);
@@ -430,24 +471,149 @@ public class UIUtils {
         if (Integer.valueOf(Classifier.LIKE).equals(classifier.get(key))) {
             row.findViewById(R.id.intel_row_like).setBackgroundResource(R.drawable.ic_thumb_up_green);
             row.findViewById(R.id.intel_row_dislike).setBackgroundResource(R.drawable.ic_thumb_down_yellow);
+            row.findViewById(R.id.intel_row_super_dislike).setBackgroundResource(R.drawable.ic_thumb_down_double_yellow);
             row.findViewById(R.id.intel_row_clear).setBackgroundResource(R.drawable.ic_clear);
-        } else 
-        if (Integer.valueOf(Classifier.DISLIKE).equals(classifier.get(key))) {
+        } else if (Integer.valueOf(Classifier.SUPER_DISLIKE).equals(classifier.get(key))) {
+            row.findViewById(R.id.intel_row_like).setBackgroundResource(R.drawable.ic_thumb_up_yellow);
+            row.findViewById(R.id.intel_row_dislike).setBackgroundResource(R.drawable.ic_thumb_down_yellow);
+            row.findViewById(R.id.intel_row_super_dislike).setBackgroundResource(R.drawable.ic_thumb_down_double_crimson);
+            row.findViewById(R.id.intel_row_clear).setBackgroundResource(R.drawable.ic_clear);
+        } else if (Integer.valueOf(Classifier.DISLIKE).equals(classifier.get(key))) {
             row.findViewById(R.id.intel_row_like).setBackgroundResource(R.drawable.ic_thumb_up_yellow);
             row.findViewById(R.id.intel_row_dislike).setBackgroundResource(R.drawable.ic_thumb_down_red);
+            row.findViewById(R.id.intel_row_super_dislike).setBackgroundResource(R.drawable.ic_thumb_down_double_yellow);
             row.findViewById(R.id.intel_row_clear).setBackgroundResource(R.drawable.ic_clear);
         } else {
             row.findViewById(R.id.intel_row_like).setBackgroundResource(R.drawable.ic_thumb_up_yellow);
             row.findViewById(R.id.intel_row_dislike).setBackgroundResource(R.drawable.ic_thumb_down_yellow);
+            row.findViewById(R.id.intel_row_super_dislike).setBackgroundResource(R.drawable.ic_thumb_down_double_yellow);
             row.findViewById(R.id.intel_row_clear).setBackgroundResource(R.drawable.ic_clear);
         }
     }
 
-    public static void inflateStoryContextMenu(ContextMenu menu, MenuInflater inflater, Context context, FeedSet fs, Story story) {
-        if (PrefsUtils.getStoryOrder(context, fs) == StoryOrder.NEWEST) {
+    /**
+     * Themes and wires up the intel explainer banner, including the info toggle
+     * that expands/collapses the examples section.
+     */
+    public static void setupIntelExplainer(View root, PrefConstants.ThemeValue theme) {
+        View explainer = root.findViewById(R.id.intel_explainer_root);
+        if (explainer == null) return;
+
+        boolean isDark = (theme == PrefConstants.ThemeValue.DARK ||
+                          theme == PrefConstants.ThemeValue.BLACK);
+
+        // Hierarchy pill backgrounds
+        int superBg = isDark ? 0x406B0001 : 0x186B0001;
+        int likeBg = isDark ? 0x4034912E : 0x1834912E;
+        int dislikeBg = isDark ? 0x40A90103 : 0x18A90103;
+        int barBg = isDark ? 0x20FFFFFF : 0x10000000;
+
+        // Text colors
+        int superColor = isDark ? 0xFFFF6B6B : 0xFF6B0001;
+        int likeColor = isDark ? 0xFF7ECE72 : 0xFF34912E;
+        int dislikeColor = isDark ? 0xFFE87272 : 0xFFA90103;
+        int separatorColor = isDark ? 0xFF777777 : 0xFFAAAAAA;
+        int lineColor = isDark ? 0xFF555555 : 0xFFCCCCCC;
+        int headerColor = isDark ? 0xFFCCCCCC : 0xFF555555;
+        int bodyColor = isDark ? 0xFFAAAAAA : 0xFF777777;
+        int dividerColor = isDark ? 0xFF555555 : 0xFFDDDDDD;
+        int infoColor = isDark ? 0xFF777777 : 0xFFBBBBBB;
+
+        float density = root.getResources().getDisplayMetrics().density;
+        float pillRadius = 6f * density;
+        float barRadius = 8f * density;
+
+        // Style the hierarchy bar background
+        View hierarchyBar = root.findViewById(R.id.explainer_hierarchy_bar);
+        stylePill(hierarchyBar, barBg, barRadius);
+
+        // Style the hierarchy pills
+        stylePill(root.findViewById(R.id.explainer_pill_super), superBg, pillRadius);
+        stylePill(root.findViewById(R.id.explainer_pill_like), likeBg, pillRadius);
+        stylePill(root.findViewById(R.id.explainer_pill_dislike), dislikeBg, pillRadius);
+
+        ((TextView) root.findViewById(R.id.explainer_label_super)).setTextColor(superColor);
+        ((TextView) root.findViewById(R.id.explainer_label_like)).setTextColor(likeColor);
+        ((TextView) root.findViewById(R.id.explainer_label_dislike)).setTextColor(dislikeColor);
+
+        // Separator text and lines
+        ((TextView) root.findViewById(R.id.explainer_sep_1)).setTextColor(separatorColor);
+        ((TextView) root.findViewById(R.id.explainer_sep_2)).setTextColor(separatorColor);
+        root.findViewById(R.id.explainer_line_1a).setBackgroundColor(lineColor);
+        root.findViewById(R.id.explainer_line_1b).setBackgroundColor(lineColor);
+        root.findViewById(R.id.explainer_line_2a).setBackgroundColor(lineColor);
+        root.findViewById(R.id.explainer_line_2b).setBackgroundColor(lineColor);
+
+        // Info toggle - entire hierarchy bar and root are clickable
+        TextView infoToggle = root.findViewById(R.id.explainer_info_toggle);
+        infoToggle.setTextColor(infoColor);
+        View examples = root.findViewById(R.id.explainer_examples);
+        View.OnClickListener toggleClick = v -> {
+            if (examples.getVisibility() == View.VISIBLE) {
+                examples.setVisibility(View.GONE);
+            } else {
+                examples.setVisibility(View.VISIBLE);
+            }
+        };
+        explainer.setOnClickListener(toggleClick);
+        hierarchyBar.setClickable(true);
+        hierarchyBar.setOnClickListener(toggleClick);
+
+        // Style the expanded examples section
+        root.findViewById(R.id.explainer_divider).setBackgroundColor(dividerColor);
+
+        ((TextView) root.findViewById(R.id.explainer_example1_header)).setTextColor(headerColor);
+        ((TextView) root.findViewById(R.id.explainer_example2_header)).setTextColor(headerColor);
+        ((TextView) root.findViewById(R.id.explainer_ex1_arrow)).setTextColor(bodyColor);
+        ((TextView) root.findViewById(R.id.explainer_ex2_arrow)).setTextColor(bodyColor);
+        ((TextView) root.findViewById(R.id.explainer_ex1_result)).setTextColor(likeColor);
+        ((TextView) root.findViewById(R.id.explainer_ex2_result)).setTextColor(superColor);
+
+        int iconSize = (int) (12 * density);
+
+        // Example 1 pills: dislike, dislike, like (like wins)
+        styleExamplePill(root.findViewById(R.id.explainer_ex1_pill1), dislikeBg, dislikeColor, pillRadius, R.drawable.ic_thumb_down_red, iconSize);
+        styleExamplePill(root.findViewById(R.id.explainer_ex1_pill2), dislikeBg, dislikeColor, pillRadius, R.drawable.ic_thumb_down_red, iconSize);
+        styleExamplePill(root.findViewById(R.id.explainer_ex1_pill3), likeBg, likeColor, pillRadius, R.drawable.ic_thumb_up_green, iconSize);
+
+        // Example 2 pills: like, like, super dislike (super dislike wins)
+        styleExamplePill(root.findViewById(R.id.explainer_ex2_pill1), likeBg, likeColor, pillRadius, R.drawable.ic_thumb_up_green, iconSize);
+        styleExamplePill(root.findViewById(R.id.explainer_ex2_pill2), likeBg, likeColor, pillRadius, R.drawable.ic_thumb_up_green, iconSize);
+        styleExamplePill(root.findViewById(R.id.explainer_ex2_pill3), superBg, superColor, pillRadius, R.drawable.ic_thumb_down_double_crimson, iconSize);
+    }
+
+    private static void stylePill(View pill, int bgColor, float radius) {
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(radius);
+        bg.setColor(bgColor);
+        pill.setBackground(bg);
+    }
+
+    private static void styleExamplePill(TextView pill, int bgColor, int textColor, float radius, int iconRes, int iconSize) {
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(radius);
+        bg.setColor(bgColor);
+        pill.setBackground(bg);
+        pill.setTextColor(textColor);
+        Drawable icon = pill.getContext().getDrawable(iconRes);
+        if (icon != null) {
+            icon.setBounds(0, 0, iconSize, iconSize);
+            pill.setCompoundDrawablesRelative(null, null, icon, null);
+            pill.setCompoundDrawablePadding((int) (3 * pill.getResources().getDisplayMetrics().density));
+        }
+    }
+
+    public static void inflateStoryContextMenu(Menu menu, MenuInflater inflater, FeedSet fs, Story story, StoryOrder storyOrder) {
+        if (storyOrder == StoryOrder.NEWEST) {
             inflater.inflate(R.menu.context_story_newest, menu);
         } else {
             inflater.inflate(R.menu.context_story_oldest, menu);
+        }
+
+        if ((!fs.isFolder() && !fs.isAllNormal()) || fs.isFilterSaved() || fs.isForWidget()) {
+            menu.removeItem(R.id.menu_go_to_feed);
         }
 
         if (story.starred) {
@@ -471,6 +637,7 @@ public class UIUtils {
 
         if ( fs.isAllRead() ||
              fs.isInfrequent() ||
+             fs.isTrending() ||
              fs.isAllSocial() ||
              fs.isGlobalShared() ||
              fs.isAllSaved() ) {
@@ -494,28 +661,36 @@ public class UIUtils {
         return result;
     }
 
-    public static void handleUri(Context context, Uri uri) {
-        DefaultBrowser defaultBrowser = PrefsUtils.getDefaultBrowser(context);
-        if (defaultBrowser == DefaultBrowser.SYSTEM_DEFAULT) {
-            openSystemDefaultBrowser(context, uri);
-        } else if (defaultBrowser == DefaultBrowser.IN_APP_BROWSER) {
-            openInAppBrowser(context, uri);
-        } else if (defaultBrowser == DefaultBrowser.CHROME) {
-            openExternalBrowserApp(context, uri, "com.android.chrome");
-        } else if (defaultBrowser == DefaultBrowser.FIREFOX) {
-            openExternalBrowserApp(context, uri, "org.mozilla.firefox");
-        } else if (defaultBrowser == DefaultBrowser.OPERA_MINI) {
-            openExternalBrowserApp(context, uri, "com.opera.mini.native");
+    public static boolean handleUri(Context context, PrefsRepo prefsRepo, Uri uri) {
+        Intent briefingIntent = DailyBriefingDeepLink.createLaunchIntent(context, uri);
+        if (briefingIntent != null) {
+            context.startActivity(briefingIntent);
+            return true;
         }
+
+        DefaultBrowser defaultBrowser = prefsRepo.getDefaultBrowser();
+        if (defaultBrowser == DefaultBrowser.SYSTEM_DEFAULT) {
+            return openSystemDefaultBrowser(context, uri);
+        } else if (defaultBrowser == DefaultBrowser.IN_APP_BROWSER) {
+            openInAppBrowser(context, prefsRepo, uri);
+            return true;
+        } else if (defaultBrowser == DefaultBrowser.CHROME) {
+            return openExternalBrowserApp(context, uri, "com.android.chrome");
+        } else if (defaultBrowser == DefaultBrowser.FIREFOX) {
+            return openExternalBrowserApp(context, uri, "org.mozilla.firefox");
+        } else if (defaultBrowser == DefaultBrowser.OPERA_MINI) {
+            return openExternalBrowserApp(context, uri, "com.opera.mini.native");
+        }
+        return false;
     }
 
-    private static void openInAppBrowser(Context context, Uri uri) {
+    private static void openInAppBrowser(Context context, PrefsRepo prefsRepo, Uri uri) {
         int colorPrimary = MaterialColors.getColor(context, androidx.appcompat.R.attr.colorPrimary, ContextCompat.getColor(context, R.color.primary_dark));
         CustomTabColorSchemeParams schemeParams = new CustomTabColorSchemeParams.Builder()
                 .setToolbarColor(colorPrimary)
                 .build();
         CustomTabsIntent customTabsIntent = new CustomTabsIntent.Builder()
-                .setColorScheme(getCustomTabsColorScheme(context))
+                .setColorScheme(getCustomTabsColorScheme(prefsRepo))
                 .setDefaultColorSchemeParams(schemeParams)
                 .setShareState(CustomTabsIntent.SHARE_STATE_ON)
                 .setUrlBarHidingEnabled(false)
@@ -524,26 +699,29 @@ public class UIUtils {
         customTabsIntent.launchUrl(context, uri);
     }
 
-    public static void openSystemDefaultBrowser(Context context, Uri uri) {
+    public static boolean openSystemDefaultBrowser(Context context, Uri uri) {
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW);
             intent.setData(uri);
             context.startActivity(intent);
+            return true;
         } catch (Exception e) {
             com.newsblur.util.Log.e(context.getClass().getName(), "device cannot open URLs");
+            return false;
         }
     }
 
-    public static void openExternalBrowserApp(Context context, Uri uri, String packageName) {
+    public static boolean openExternalBrowserApp(Context context, Uri uri, String packageName) {
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW);
             intent.setData(uri);
             intent.setPackage(packageName);
             context.startActivity(intent);
+            return true;
         } catch (Exception e) {
             com.newsblur.util.Log.e(context.getClass().getName(), "apps not available to open URLs");
             // fallback to system default if apps cannot be opened
-            openSystemDefaultBrowser(context, uri);
+            return openSystemDefaultBrowser(context, uri);
         }
     }
 
@@ -557,8 +735,8 @@ public class UIUtils {
         }
     }
 
-    public static boolean needsSubscriptionAccess(Context context, FeedSet feedSet) {
-        boolean hasSubscription = PrefsUtils.hasSubscription(context);
+    public static boolean needsSubscriptionAccess(FeedSet feedSet, PrefsRepo prefsRepo) {
+        boolean hasSubscription = prefsRepo.hasSubscription();
         boolean requiresSubscription = feedSet.isFolder() || feedSet.isInfrequent() ||
                 feedSet.isAllNormal() || feedSet.isGlobalShared() || feedSet.isSingleSavedTag();
         return !hasSubscription && requiresSubscription;
@@ -569,11 +747,11 @@ public class UIUtils {
         context.startActivity(intent);
     }
 
-    private static int getCustomTabsColorScheme(Context context) {
-        PrefConstants.ThemeValue value = PrefsUtils.getSelectedTheme(context);
+    private static int getCustomTabsColorScheme(PrefsRepo prefsRepo) {
+        PrefConstants.ThemeValue value = prefsRepo.getSelectedTheme();
         if (value == PrefConstants.ThemeValue.DARK || value == PrefConstants.ThemeValue.BLACK) {
             return CustomTabsIntent.COLOR_SCHEME_DARK;
-        } else if (value == PrefConstants.ThemeValue.LIGHT) {
+        } else if (value == PrefConstants.ThemeValue.LIGHT || value == PrefConstants.ThemeValue.SEPIA) {
             return CustomTabsIntent.COLOR_SCHEME_LIGHT;
         } else {
             return CustomTabsIntent.COLOR_SCHEME_SYSTEM;

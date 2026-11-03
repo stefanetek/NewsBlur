@@ -1,0 +1,370 @@
+import datetime
+import hashlib
+import time
+from urllib.parse import urljoin
+
+import requests
+from django.conf import settings
+from lxml import html as lxml_html
+
+from apps.rss_feeds.models import Feed
+from apps.statistics.rscrapingbee import RScrapingBee
+from apps.webfeed.models import MWebFeedConfig
+from apps.webfeed.tasks import decode_response_text, extract_image_url
+from utils import log as logging
+from utils.url_safety import UnsafeUrlError, safe_requests_get, validate_public_url
+
+USER_AGENT = "NewsBlur Web Feed Fetcher (https://newsblur.com)"
+
+# Custom exception code for web feed XPath extraction failure
+WEBFEED_EXCEPTION_CODE = 590
+
+# Responses that mean a bot check challenged this request, not that the page is gone.
+# AbeBooks answers 202 challenge pages to some task server IPs and real pages to others,
+# and in September 2026 proxying every challenged fetch cost ~43K ScrapingBee credits a
+# day for one user's search feeds.
+CHALLENGE_STATUSES = (202, 403, 429, 503)
+# A site that served the feed directly this recently is only challenging some of our
+# IPs, so the next scheduled fetch on another server gets through for free. A site
+# that hasn't answered directly in this long blocks every server and needs the proxy.
+DIRECT_FETCH_MAX_AGE = datetime.timedelta(hours=24)
+
+# Phrases a results page shows when a search legitimately has no items right now. A
+# page carrying one of these is a healthy feed with zero stories, not a broken one:
+# it must not count toward reanalysis or flag exception 590 (very specific rare-book
+# searches sit empty for weeks until a matching listing appears).
+NO_RESULTS_MARKERS = [
+    "no results",
+    "no matches",
+    "no exact matches",
+    "0 results",
+    "nothing found",
+    "did not match any",
+]
+
+
+class WebFeedFetcher:
+    """Fetches HTML from a website and extracts stories using stored XPath expressions."""
+
+    def __init__(self, feed):
+        self.feed = feed
+        self.url = feed.feed_address[len("webfeed:") :]
+        self.config = MWebFeedConfig.get_config(feed.pk)
+        # Set by _fetch_html when a fetch is skipped without failing: a bot challenge on a
+        # site other servers still reach, or a host over its daily proxy credit cap.
+        self.skip_reason = None
+
+    def fetch(self):
+        """Main entry point. Returns a feedparser-compatible dict or None on failure."""
+        if not self.config:
+            logging.debug(
+                "   ***> [%-30s] ~FRWeb Feed: No config found for feed %s"
+                % (self.feed.log_title[:30], self.feed.pk)
+            )
+            return None
+
+        start = time.time()
+        logging.debug("   ---> [%-30s] ~FYWeb Feed: Fetching ~SB%s~SN" % (self.feed.log_title[:30], self.url))
+
+        page_html = self._fetch_html()
+        if not page_html and self.skip_reason:
+            # Not a failure: nothing is recorded, so this can't trip reanalysis, and the
+            # feed simply waits for its next scheduled fetch.
+            logging.debug(
+                "   ---> [%-30s] ~FYWeb Feed: skipping this fetch (%s): ~SB%s~SN"
+                % (self.feed.log_title[:30], self.skip_reason, self.url)
+            )
+            return None
+        if not page_html:
+            self.config.record_failure()
+            if self.config.needs_reanalysis:
+                self.feed.has_feed_exception = True
+                self.feed.exception_code = WEBFEED_EXCEPTION_CODE
+                self.feed.save()
+            return None
+
+        stories = self._extract_stories(page_html)
+
+        if not stories:
+            if self._page_shows_no_results(page_html):
+                logging.debug(
+                    "   ---> [%-30s] ~FYWeb Feed: search has no current results, healthy but empty"
+                    % (self.feed.log_title[:30],)
+                )
+                self.config.record_success()
+                self._clear_webfeed_exception()
+                return None
+
+            self.config.record_failure()
+            logging.debug(
+                "   ***> [%-30s] ~FRWeb Feed: 0 stories extracted (failure %d)"
+                % (self.feed.log_title[:30], self.config.consecutive_failures)
+            )
+            if self.config.needs_reanalysis:
+                self.feed.has_feed_exception = True
+                self.feed.exception_code = WEBFEED_EXCEPTION_CODE
+                self.feed.save()
+            return None
+
+        self.config.record_success()
+        self._clear_webfeed_exception()
+
+        fpf = self._to_feedparser_format(stories)
+
+        logging.debug(
+            "   ---> [%-30s] ~FGWeb Feed: Extracted ~SB%s~SN stories in ~SB%.2fs~SN"
+            % (self.feed.log_title[:30], len(stories), time.time() - start)
+        )
+
+        return fpf
+
+    def _page_shows_no_results(self, html_text):
+        """True when the page says the search matched nothing right now."""
+        lowered = html_text.lower()
+        return any(marker in lowered for marker in NO_RESULTS_MARKERS)
+
+    def _clear_webfeed_exception(self):
+        """Clear a previous extraction-failure exception after a healthy fetch."""
+        if self.feed.has_feed_exception and self.feed.exception_code == WEBFEED_EXCEPTION_CODE:
+            self.feed.has_feed_exception = False
+            self.feed.exception_code = 0
+            self.feed.save()
+
+    def _fetch_html(self):
+        """Fetch page HTML with proxy fallbacks for forbidden feeds."""
+        headers = {"User-Agent": USER_AGENT}
+        try:
+            validate_public_url(self.url)
+        except UnsafeUrlError:
+            return None
+
+        # Try direct fetch first
+        try:
+            response = safe_requests_get(self.url, headers=headers, timeout=15, allow_redirects=True)
+            text = decode_response_text(response)
+            if response.status_code == 200 and text:
+                # Persisted by record_success / record_failure in fetch()
+                self.config.last_direct_fetch = datetime.datetime.utcnow()
+                return text
+            if response.status_code in CHALLENGE_STATUSES and self._recently_fetched_directly():
+                self.skip_reason = (
+                    "bot challenge (%s) on a site other servers still reach" % response.status_code
+                )
+                return None
+        except requests.RequestException:
+            pass
+
+        # One host can't spend more than its share of the ScrapingBee plan in a day
+        if RScrapingBee.host_over_budget(self.url):
+            RScrapingBee.record_capped("webfeed", url=self.url)
+            self.skip_reason = "host is over its daily proxy credit cap"
+            return None
+
+        # Fallback to ScrapingBee
+        if getattr(settings, "SCRAPINGBEE_API_KEY", None):
+            try:
+                response = requests.get(
+                    "https://app.scrapingbee.com/api/v1",
+                    params={
+                        "api_key": settings.SCRAPINGBEE_API_KEY,
+                        "url": self.url,
+                        "render_js": "false",
+                        "return_page_source": "true",
+                    },
+                    timeout=15,
+                )
+                RScrapingBee.record_response("webfeed", response, url=self.url)
+                text = decode_response_text(response)
+                if response.status_code == 200 and text:
+                    return text
+            except requests.RequestException:
+                RScrapingBee.record("webfeed", None, url=self.url)
+
+        # Fallback to ScrapeNinja
+        if getattr(settings, "SCRAPENINJA_API_KEY", None):
+            try:
+                response = requests.post(
+                    "https://scrapeninja.p.rapidapi.com/scrape",
+                    headers={
+                        "X-RapidAPI-Key": settings.SCRAPENINJA_API_KEY,
+                        "X-RapidAPI-Host": "scrapeninja.p.rapidapi.com",
+                        "Content-Type": "application/json",
+                    },
+                    json={"url": self.url},
+                    timeout=15,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("body"):
+                        return data["body"]
+            except requests.RequestException:
+                pass
+
+        logging.debug(
+            "   ***> [%-30s] ~FRWeb Feed: All fetch methods failed for ~SB%s~SN"
+            % (self.feed.log_title[:30], self.url)
+        )
+        return None
+
+    def _recently_fetched_directly(self):
+        """True when the site served this feed to a task server without a proxy recently."""
+        last_direct_fetch = self.config.last_direct_fetch if self.config else None
+        if not last_direct_fetch:
+            return False
+        return datetime.datetime.utcnow() - last_direct_fetch < DIRECT_FETCH_MAX_AGE
+
+    def _extract_stories(self, html_text):
+        """Apply stored XPaths to HTML and extract story dicts."""
+        try:
+            doc = lxml_html.fromstring(html_text)
+        except Exception:
+            return []
+
+        stories = []
+        seen_keys = set()
+        try:
+            containers = doc.xpath(self.config.story_container_xpath)
+        except Exception:
+            return []
+
+        for container in containers:
+            story = {}
+
+            # Title
+            try:
+                titles = container.xpath(self.config.title_xpath)
+                story["title"] = titles[0].strip() if titles else None
+            except Exception:
+                story["title"] = None
+
+            # Link
+            try:
+                links = container.xpath(self.config.link_xpath)
+                link = links[0].strip() if links else None
+                if link and not link.startswith("http"):
+                    link = urljoin(self.url, link)
+                story["link"] = link
+            except Exception:
+                story["link"] = None
+
+            # Content
+            if self.config.content_xpath:
+                try:
+                    contents = container.xpath(self.config.content_xpath)
+                    story["content"] = contents[0].strip() if contents else ""
+                except Exception:
+                    story["content"] = ""
+            else:
+                story["content"] = ""
+
+            # Image
+            if self.config.image_xpath:
+                try:
+                    images = container.xpath(self.config.image_xpath)
+                    img_src = images[0].strip() if images else ""
+                    img_src = extract_image_url(img_src) or ""
+                    if img_src and not img_src.startswith("http"):
+                        img_src = urljoin(self.url, img_src)
+                    story["image"] = img_src
+                except Exception:
+                    story["image"] = ""
+            else:
+                story["image"] = ""
+
+            # Author
+            if self.config.author_xpath:
+                try:
+                    authors = container.xpath(self.config.author_xpath)
+                    story["author"] = authors[0].strip() if authors else ""
+                except Exception:
+                    story["author"] = ""
+            else:
+                story["author"] = ""
+
+            # Date
+            if self.config.date_xpath:
+                try:
+                    dates = container.xpath(self.config.date_xpath)
+                    story["date_string"] = dates[0].strip() if dates else ""
+                except Exception:
+                    story["date_string"] = ""
+            else:
+                story["date_string"] = ""
+
+            # Generate GUID
+            story["guid"] = self._generate_guid(story.get("link"), story.get("title"))
+
+            if story.get("title") or story.get("link"):
+                dedup_key = (story.get("title", ""), story.get("link", ""))
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+                stories.append(story)
+
+        return stories
+
+    def _generate_guid(self, permalink, title):
+        """Generate a stable GUID for a web-scraped story."""
+        if permalink:
+            normalized = permalink.rstrip("/").lower()
+            return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+        if title:
+            key = f"{self.feed.pk}:{title.strip().lower()}"
+            return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        return hashlib.sha256(str(time.time()).encode("utf-8")).hexdigest()[:32]
+
+    def _to_feedparser_format(self, stories):
+        """Build a feedparser-compatible result dict from extracted stories."""
+        entries = []
+        for story in stories:
+            summary = story.get("content", "")
+            image_url = story.get("image", "")
+            if image_url:
+                img_tag = f'<img src="{image_url}" />'
+                summary = img_tag + summary if summary else img_tag
+            entry = {
+                "title": story.get("title", ""),
+                "link": story.get("link") or self.url,
+                "guid": story.get("guid", ""),
+                "summary": summary,
+                "author": story.get("author", ""),
+            }
+            entries.append(entry)
+
+        # Build a minimal feedparser-like object
+        fpf = FeedParserResult(
+            entries=entries,
+            feed_title=self.feed.feed_title,
+            feed_link=self.url,
+            encoding="utf-8",
+        )
+
+        return fpf
+
+
+class FeedParserResult:
+    """Minimal feedparser-compatible result object for web feed extraction."""
+
+    def __init__(self, entries, feed_title, feed_link, encoding="utf-8"):
+        self.entries = entries
+        self.encoding = encoding
+        self.headers = {}
+        self.feed = FeedParserFeed(feed_title, feed_link)
+        self.bozo = 0
+        self.status = 200
+        self.etag = None
+        self.modified = None
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+class FeedParserFeed:
+    """Minimal feedparser feed metadata object."""
+
+    def __init__(self, title, link):
+        self.title = title
+        self.link = link
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)

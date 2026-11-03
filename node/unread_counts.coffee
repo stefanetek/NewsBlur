@@ -2,6 +2,9 @@ fs     = require 'fs'
 redis  = require 'redis'
 log    = require './log.js'
 ask_ai = require './ask_ai.js'
+archive_assistant = require './archive_assistant.js'
+webfeed = require './webfeed.js'
+briefing = require './briefing.js'
 
 unread_counts = (server) =>
     ENV_DEV = process.env.NODE_ENV == 'development' or process.env.NODE_ENV == 'debug'
@@ -174,6 +177,28 @@ unread_counts = (server) =>
                         return
                     else
                         log.debug username, "Ask AI handler returned false"
+
+                # Route briefing messages to dedicated handler
+                if message.startsWith?('briefing:')
+                    log.debug username, "Routing to briefing handler"
+                    handled = briefing.handle_briefing_message(socket, channel, message)
+                    if handled
+                        log.debug username, "Briefing handler processed message"
+                        return
+
+                # Route archive_assistant messages to dedicated handler
+                if message.startsWith?('archive_assistant:')
+                    log.debug username, "Routing to archive_assistant handler"
+                    handled = archive_assistant.handle_archive_assistant_message(socket, channel, message)
+                    if handled
+                        log.debug username, "Archive Assistant handler processed message"
+                        return
+
+                # Route webfeed messages to dedicated handler
+                if message.startsWith?('webfeed:')
+                    handled = webfeed.handle_webfeed_message(socket, channel, message)
+                    if handled
+                        return
 
                 # Handle standard feed/user update messages
                 event_name = 'feed:update'

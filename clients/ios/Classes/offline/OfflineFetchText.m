@@ -42,12 +42,12 @@
         [pendingTextDictionaries count] == 0) {
         NSLog(@"Finished caching text. %ld total", (long)self.appDelegate.totalUncachedTextCount);
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.isCancelled || self.appDelegate.clearingOfflineCache) return;
             if ([[NSUserDefaults standardUserDefaults] boolForKey:@"offline_image_download"]) {
                 [self.appDelegate.feedsViewController showCachingNotifier:@"Images" progress:0 hoursBack:1];
                 [self.appDelegate startOfflineFetchImages];
             } else {
                 [self.appDelegate.feedsViewController showDoneNotifier];
-                [self.appDelegate.feedsViewController hideNotifier];
                 [self.appDelegate finishBackground];
             }
         });
@@ -56,8 +56,8 @@
     
     if (![self.appDelegate isReachableForOffline]) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.isCancelled || self.appDelegate.clearingOfflineCache) return;
             [self.appDelegate.feedsViewController showDoneNotifier];
-            [self.appDelegate.feedsViewController hideNotifier];
         });
         return NO;
     }
@@ -65,7 +65,7 @@
     NSString *urlString = [NSString stringWithFormat:@"%@/rss_feeds/original_text", self.appDelegate.url];
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
     AFHTTPSessionManager *manager = [[AFHTTPSessionManager alloc] initWithSessionConfiguration:configuration];
-    manager.completionQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0);
+    manager.completionQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
     
     dispatch_group_t group = dispatch_group_create();
     
@@ -173,27 +173,26 @@
     
     NSDictionary *textDictionary = @{@"text" : text};
     
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW,
-                                             (unsigned long)NULL), ^{
-        [self storeTextDictionary:textDictionary forStoryHash:storyHash];
-        
-        if ([[[NSUserDefaults standardUserDefaults] objectForKey:@"default_order"] isEqualToString:@"oldest"]) {
-            if (storyTimestamp > self.appDelegate.latestCachedTextDate) {
-                self.appDelegate.latestCachedTextDate = storyTimestamp;
-            }
-        } else {
-            if (!self.appDelegate.latestCachedTextDate || storyTimestamp < self.appDelegate.latestCachedTextDate) {
-                self.appDelegate.latestCachedTextDate = storyTimestamp;
-            }
+    [self storeTextDictionary:textDictionary forStoryHash:storyHash];
+    if (self.isCancelled || self.appDelegate.clearingOfflineCache) return;
+
+    if ([[[NSUserDefaults standardUserDefaults] objectForKey:@"default_order"] isEqualToString:@"oldest"]) {
+        if (storyTimestamp > self.appDelegate.latestCachedTextDate) {
+            self.appDelegate.latestCachedTextDate = storyTimestamp;
         }
-        
-        @synchronized (self) {
-            self.appDelegate.remainingUncachedTextCount--;
-            if (self.appDelegate.remainingUncachedTextCount % 10 == 0) {
-                [self updateProgress];
-            }
+    } else {
+        if (!self.appDelegate.latestCachedTextDate || storyTimestamp < self.appDelegate.latestCachedTextDate) {
+            self.appDelegate.latestCachedTextDate = storyTimestamp;
         }
-    });
+    }
+
+    @synchronized (self) {
+        self.appDelegate.remainingUncachedTextCount--;
+        if (self.appDelegate.remainingUncachedTextCount % 10 == 0) {
+            [self updateProgress];
+        }
+    }
+
 }
 
 - (void)storeFailedTextForStoryHash:(NSString *)storyHash {
@@ -204,6 +203,7 @@
 
 - (void)storeTextDictionary:(NSDictionary *)textDictionary forStoryHash:(NSString *)storyHash {
     [self.appDelegate.database inDatabase:^(FMDatabase *db) {
+        if (self.isCancelled || self.appDelegate.clearingOfflineCache) return;
         [db executeUpdate:@"UPDATE cached_text SET text_json = ? WHERE story_hash = ?",
          [textDictionary JSONRepresentation],
          storyHash];

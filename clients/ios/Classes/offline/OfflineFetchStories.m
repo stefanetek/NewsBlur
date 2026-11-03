@@ -41,8 +41,8 @@
     if (!offlineAllowed ||
         ![self.appDelegate isReachableForOffline]) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.isCancelled || self.appDelegate.clearingOfflineCache) return;
             [self.appDelegate.feedsViewController showDoneNotifier];
-            [self.appDelegate.feedsViewController hideNotifier];
         });
         return NO;
     }
@@ -52,6 +52,7 @@
     if ([hashes count] == 0) {
 //        NSLog(@"Finished downloading unread stories. %d total", appDelegate.totalUnfetchedStoryCount);
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.isCancelled || self.appDelegate.clearingOfflineCache) return;
 //            [UIApplication sharedApplication].networkActivityIndicatorVisible = NO;
             
             if ([[NSUserDefaults standardUserDefaults] boolForKey:@"offline_text_download"]) {
@@ -62,7 +63,6 @@
                 [self.appDelegate startOfflineFetchImages];
             } else {
                 [self.appDelegate.feedsViewController showDoneNotifier];
-                [self.appDelegate.feedsViewController hideNotifier];
                 [self.appDelegate finishBackground];
             }
         });
@@ -76,7 +76,7 @@
                            self.appDelegate.url, [hashes componentsJoinedByString:@"&h="]];
     AFHTTPSessionManager *manager = [AFHTTPSessionManager manager];
     manager.responseSerializer = [AFJSONResponseSerializer serializer];
-    manager.completionQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0);
+    manager.completionQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
     
     [manager GET:urlString parameters:nil progress:nil success:^(NSURLSessionDataTask * _Nonnull task, id  _Nullable responseObject) {
         [self storeAllUnreadStories:responseObject withHashes:hashes];
@@ -90,7 +90,11 @@
 //        [UIApplication sharedApplication].networkActivityIndicatorVisible = YES;
 //    });
     
-    [lock waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:30]];
+    BOOL completed = [lock waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:30]];
+    if (!completed) {
+        [self cancel];
+        [manager invalidateSessionCancelingTasks:YES];
+    }
     [lock unlock];
     
     return YES;
@@ -163,7 +167,7 @@
 
     [self.appDelegate.database inDatabase:^(FMDatabase *db) {
         __strong __typeof(&*weakSelf)strongSelf = weakSelf;
-        if (!strongSelf) return;
+        if (!strongSelf || self.isCancelled || self.appDelegate.clearingOfflineCache) return;
         BOOL anyInserted = NO;
         for (NSDictionary *story in [results objectForKey:@"stories"]) {
             id storyFeedId = [story objectForKey:@"story_feed_id"];
@@ -238,7 +242,7 @@
         }
     }];
     
-    [self.appDelegate storeUserProfiles:[results objectForKey:@"user_profiles"]];
+    if (!self.isCancelled) [self.appDelegate storeUserProfiles:[results objectForKey:@"user_profiles"]];
 }
 
 

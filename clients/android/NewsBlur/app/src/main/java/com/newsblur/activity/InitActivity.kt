@@ -5,12 +5,15 @@ import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
+import com.newsblur.NbApplication
 import com.newsblur.database.BlurDatabaseHelper
-import com.newsblur.service.NBSyncService
+import com.newsblur.preference.PrefsRepo
 import com.newsblur.service.SubscriptionSyncService
+import com.newsblur.service.SyncServiceState
+import com.newsblur.util.DailyBriefingDeepLink
+import com.newsblur.util.LanguageSettings
 import com.newsblur.util.Log
 import com.newsblur.util.NotificationUtils
-import com.newsblur.util.PrefsUtils
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -24,13 +27,22 @@ import javax.inject.Inject
  */
 @AndroidEntryPoint
 class InitActivity : AppCompatActivity() {
-
     @Inject
     lateinit var dbHelper: BlurDatabaseHelper
+
+    @Inject
+    lateinit var prefsRepo: PrefsRepo
+
+    @Inject
+    lateinit var syncServiceState: SyncServiceState
+
+    @Inject lateinit var onboarding: com.newsblur.onboarding.OnboardingGate
 
     override fun onCreate(savedInstanceState: Bundle?) {
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        // AppCompat has restored its stored locale by now, so InitActivity.kt can line it up with the language pref.
+        LanguageSettings.reconcile(this)
 
         // Keep the splash screen visible for this Activity
         splashScreen.setKeepOnScreenCondition { true }
@@ -45,33 +57,49 @@ class InitActivity : AppCompatActivity() {
                 userAuthCheck()
             }
         }
-        Log.i(this, "cold launching version " + PrefsUtils.getVersion(this))
+        Log.i(this, "cold launching version " + NbApplication.getVersion(this))
     }
 
     // see if a user is already logged in; if so, jump to the Main activity
-    private fun userAuthCheck() {
-        if (PrefsUtils.hasCookie(this)) {
+    private suspend fun userAuthCheck() {
+        val briefingIntent = DailyBriefingDeepLink.createLaunchIntent(this, intent?.data)
+        if (prefsRepo.hasCookie()) {
             SubscriptionSyncService.schedule(this)
-            val mainIntent = Intent(this, Main::class.java)
-            startActivity(mainIntent)
+            val destination =
+                if (briefingIntent == null &&
+                    onboarding.shouldOpen()
+                ) {
+                    Intent(this, OnboardingActivity::class.java).putExtra("initial_setup", true)
+                } else {
+                    briefingIntent
+                        ?: Intent(this, Main::class.java)
+                }
+            startActivity(destination)
         } else {
-            val loginIntent = Intent(this, Login::class.java)
-            startActivity(loginIntent)
+            val loginActivityIntent =
+                Intent(this, LoginActivity::class.java).apply {
+                    if (briefingIntent != null) {
+                        action = intent?.action
+                        data = intent?.data
+                    }
+                }
+            startActivity(loginActivityIntent)
         }
+        finish()
     }
 
     // now before there is any chance at all of an activity hitting the DB and crashing when it
     // cannot find new tables or columns right after an app upgrade, check to see if the DB
     // needs an upgrade
     private fun upgradeCheck() {
-        val upgrade = PrefsUtils.checkForUpgrade(this)
+        val upgrade = prefsRepo.checkForUpgrade(this)
         if (upgrade) {
             dbHelper.dropAndRecreateTables()
             // don't actually unset the upgrade flag, the sync service will do this same check and
             // update everything
 
             // force full sync after recreating tables
-            NBSyncService.forceFeedsFolders()
+            syncServiceState.forceFeedsFolders()
         }
     }
 }

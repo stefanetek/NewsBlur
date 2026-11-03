@@ -31,9 +31,8 @@
 
 - (void)viewDidLoad {
     appDelegate = [NewsBlurAppDelegate sharedAppDelegate];
-
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(doCancelButton)];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Add Site" style:UIBarButtonItemStyleDone target:self action:@selector(addSite)];
+    self.navigationItem.leftBarButtonItem = nil;
+    self.navigationItem.rightBarButtonItem = nil;
     
     UIView *folderPadding = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 24, 16)];
     UIImageView *folderImage = [[UIImageView alloc]
@@ -82,6 +81,9 @@
     [self.addingLabel setHidden:YES];
     [self.activityIndicator stopAnimating];
     
+    if (self.navigationController) {
+        self.navigationController.navigationBarHidden = YES;
+    }
     self.view.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
     self.siteTable.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);
     // eliminate extra separators at bottom of site table (e.g., while animating)
@@ -129,11 +131,7 @@
 }
 
 - (IBAction)doCancelButton {
-    if (!self.isPhone) {
-        [appDelegate hidePopover];
-    } else {
-        [appDelegate hidePopoverAnimated:YES];
-    }
+    [self dismissAddSiteDialog];
 }
 
 - (IBAction)doAddButton {
@@ -271,11 +269,7 @@
             [self.errorLabel setText:[responseObject valueForKey:@"message"]];
             [self.errorLabel setHidden:NO];
         } else {
-            if (!self.isPhone) {
-                [self->appDelegate hidePopover];
-            } else {
-                [self->appDelegate hidePopoverAnimated:YES];
-            }
+            [self dismissAddSiteDialog];
             [self->appDelegate reloadFeedsView:NO];
         }
         
@@ -290,6 +284,20 @@
         [self preferredContentSize];
         
     }];
+}
+
+- (void)dismissAddSiteDialog {
+    UIViewController *presenter = self.navigationController ?: self;
+    if (presenter.presentingViewController) {
+        [presenter dismissViewControllerAnimated:YES completion:nil];
+        return;
+    }
+
+    if (!self.isPhone) {
+        [appDelegate hidePopover];
+    } else {
+        [appDelegate hidePopoverAnimated:YES];
+    }
 }
 
 - (NSString *)extractParentFolder {
@@ -343,17 +351,21 @@
                        @"widget_stories",
                        @"river_blurblogs",
                        @"river_global",
+                       @"trending:well_read",
+                       @"trending:long_reads",
+                       @"trending:good_reads",
+                       @"dashboard",
                        @"infrequent",
                        @"everything"]);
 }
 
 - (void)showFolderMenu {
     MenuViewController *viewController = [MenuViewController new];
-    viewController.title = @"Add To";
+    viewController.title = [NBLocalization text:@"Add To"];
     
     __weak __typeof(&*self)weakSelf = self;
     
-    [viewController addTitle:@"Top Level" iconName:@"menu_icn_all.png" selectionShouldDismiss:NO handler:^{
+    [viewController addTitle:[NBLocalization text:@"Top Level"] iconName:@"menu_icn_all.png" selectionShouldDismiss:NO handler:^{
         weakSelf.inFolderInput.text = @"— Top Level —";
         [self.navigationController popViewControllerAnimated:YES];
     }];
@@ -415,9 +427,6 @@
     
     NSDictionary *result = [self.autocompleteResults objectAtIndex:indexPath.row];
     int subs = [[result objectForKey:@"num_subscribers"] intValue];
-    NSNumberFormatter *numberFormatter = [[NSNumberFormatter alloc] init];
-    [numberFormatter setPositiveFormat:@"#,###"];
-    NSNumber *theScore = [NSNumber numberWithInt:subs];
     NSString *favicon = [result objectForKey:@"favicon"];
     UIImage *faviconImage;
     if ((NSNull *)favicon != [NSNull null] && [favicon length] > 0) {
@@ -431,8 +440,8 @@
     cell.feedTitle.textColor = UIColorFromRGB(NEWSBLUR_BLACK_COLOR);
     cell.feedUrl.text = [result objectForKey:@"value"];
     cell.feedUrl.textColor = UIColorFromLightDarkRGB(NEWSBLUR_LINK_COLOR, 0x3B7CC5);
-    cell.feedSubs.text = [NSString stringWithFormat:@"%@ subscriber%@",
-                           [NSString stringWithFormat:@"%@", [numberFormatter stringFromNumber:theScore]], subs == 1 ? @"" : @"s"];
+    // AddSiteViewController.m uses the language's plural rules instead of appending an English "s".
+    cell.feedSubs.text = [NBLocalization plural:@"%@ subscribers" groupedCount:subs];
     cell.feedSubs.textColor = UIColorFromRGB(0x808080);
     cell.feedFavicon.image = faviconImage;
     cell.backgroundColor = UIColorFromRGB(NEWSBLUR_WHITE_COLOR);

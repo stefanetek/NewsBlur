@@ -2,7 +2,6 @@ package com.newsblur.database;
 
 import java.util.List;
 
-import android.text.TextUtils;
 import android.provider.BaseColumns;
 
 import com.google.gson.Gson;
@@ -25,6 +24,8 @@ public class DatabaseConstants {
 
 	public static final String FOLDER_TABLE = "folders";
 	public static final String FOLDER_NAME = "folder_name";
+    public static final String FOLDER_KEY = "folder_key";
+    public static final String FOLDER_PATH = "folder_path";
 	public static final String FOLDER_PARENT_NAMES = "folder_parent_names";
 	public static final String FOLDER_CHILDREN_NAMES = "folder_children_names";
 	public static final String FOLDER_FEED_IDS = "folder_feedids";
@@ -101,6 +102,7 @@ public class DatabaseConstants {
 	public static final String STORY_SOURCE_USER_ID = "sourceUserId";
 	public static final String STORY_TAGS = "tags";
 	public static final String STORY_USER_TAGS = "user_tags";
+	public static final String STORY_HIGHLIGHTS = "highlights";
     public static final String STORY_HASH = "story_hash";
     public static final String STORY_IMAGE_URLS = "image_urls";
     public static final String STORY_LAST_READ_DATE = "last_read_date";
@@ -108,6 +110,7 @@ public class DatabaseConstants {
     public static final String STORY_THUMBNAIL_URL = "thumbnail_url";
     public static final String STORY_INFREQUENT = "infrequent";
     public static final String STORY_HAS_MODIFICATIONS = "has_modifications";
+    public static final String STORY_CLUSTER_STORIES = "cluster_stories";
 
     public static final String READING_SESSION_TABLE = "reading_session";
     public static final String READING_SESSION_STORY_HASH = "session_story_hash";
@@ -172,8 +175,18 @@ public class DatabaseConstants {
     public static final String SYNC_METADATA_KEY = "key";
     public static final String SYNC_METADATA_VALUE = "value";
 
+    public static final String CUSTOM_ICON_TABLE = "custom_icons";
+    public static final String CUSTOM_ICON_ID = "icon_id";           // folder name or feed ID
+    public static final String CUSTOM_ICON_IS_FEED = "is_feed";      // 1 for feed, 0 for folder
+    public static final String CUSTOM_ICON_TYPE = "icon_type";       // preset, emoji, upload, none
+    public static final String CUSTOM_ICON_DATA = "icon_data";       // icon name, emoji, or base64
+    public static final String CUSTOM_ICON_COLOR = "icon_color";     // hex color
+    public static final String CUSTOM_ICON_SET = "icon_set";         // lucide or heroicons-solid
+
 	static final String FOLDER_SQL = "CREATE TABLE " + FOLDER_TABLE + " (" +
-		FOLDER_NAME + TEXT + " PRIMARY KEY, " +  
+        FOLDER_KEY + TEXT + " PRIMARY KEY, " +
+        FOLDER_PATH + TEXT + ", " +
+        FOLDER_NAME + TEXT + ", " +
         FOLDER_PARENT_NAMES + TEXT + ", " +
         FOLDER_CHILDREN_NAMES + TEXT + ", " +
         FOLDER_FEED_IDS + TEXT +
@@ -263,8 +276,9 @@ public class DatabaseConstants {
 		STORY_SHARED_USER_IDS + TEXT + ", " +
 		STORY_FRIEND_USER_IDS + TEXT + ", " +
 		STORY_TAGS + TEXT + ", " +
+		STORY_HIGHLIGHTS + TEXT + ", " +
 		STORY_USER_TAGS + TEXT + ", " +
-		STORY_PERMALINK + TEXT + ", " + 
+		STORY_PERMALINK + TEXT + ", " +
 		STORY_READ + INTEGER + ", " +
 		STORY_STARRED + INTEGER + ", " +
 		STORY_STARRED_DATE + INTEGER + ", " +
@@ -274,7 +288,8 @@ public class DatabaseConstants {
         STORY_LAST_READ_DATE + INTEGER + ", " +
         STORY_SEARCH_HIT + TEXT + ", " +
         STORY_THUMBNAIL_URL + TEXT + ", " +
-        STORY_HAS_MODIFICATIONS + INTEGER +
+        STORY_HAS_MODIFICATIONS + INTEGER + ", " +
+        STORY_CLUSTER_STORIES + TEXT +
         ")";
 
     static final String READING_SESSION_SQL = "CREATE TABLE " + READING_SESSION_TABLE + " (" +
@@ -340,17 +355,27 @@ public class DatabaseConstants {
         SYNC_METADATA_VALUE + TEXT +
         ")";
 
+    static final String CUSTOM_ICON_SQL = "CREATE TABLE IF NOT EXISTS " + CUSTOM_ICON_TABLE + " (" +
+        CUSTOM_ICON_ID + TEXT + ", " +
+        CUSTOM_ICON_IS_FEED + INTEGER + ", " +
+        CUSTOM_ICON_TYPE + TEXT + ", " +
+        CUSTOM_ICON_DATA + TEXT + ", " +
+        CUSTOM_ICON_COLOR + TEXT + ", " +
+        CUSTOM_ICON_SET + TEXT + ", " +
+        "PRIMARY KEY (" + CUSTOM_ICON_ID + ", " + CUSTOM_ICON_IS_FEED + ")" +
+        ")";
+
 	private static final String[] BASE_STORY_COLUMNS = {
 		STORY_AUTHORS, STORY_SHORT_CONTENT, STORY_TIMESTAMP, STORY_SHARED_DATE,
         STORY_TABLE + "." + STORY_FEED_ID, STORY_TABLE + "." + STORY_ID,
         STORY_INTELLIGENCE_AUTHORS, STORY_INTELLIGENCE_FEED, STORY_INTELLIGENCE_TAGS, STORY_INTELLIGENCE_TOTAL,
-        STORY_INTELLIGENCE_TITLE, STORY_PERMALINK, STORY_READ, STORY_STARRED, STORY_STARRED_DATE, STORY_TAGS, STORY_USER_TAGS, STORY_TITLE,
+        STORY_INTELLIGENCE_TITLE, STORY_PERMALINK, STORY_READ, STORY_STARRED, STORY_STARRED_DATE, STORY_TAGS, STORY_HIGHLIGHTS, STORY_USER_TAGS, STORY_TITLE,
         STORY_SOCIAL_USER_ID, STORY_SOURCE_USER_ID, STORY_SHARED_USER_IDS, STORY_FRIEND_USER_IDS, STORY_HASH,
-        STORY_LAST_READ_DATE, STORY_THUMBNAIL_URL, STORY_HAS_MODIFICATIONS,
+        STORY_LAST_READ_DATE, STORY_THUMBNAIL_URL, STORY_HAS_MODIFICATIONS, STORY_CLUSTER_STORIES,
 	};
 
     private static final String STORY_COLUMNS = 
-        TextUtils.join(",", BASE_STORY_COLUMNS) + ", " + 
+        String.join(",", BASE_STORY_COLUMNS) + ", " + 
         FEED_TITLE + ", " + FEED_FAVICON_URL + ", " + FEED_FAVICON_COLOR + ", " + FEED_FAVICON_BORDER + ", " + FEED_FAVICON_FADE + ", " + FEED_FAVICON_TEXT;
 
 	public static final String STORY_QUERY_BASE_0 =
@@ -370,13 +395,34 @@ public class DatabaseConstants {
     public static final String STORY_QUERY_BASE_2 =
         " GROUP BY " + STORY_HASH;
 
-    public static final String SESSION_STORY_QUERY_BASE = 
-        STORY_QUERY_BASE_1 +
+    private static final String SESSION_STORY_SELECTION =
         STORY_HASH + " IN (" +
         " SELECT DISTINCT " + READING_SESSION_STORY_HASH +
         " FROM " + READING_SESSION_TABLE +
         ")" + 
         STORY_QUERY_BASE_2;
+
+    public static final String SESSION_STORY_QUERY_BASE = STORY_QUERY_BASE_1 + SESSION_STORY_SELECTION;
+
+    // FeedItemsList.kt previews have stories before any subscription metadata exists in feeds.
+    public static final String SINGLE_FEED_SESSION_STORY_QUERY =
+        "SELECT " + STORY_COLUMNS +
+        " FROM " + STORY_TABLE +
+        " LEFT JOIN " + FEED_TABLE +
+        " ON " + STORY_TABLE + "." + STORY_FEED_ID + " = " + FEED_TABLE + "." + FEED_ID +
+        " WHERE " + SESSION_STORY_SELECTION;
+
+    public static final String DAILY_BRIEFING_SESSION_STORY_QUERY =
+        "SELECT " +
+        STORY_COLUMNS +
+        " FROM " + READING_SESSION_TABLE +
+        " INNER JOIN " + STORY_TABLE +
+        " ON " + READING_SESSION_TABLE + "." + READING_SESSION_STORY_HASH +
+        " = " + STORY_TABLE + "." + STORY_HASH +
+        " INNER JOIN " + FEED_TABLE +
+        " ON " + STORY_TABLE + "." + STORY_FEED_ID +
+        " = " + FEED_TABLE + "." + FEED_ID +
+        " ORDER BY " + READING_SESSION_TABLE + ".rowid";
 
     public static String NOTIFY_FOCUS_STORY_QUERY = 
         STORY_QUERY_BASE_1 +

@@ -1,0 +1,253 @@
+package com.newsblur.network
+
+import android.content.ContentValues
+import android.content.Context
+import com.newsblur.di.ApiOkHttpClient
+import com.newsblur.domain.ValueMultimap
+import com.newsblur.preference.PrefsRepo
+import com.newsblur.util.AppConstants
+import com.newsblur.util.LanguageSettings
+import com.newsblur.util.Log
+import com.newsblur.util.NetworkUtils
+import com.newsblur.util.PrefConstants
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.FormBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.Response
+import okio.ByteString
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.coroutines.resume
+
+class NetworkClientImpl(
+    private val context: Context,
+    @param:ApiOkHttpClient
+    private val client: OkHttpClient,
+    initialUserAgent: String,
+    prefsRepo: PrefsRepo,
+) : NetworkClient {
+    private var customUserAgent: String = initialUserAgent
+    private val inFlightPosts = ConcurrentHashMap<InFlightPostKey, CompletableDeferred<APIResponse>>()
+
+    init {
+        APIConstants.setCustomServer(prefsRepo.getCustomServer())
+    }
+
+    override suspend fun get(urlString: String): APIResponse {
+        var response: APIResponse
+        var tryCount = 0
+        do {
+            backoffSleep(tryCount++)
+            response = getSingle(urlString)
+        } while ((response.isError) && (tryCount < AppConstants.MAX_API_TRIES))
+        return response
+    }
+
+    override suspend fun get(
+        urlString: String,
+        values: ContentValues,
+    ): APIResponse = get(urlString + "?" + builderGetParametersString(values))
+
+    override suspend fun get(
+        urlString: String,
+        valueMap: ValueMultimap,
+    ): APIResponse = get(urlString + "?" + valueMap.getParameterString())
+
+    override suspend fun getCancellable(urlString: String, valueMap: ValueMultimap): APIResponse {
+        if (!NetworkUtils.isOnline(context)) return APIResponse()
+        val request = Request.Builder().url(urlString + "?" + valueMap.getParameterString())
+        addCookieHeader(request)
+        request.header("User-Agent", customUserAgent)
+        LanguageSettings.addLanguageHeader(request, context)
+        return suspendCancellableCoroutine { continuation ->
+            // NetworkClientImpl.kt keeps bounded preview refreshes cancellable during headers and body reads.
+            val call = client.newCall(request.build())
+            val started = System.currentTimeMillis()
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) continuation.resume(APIResponse())
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    response.use {
+                        val result = try {
+                            APIResponse(it, System.currentTimeMillis() - started)
+                        } catch (_: IOException) {
+                            APIResponse()
+                        }
+                        if (continuation.isActive) continuation.resume(result)
+                    }
+                }
+            })
+        }
+    }
+
+    override suspend fun post(
+        urlString: String,
+        formBody: RequestBody,
+    ): APIResponse {
+        var response: APIResponse
+        var tryCount = 0
+        do {
+            backoffSleep(tryCount++)
+            response = postSingle(urlString, formBody)
+        } while ((response.isError) && (tryCount < AppConstants.MAX_API_TRIES))
+        return response
+    }
+
+    override suspend fun post(
+        urlString: String,
+        values: ContentValues,
+    ): APIResponse {
+        val formEncodingBuilder = FormBody.Builder()
+        for (entry in values.valueSet()) {
+            formEncodingBuilder.add(entry.key, entry.value?.toString().orEmpty())
+        }
+        return post(urlString, formEncodingBuilder.build())
+    }
+
+    override suspend fun post(
+        urlString: String,
+        valueMap: ValueMultimap,
+    ): APIResponse = post(urlString, valueMap.asFormEncodedRequestBody())
+
+    override suspend fun postWithoutRetry(
+        urlString: String,
+        valueMap: ValueMultimap,
+        readTimeoutSeconds: Long,
+    ): APIResponse {
+        val formBody = valueMap.asFormEncodedRequestBody()
+        val key =
+            InFlightPostKey(
+                urlString = urlString,
+                formBody = formBody.toByteString(),
+                readTimeoutSeconds = readTimeoutSeconds,
+            )
+        val ownedResponse = CompletableDeferred<APIResponse>()
+        val inFlightResponse = inFlightPosts.putIfAbsent(key, ownedResponse)
+        if (inFlightResponse != null) {
+            return inFlightResponse.await()
+        }
+
+        try {
+            val requestClient =
+                client
+                    .newBuilder()
+                    .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
+                    .retryOnConnectionFailure(false)
+                    .build()
+            val response = postSingle(urlString, formBody, requestClient)
+            ownedResponse.complete(response)
+            return response
+        } catch (throwable: Throwable) {
+            ownedResponse.completeExceptionally(throwable)
+            throw throwable
+        } finally {
+            inFlightPosts.remove(key, ownedResponse)
+        }
+    }
+
+    override fun updateCustomUserAgent(customUserAgent: String) {
+        this.customUserAgent = customUserAgent
+    }
+
+    override fun addCookieHeader(requestBuilder: Request.Builder) {
+        val preferences = context.getSharedPreferences(PrefConstants.PREFERENCES, 0)
+        val cookie = preferences.getString(PrefConstants.PREF_COOKIE, null)
+        if (cookie != null) {
+            requestBuilder.header("Cookie", cookie)
+        }
+    }
+
+    override fun builderGetParametersString(values: ContentValues): String {
+        val parameters = mutableListOf<String>()
+        for (entry in values.valueSet()) {
+            val builder = StringBuilder()
+            builder.append(entry.key)
+            builder.append("=")
+            builder.append(NetworkUtils.encodeURL(entry.value?.toString().orEmpty()))
+            parameters.add(builder.toString())
+        }
+        return parameters.joinToString("&")
+    }
+
+    private fun getSingle(urlString: String): APIResponse {
+        if (!NetworkUtils.isOnline(context)) {
+            return APIResponse()
+        }
+
+        val requestBuilder = Request.Builder().url(urlString)
+        addCookieHeader(requestBuilder)
+        requestBuilder.header("User-Agent", customUserAgent)
+        LanguageSettings.addLanguageHeader(requestBuilder, context)
+
+        return APIResponse(client, requestBuilder.build())
+    }
+
+    private fun postSingle(
+        urlString: String,
+        formBody: RequestBody,
+        requestClient: OkHttpClient = client,
+    ): APIResponse {
+        if (!NetworkUtils.isOnline(context)) {
+            return APIResponse()
+        }
+
+        if (AppConstants.VERBOSE_LOG_NET) {
+            Log.d(this.javaClass.name, "API POST $urlString")
+            var body = ""
+            try {
+                val buffer = okio.Buffer()
+                formBody.writeTo(buffer)
+                body = buffer.readUtf8()
+            } catch (_: Exception) {
+                // this is debug code, do not raise
+            }
+            android.util.Log.d(this.javaClass.name, "post body: $body")
+        }
+
+        val requestBuilder = Request.Builder().url(urlString)
+        addCookieHeader(requestBuilder)
+        requestBuilder.post(formBody)
+        LanguageSettings.addLanguageHeader(requestBuilder, context)
+
+        return APIResponse(requestClient, requestBuilder.build())
+    }
+
+    private fun RequestBody.toByteString(): ByteString {
+        val buffer = okio.Buffer()
+        writeTo(buffer)
+        return buffer.readByteString()
+    }
+
+    /**
+     * Pause for the sake of exponential retry-backoff as apropriate before the Nth call as counted
+     * by the zero-indexed tryCount.
+     */
+    private fun backoffSleep(tryCount: Int) {
+        if (tryCount == 0) return
+        Log.i(this.javaClass.name, "API call failed, pausing before retry number $tryCount")
+        try {
+            // simply double the base sleep time for each subsequent try
+            val factor = 2.0.pow(tryCount.toDouble()).roundToInt()
+            Thread.sleep(AppConstants.API_BACKOFF_BASE_MILLIS * factor)
+        } catch (_: InterruptedException) {
+            Log.w(this.javaClass.name, "Abandoning API backoff due to interrupt.")
+        }
+    }
+
+    private data class InFlightPostKey(
+        val urlString: String,
+        val formBody: ByteString,
+        val readTimeoutSeconds: Long,
+    )
+}

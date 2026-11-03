@@ -5,7 +5,9 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
     events: {
         "click .NB-feed-story-premium-only a": function (e) {
             e.preventDefault();
-            NEWSBLUR.reader.open_feedchooser_modal({ premium_only: true });
+            // story_list_view.js: The notice link's data-feature names the tier
+            // line to highlight (river, saved-tags, or search).
+            NEWSBLUR.reader.open_premium_upgrade_modal({ highlight_feature: $(e.currentTarget).data('feature') });
         }
     },
 
@@ -29,6 +31,13 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
     },
 
     reset_flags: function () {
+        // story_list_view.js: Skip event-triggered resets during briefing view
+        // to avoid destroying story views and resetting scroll position.
+        if (NEWSBLUR.reader.flags.briefing_view &&
+            arguments.length && arguments[0] && arguments[0].models) {
+            return;
+        }
+        this.stop_maintaining_scroll();
         this.clear();
         this.cache = {
             story_pane_position: null,
@@ -38,7 +47,8 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
             latest_mark_read_scroll_position: -1
         };
         this.flags = {
-            mousemove_timeout: false
+            mousemove_timeout: false,
+            maintaining_scroll: null
         };
         this.counts = {
             positions_timer: 0
@@ -50,6 +60,13 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
     // ==========
 
     render: function () {
+        // story_list_view.js: When triggered by a collection reset event in
+        // briefing view, skip re-rendering to avoid resetting scroll position.
+        // Backbone passes the collection as the first arg on reset events.
+        if (NEWSBLUR.reader.flags.briefing_view &&
+            arguments.length && arguments[0] && arguments[0].models) {
+            return;
+        }
         // console.log(["Rendering story list", NEWSBLUR.assets.view_setting(NEWSBLUR.reader.active_feed, 'layout')]);
         if (!_.contains(['split', 'full'], NEWSBLUR.assets.view_setting(NEWSBLUR.reader.active_feed, 'layout'))) return;
 
@@ -142,7 +159,7 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
 
         var $empty = $.make("div", { className: "NB-story-list-empty" }, [
             $.make('div', { className: 'NB-world' }),
-            'Select a story to read'
+            gettext('Select a story to read')
         ]);
 
         this.$el.append($empty);
@@ -166,14 +183,12 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
             hidden_stories = false;
         }
         var $empty = $.make("div", { className: "NB-story-list-empty" }, [
-            'No stories to read',
+            gettext('No stories to read'),
             $.make('div', { className: 'NB-world' }),
-            (hidden_stories && $.make('div', { className: 'NB-story-list-empty-subtitle' }, [
-                'There ',
-                Inflector.pluralize('is', hidden_stories),
-                ' ',
-                Inflector.pluralize('hidden story', hidden_stories, true)
-            ]))
+            (hidden_stories && $.make('div', { className: 'NB-story-list-empty-subtitle' },
+                interpolate(ngettext('There is %(count)s hidden story', 'There are %(count)s hidden stories', hidden_stories),
+                    { count: Inflector.commas(hidden_stories) }, true)
+            ))
         ]);
 
         this.$el.append($empty);
@@ -208,8 +223,10 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
             return;
         }
 
+        this.stop_maintaining_scroll();
         clearTimeout(NEWSBLUR.reader.locks.scrolling);
         NEWSBLUR.reader.flags.scrolling_by_selecting_story_title = true;
+        var self = this;
         var scroll_to = options.scroll_to_top ? 0 : $story;
         NEWSBLUR.reader.$s.$feed_scroll.stop().scrollTo(scroll_to, {
             duration: options.immediate ? 0 : 340,
@@ -221,6 +238,7 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
                 NEWSBLUR.reader.locks.scrolling = setTimeout(function () {
                     NEWSBLUR.reader.flags.scrolling_by_selecting_story_title = false;
                 }, 100);
+                self.maintain_scroll_position(story, options);
             }
         });
     },
@@ -303,7 +321,6 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
     fill_out: function (options) {
         if (this.collection.no_more_stories ||
             !NEWSBLUR.reader.flags.story_titles_closed) {
-            this.show_no_more_stories();
             return;
         }
 
@@ -318,8 +335,6 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
             _.delay(_.bind(function () {
                 this.scroll();
             }, this), 10);
-        } else {
-            this.show_no_more_stories();
         }
     },
 
@@ -362,29 +377,30 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
         }
     },
 
+    // story_list_view.js: Each premium notice is one complete translated sentence whose
+    // %(link_start)s/%(link_end)s markers wrap the upgrade link.
+    make_premium_only_text: function (message, feature) {
+        var link_start = '<a href="#" class="NB-splash-link"' +
+            (feature ? ' data-feature="' + feature + '"' : '') + '>';
+        var $text = $.make('div', { className: 'NB-feed-story-premium-only-text' });
+        $text.html(interpolate(_.escape(message), { link_start: link_start, link_end: '</a>' }, true));
+        return $text;
+    },
+
     append_river_premium_only_notification: function () {
-        var message = [
-            'The full River of News is a ',
-            $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-            '.'
-        ];
+        var message = gettext('The full River of News is a %(link_start)spremium feature%(link_end)s.');
+        var feature = 'river';
         if (NEWSBLUR.reader.flags['starred_view']) {
-            message = [
-                'Reading saved stories by tag is a ',
-                $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-                '.'
-            ];
+            message = gettext('Reading saved stories by tag is a %(link_start)spremium feature%(link_end)s.');
+            feature = 'saved-tags';
         }
         if (NEWSBLUR.reader.active_feed == "read") {
-            message = [
-                'This read stories list is a ',
-                $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-                '.'
-            ];
+            message = gettext('This read stories list is a %(link_start)spremium feature%(link_end)s.');
+            feature = null;
         }
 
         var $notice = $.make('div', { className: 'NB-feed-story-premium-only' }, [
-            $.make('div', { className: 'NB-feed-story-premium-only-text' }, message)
+            this.make_premium_only_text(message, feature)
         ]);
         this.$('.NB-feed-story-premium-only').remove();
         if (_.contains(['full'], NEWSBLUR.assets.view_setting(NEWSBLUR.reader.active_feed, 'layout'))) {
@@ -398,11 +414,7 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
 
     append_search_premium_only_notification: function () {
         var $notice = $.make('div', { className: 'NB-feed-story-premium-only' }, [
-            $.make('div', { className: 'NB-feed-story-premium-only-text' }, [
-                'Search is a ',
-                $.make('a', { href: '#', className: 'NB-splash-link' }, 'premium feature'),
-                '.'
-            ])
+            this.make_premium_only_text(gettext('Search is a %(link_start)spremium feature%(link_end)s.'), 'search')
         ]);
         this.$('.NB-feed-story-premium-only').remove();
         this.$(".NB-end-line").append($notice);
@@ -651,6 +663,108 @@ NEWSBLUR.Views.StoryListView = Backbone.View.extend({
         if (!story.get('selected')) {
             story.set('selected', true, { selected_by_scrolling: true, mouse: true, immediate: true });
         }
+    },
+
+    maintain_scroll_position: function (story, options) {
+        if (NEWSBLUR.assets.preference('feed_view_single_story')) return;
+        if (options && options.scroll_to_top) return;
+        if (!story || !story.story_view) return;
+
+        var $target = (options && options.scroll_to_comments)
+            ? story.story_view.$('.NB-feed-story-comments')
+            : story.story_view.$el;
+        if (!$target || !$target.length) return;
+
+        var self = this;
+        var $feed_scroll = NEWSBLUR.reader.$s.$feed_scroll;
+        var scroll_offset = (options && options.scroll_offset) || 0;
+        var DRIFT_THRESHOLD = 10;
+        var MONITORING_DURATION = 2000;
+
+        this.flags['maintaining_scroll'] = {
+            raf_handle: null,
+            correcting: false,
+            cancel_timeout: null
+        };
+        var state = this.flags['maintaining_scroll'];
+
+        $feed_scroll.on(
+            'wheel.maintain_scroll mousedown.maintain_scroll touchstart.maintain_scroll',
+            function () {
+                console.log(['maintain_scroll: cancelled by user interaction']);
+                self.stop_maintaining_scroll();
+            }
+        );
+        $(document).on('keydown.maintain_scroll', function () {
+            console.log(['maintain_scroll: cancelled by keyboard']);
+            self.stop_maintaining_scroll();
+        });
+
+        state.cancel_timeout = setTimeout(function () {
+            self.stop_maintaining_scroll();
+        }, MONITORING_DURATION);
+
+        console.log(['maintain_scroll: started', story.get('story_title')]);
+
+        var check = function () {
+            var current_state = self.flags['maintaining_scroll'];
+            if (!current_state) return;
+            if (!$target.closest($feed_scroll).length) {
+                self.stop_maintaining_scroll();
+                return;
+            }
+            if (current_state.correcting) {
+                current_state.raf_handle = requestAnimationFrame(check);
+                return;
+            }
+
+            var container_top = $feed_scroll[0].getBoundingClientRect().top;
+            var target_top = $target[0].getBoundingClientRect().top;
+            var drift = (target_top - container_top) + scroll_offset;
+
+            if (Math.abs(drift) > DRIFT_THRESHOLD) {
+                console.log(['maintain_scroll: correcting drift', drift, story.get('story_title')]);
+                current_state.correcting = true;
+
+                clearTimeout(NEWSBLUR.reader.locks.scrolling);
+                NEWSBLUR.reader.flags.scrolling_by_selecting_story_title = true;
+
+                $feed_scroll.stop().scrollTo($target, {
+                    duration: 200,
+                    axis: 'y',
+                    easing: 'easeOutQuint',
+                    offset: scroll_offset,
+                    queue: false,
+                    onAfter: function () {
+                        if (!self.flags['maintaining_scroll']) return;
+                        self.flags['maintaining_scroll'].correcting = false;
+                        NEWSBLUR.reader.locks.scrolling = setTimeout(function () {
+                            NEWSBLUR.reader.flags.scrolling_by_selecting_story_title = false;
+                        }, 100);
+                    }
+                });
+            }
+
+            current_state.raf_handle = requestAnimationFrame(check);
+        };
+
+        state.raf_handle = requestAnimationFrame(check);
+    },
+
+    stop_maintaining_scroll: function () {
+        var state = this.flags && this.flags['maintaining_scroll'];
+        if (!state) return;
+
+        if (state.raf_handle) {
+            cancelAnimationFrame(state.raf_handle);
+        }
+        if (state.cancel_timeout) {
+            clearTimeout(state.cancel_timeout);
+        }
+
+        NEWSBLUR.reader.$s.$feed_scroll.off('.maintain_scroll');
+        $(document).off('.maintain_scroll');
+        this.flags['maintaining_scroll'] = null;
     },
 
     scroll: function (elem, e) {

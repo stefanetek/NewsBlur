@@ -9,7 +9,7 @@
 import UIKit
 
 /// Singleton to manage the storyboards of the app.
-class Storyboards {
+@MainActor class Storyboards {
     /// Singleton shared instance.
     static let shared = Storyboards()
     
@@ -19,6 +19,7 @@ class Storyboards {
     
     /// Main storyboard identifiers.
     enum Main: String {
+        case feeds = "FeedsViewController"
         case feedDetail = "FeedDetailViewController"
         case horizontalPages = "HorizontalPageViewController"
         case verticalPages = "VerticalPageViewController"

@@ -1,64 +1,59 @@
+"""RSS feed views: feed CRUD, story detail, feed statistics, and exception handling.
+
+API endpoints for adding/removing/moving feeds, loading individual stories,
+fetching original page content, viewing feed statistics, and managing feed
+exceptions (address changes, duplicate detection).
+"""
+
 import base64
 import datetime
+import hashlib
+import re
 import time
 from collections import defaultdict
 from urllib.parse import urlparse
 
 import redis
+import requests
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.http import (
-    Http404,
-    HttpResponse,
-    HttpResponseForbidden,
-    HttpResponseRedirect,
-)
+from django.http import Http404, HttpResponse, HttpResponseForbidden, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
+from django.utils.translation import gettext
 from django.views.decorators.http import condition
 
 from apps.analyzer.models import get_classifiers_for_user
+from apps.discover.views import IGNORE_AUTOCOMPLETE, TRENDING_CATEGORIES
 from apps.push.models import PushSubscription
 from apps.reader.models import UserSubscription
-
-# from django.db import IntegrityError
 from apps.rss_feeds.models import Feed, MFeedIcon, MFetchHistory, MStory, merge_feeds
 from apps.search.models import MUserSearch
+from apps.statistics.rdiscover_usage import RDiscoverUsage
+from apps.statistics.rtrending_subscriptions import RTrendingSubscription
 from utils import feedfinder_forman as feedfinder
 from utils import json_functions as json
 from utils import log as logging
 from utils.feed_functions import relative_timesince, relative_timeuntil
 from utils.ratelimit import ratelimit
+from utils.url_safety import BLOCKED_PRIVATE_URL_MESSAGE, UnsafeUrlError, validate_public_url
 from utils.user_functions import ajax_login_required, get_user
 from utils.view_functions import get_argument_or_404, is_true, required_params
 from vendor.timezones.utilities import localtime_for_timezone
 
-IGNORE_AUTOCOMPLETE = [
-    "facebook.com/feeds/notifications.php",
-    "inbox",
-    "secret",
-    "password",
-    "latitude",
-]
 
+def normalize_feed_id(feed_id):
+    """Clients sometimes send the DOM element id ('feed:123') instead of the bare feed id."""
+    if not feed_id:
+        return None
 
-@ajax_login_required
-@json.json_view
-def search_feed(request):
-    address = request.GET.get("address")
-    offset = int(request.GET.get("offset", 0))
-    if not address:
-        return dict(code=-1, message="Please provide a URL/address.")
+    feed_id = str(feed_id)
+    if feed_id.startswith("feed:"):
+        feed_id = feed_id[len("feed:") :]
+    if not feed_id.isdigit():
+        return None
 
-    logging.user(request.user, "~FBFinding feed (search_feed): %s" % address)
-    ip = request.META.get("HTTP_X_FORWARDED_FOR", None) or request.META["REMOTE_ADDR"]
-    logging.user(request.user, "~FBIP: %s" % ip)
-    aggressive = request.user.is_authenticated
-    feed = Feed.get_feed_from_url(address, create=False, aggressive=aggressive, offset=offset)
-    if feed:
-        return feed.canonical()
-    else:
-        return dict(code=-1, message="No feed found matching that XML or website address.")
+    return int(feed_id)
 
 
 @json.json_view
@@ -79,7 +74,13 @@ def feed_favicon_etag(request, feed_id):
     except MFeedIcon.DoesNotExist:
         return
 
-    return feed_icon.color
+    etag_source = "%s:%s:%s:%s" % (
+        feed_icon.color or "",
+        feed_icon.icon_url or "",
+        feed_icon.not_found or False,
+        feed_icon.data or "",
+    )
+    return hashlib.md5(etag_source.encode("utf-8")).hexdigest()
 
 
 @condition(etag_func=feed_favicon_etag)
@@ -103,19 +104,20 @@ def feed_autocomplete(request):
     query = request.GET.get("term") or request.GET.get("query")
     version = int(request.GET.get("v", 1))
     autocomplete_format = request.GET.get("format", "autocomplete")
+    limit = int(request.GET.get("limit", 5))
 
     # user = get_user(request)
     # if True or not user.profile.is_premium:
     #     return dict(code=-1, message="Overloaded, no autocomplete results.", feeds=[], term=query)
 
     if not query:
-        return dict(code=-1, message="Specify a search 'term'.", feeds=[], term=query)
+        return dict(code=-1, message=gettext("Specify a search 'term'."), feeds=[], term=query)
 
     if "." in query:
         try:
             parts = urlparse(query)
-            if not parts.hostname and not query.startswith("http"):
-                parts = urlparse("http://%s" % query)
+            if not parts.hostname and not re.match(r"https?://", query):
+                parts = urlparse("http://%s" % re.sub(r"^https?:", "", query))
             if parts.hostname:
                 query = [parts.hostname]
                 query.extend([p for p in parts.path.split("/") if p])
@@ -127,7 +129,7 @@ def feed_autocomplete(request):
     tries_left = 5
     while len(query_params) and tries_left:
         tries_left -= 1
-        feed_ids = Feed.autocomplete(" ".join(query_params))
+        feed_ids = Feed.autocomplete(" ".join(query_params), limit=limit)
         if feed_ids:
             break
         else:
@@ -365,15 +367,47 @@ def exception_retry(request):
     return {"code": 1, "feeds": feeds}
 
 
+def find_or_create_feed_for_branch(original_feed, feed_address, feed_link):
+    """The feed a reader leaving original_feed for this address and link moves onto, whether
+    this call created it (only then do the Change Feed Address views make it a branch), and
+    whether nothing holds the address at all, in which case the reader stays on
+    original_feed. A feed that already holds the address has readers of its own and is never
+    re-parented under the reader's feed (forum #13860). Feed.save folds a new row into a feed
+    another request created at this address meanwhile and leaves the instance without an id,
+    so the id is what says the row is ours (Feed.save handles the IntegrityError itself).
+    apps/rss_feeds/views.py
+    """
+    hash_address_and_link = Feed.generate_hash_address_and_link(feed_address, feed_link)
+    try:
+        return Feed.objects.get(hash_address_and_link=hash_address_and_link), False, False
+    except Feed.DoesNotExist:
+        pass
+    new_feed = Feed.objects.create(feed_address=feed_address, feed_link=feed_link)
+    if new_feed.pk is not None:
+        return new_feed, True, False
+    existing_feed = Feed.objects.filter(hash_address_and_link=hash_address_and_link).first()
+    if existing_feed:
+        return existing_feed, False, False
+    return original_feed, False, True
+
+
 @ajax_login_required
 @json.json_view
 def exception_change_feed_address(request):
-    feed_id = request.POST["feed_id"]
+    feed_id = normalize_feed_id(request.POST.get("feed_id"))
+    if not feed_id:
+        return {"code": -1, "message": gettext("Missing or invalid feed id.")}
+
     feed = get_object_or_404(Feed, pk=feed_id)
     original_feed = feed
     feed_address = request.POST["feed_address"]
     timezone = request.user.profile.timezone
     code = -1
+
+    try:
+        validate_public_url(feed_address)
+    except UnsafeUrlError:
+        return {"code": -1, "message": BLOCKED_PRIVATE_URL_MESSAGE}
 
     if False and (feed.has_page_exception or feed.has_feed_exception):
         # Fix broken feed
@@ -402,14 +436,15 @@ def exception_change_feed_address(request):
         logging.user(
             request, "~FRBranching feed by address: ~SB%s~SN to ~SB%s" % (feed.feed_address, feed_address)
         )
-        try:
-            feed = Feed.objects.get(
-                hash_address_and_link=Feed.generate_hash_address_and_link(feed_address, feed.feed_link)
-            )
-        except Feed.DoesNotExist:
-            feed = Feed.objects.create(feed_address=feed_address, feed_link=feed.feed_link)
-        code = 1
-        if feed.pk != original_feed.pk:
+        feed, created_branch, left_in_place = find_or_create_feed_for_branch(
+            original_feed, feed_address, feed.feed_link
+        )
+        code = -1 if left_in_place else 1
+        # Only a feed made here for this reader becomes a branch. A feed that already holds the
+        # address has readers of its own: re-parenting it under this one hid it from search and
+        # let it lose a merge to this feed, moving all of them (forum #13860). The reader is
+        # switched onto it below either way. apps/rss_feeds/views.py
+        if created_branch and feed.pk != original_feed.pk:
             try:
                 feed.branch_from_feed = original_feed.branch_from_feed or original_feed
             except Feed.DoesNotExist:
@@ -461,12 +496,20 @@ def exception_change_feed_address(request):
 @ajax_login_required
 @json.json_view
 def exception_change_feed_link(request):
-    feed_id = request.POST["feed_id"]
+    feed_id = normalize_feed_id(request.POST.get("feed_id"))
+    if not feed_id:
+        return {"code": -1, "message": gettext("Missing or invalid feed id.")}
+
     feed = get_object_or_404(Feed, pk=feed_id)
     original_feed = feed
     feed_link = request.POST["feed_link"]
     timezone = request.user.profile.timezone
     code = -1
+
+    try:
+        validate_public_url(feed_link)
+    except UnsafeUrlError:
+        return {"code": -1, "message": BLOCKED_PRIVATE_URL_MESSAGE}
 
     if False and (feed.has_page_exception or feed.has_feed_exception):
         # Fix broken feed
@@ -492,14 +535,13 @@ def exception_change_feed_link(request):
     else:
         # Branch good feed
         logging.user(request, "~FRBranching feed by link: ~SB%s~SN to ~SB%s" % (feed.feed_link, feed_link))
-        try:
-            feed = Feed.objects.get(
-                hash_address_and_link=Feed.generate_hash_address_and_link(feed.feed_address, feed_link)
-            )
-        except Feed.DoesNotExist:
-            feed = Feed.objects.create(feed_address=feed.feed_address, feed_link=feed_link)
-        code = 1
-        if feed.pk != original_feed.pk:
+        feed, created_branch, left_in_place = find_or_create_feed_for_branch(
+            original_feed, feed.feed_address, feed_link
+        )
+        code = -1 if left_in_place else 1
+        # As in exception_change_feed_address: an existing feed at this link is never
+        # re-parented or locked, only switched to (forum #13860). apps/rss_feeds/views.py
+        if created_branch and feed.pk != original_feed.pk:
             try:
                 feed.branch_from_feed = original_feed.branch_from_feed or original_feed
             except Feed.DoesNotExist:
@@ -595,7 +637,7 @@ def original_text(request):
     debug = GET_POST.get("debug", False)
 
     if not story_hash and not story_id:
-        return {"code": -1, "message": "Missing story_hash.", "original_text": None, "failed": True}
+        return {"code": -1, "message": gettext("Missing story_hash."), "original_text": None, "failed": True}
 
     if story_hash:
         story, _ = MStory.find_story(story_hash=story_hash)
@@ -604,7 +646,7 @@ def original_text(request):
 
     if not story:
         logging.user(request, "~FYFetching ~FGoriginal~FY story text: ~FRstory not found")
-        return {"code": -1, "message": "Story not found.", "original_text": None, "failed": True}
+        return {"code": -1, "message": gettext("Story not found."), "original_text": None, "failed": True}
 
     original_text = story.fetch_original_text(force=force, request=request, debug=debug)
 
@@ -645,7 +687,7 @@ def story_changes(request):
     story, _ = MStory.find_story(story_hash=story_hash)
     if not story:
         logging.user(request, "~FYFetching ~FGoriginal~FY story page: ~FRstory not found")
-        return {"code": -1, "message": "Story not found.", "original_page": None, "failed": True}
+        return {"code": -1, "message": gettext("Story not found."), "original_page": None, "failed": True}
 
     return {"story": Feed.format_story(story, show_changes=show_changes)}
 
@@ -668,7 +710,7 @@ def discover_feeds(request, feed_id=None):
         similar_feeds = Feed.find_similar_feeds(feed_ids=feed_ids, offset=offset, limit=limit)
         similar_feed_ids = [result["_source"]["feed_id"] for result in similar_feeds]
     else:
-        return {"code": -1, "message": "Missing feed_ids.", "discover_feeds": None, "failed": True}
+        return {"code": -1, "message": gettext("Missing feed_ids."), "discover_feeds": None, "failed": True}
 
     feeds = Feed.objects.filter(pk__in=similar_feed_ids)
     discover_feeds = defaultdict(dict)
@@ -677,6 +719,7 @@ def discover_feeds(request, feed_id=None):
         discover_feeds[feed.pk]["stories"] = feed.get_stories(limit=5)
 
     logging.user(request, "~FCDiscovering similar feeds, page %s: ~SB%s" % (page, similar_feed_ids))
+    RDiscoverUsage.record("feeds", request.user.pk)
     return {"discover_feeds": discover_feeds}
 
 
@@ -689,10 +732,11 @@ def discover_stories(request, story_hash):
     offset = (page - 1) * limit
     story, _ = MStory.find_story(story_hash=story_hash)
     if not story:
-        return {"code": -1, "message": "Story not found.", "discover_stories": None, "failed": True}
+        return {"code": -1, "message": gettext("Story not found."), "discover_stories": None, "failed": True}
 
     user_search = MUserSearch.get_user(request.user.pk)
     user_search.touch_discover_date()
+    RDiscoverUsage.record("stories", request.user.pk)
 
     similar_stories = story.fetch_similar_stories(feed_ids=feed_ids, offset=offset, limit=limit)
     similar_story_hashes = [result["_id"] for result in similar_stories]
@@ -709,3 +753,51 @@ def discover_stories(request, story_hash):
     feeds = {feed.pk: feed.canonical(include_favicon=False) for feed in feeds}
 
     return {"discover_stories": stories, "feeds": feeds}
+
+
+@json.json_view
+def trending_sites(request):
+    """
+    Returns trending feeds with their recent stories for the Trending Sites feature.
+    Supports categories: popular, rising, hidden_gems, new_arrivals.
+    """
+    page = int(request.GET.get("page", 1))
+    days = int(request.GET.get("days", 7))
+    category = request.GET.get("category", "popular")
+    limit = 10
+    offset = (page - 1) * limit
+
+    if days not in [1, 7, 30]:
+        days = 7
+    if category not in TRENDING_CATEGORIES:
+        category = "popular"
+
+    one_year_ago = datetime.datetime.now() - datetime.timedelta(days=365)
+
+    get_trending = TRENDING_CATEGORIES[category]
+    trending_feed_ids, score_map, has_more, use_fallback = get_trending(days, limit, offset, one_year_ago)
+
+    if not trending_feed_ids:
+        return {"trending_feeds": {}, "has_more": False}
+
+    feeds = Feed.objects.filter(
+        pk__in=trending_feed_ids, last_story_date__gte=one_year_ago, branch_from_feed__isnull=True
+    )
+    feeds_dict = {feed.pk: feed for feed in feeds}
+
+    trending_feeds = {}
+    for feed_id in trending_feed_ids:
+        if feed_id in feeds_dict:
+            feed = feeds_dict[feed_id]
+            score = feed.num_subscribers if use_fallback else score_map.get(feed_id, 0)
+            trending_feeds[feed_id] = {
+                "feed": feed.canonical(include_favicon=False),
+                "stories": feed.get_stories(limit=5),
+                "trending_score": score,
+            }
+
+    logging.user(
+        request,
+        "~FCTrending sites/%s (page %s, %sd): ~SB%s feeds" % (category, page, days, len(trending_feeds)),
+    )
+    return {"trending_feeds": trending_feeds, "has_more": has_more}

@@ -1,25 +1,112 @@
 package com.newsblur.view
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.util.AttributeSet
+import android.view.View
+import android.view.ViewGroup
 import androidx.appcompat.widget.AppCompatImageView
 import com.newsblur.R
 import com.newsblur.util.ThumbnailStyle
 
 class StoryThumbnailView
-@JvmOverloads constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0)
-    : AppCompatImageView(context, attrs, defStyleAttr) {
+    @JvmOverloads
+    constructor(
+        context: Context,
+        attrs: AttributeSet? = null,
+        defStyleAttr: Int = 0,
+    ) : AppCompatImageView(context, attrs, defStyleAttr) {
+        private var expandedWidth: Int = 0
+        private var expandedHeight: Int = 0
+        private var expandedStartMargin: Int = 0
+        private var expandedTopMargin: Int = 0
+        private var expandedEndMargin: Int = 0
+        private var expandedBottomMargin: Int = 0
 
-    init {
-        clipToOutline = true
-        scaleType = ScaleType.CENTER_CROP
-    }
+        init {
+            clipToOutline = true
+            scaleType = ScaleType.CENTER_CROP
+        }
 
-    fun setThumbnailStyle(thumbnailStyle: ThumbnailStyle) {
-        if (thumbnailStyle.isSmall()) {
-            setBackgroundResource(R.drawable.shape_rounded_corners_6dp)
-        } else {
-            setBackgroundResource(0)
+        fun setExpandedLayout(
+            width: Int,
+            height: Int,
+            startMargin: Int,
+            topMargin: Int,
+            endMargin: Int,
+            bottomMargin: Int,
+        ) {
+            expandedWidth = width
+            expandedHeight = height
+            expandedStartMargin = startMargin
+            expandedTopMargin = topMargin
+            expandedEndMargin = endMargin
+            expandedBottomMargin = bottomMargin
+            if (visibility == VISIBLE) {
+                (layoutParams as? ViewGroup.MarginLayoutParams)?.let { params ->
+                    params.width = width
+                    params.height = height
+                    setRelativeMargins(params, startMargin, topMargin, endMargin, bottomMargin)
+                    layoutParams = params
+                    refreshHierarchy()
+                }
+            }
+        }
+
+        fun setThumbnailStyle(thumbnailStyle: ThumbnailStyle) {
+            if (thumbnailStyle.isSmall()) {
+                setBackgroundResource(R.drawable.shape_rounded_corners_6dp)
+            } else {
+                setBackgroundResource(0)
+            }
+        }
+
+        override fun setVisibility(visibility: Int) {
+            (layoutParams as? ViewGroup.MarginLayoutParams)?.let { params ->
+                if (visibility == VISIBLE) {
+                    if (expandedWidth != 0) params.width = expandedWidth
+                    if (expandedHeight != 0) params.height = expandedHeight
+                    setRelativeMargins(params, expandedStartMargin, expandedTopMargin, expandedEndMargin, expandedBottomMargin)
+                } else {
+                    if (params.width != 0) expandedWidth = params.width
+                    if (params.height != 0) expandedHeight = params.height
+                    expandedStartMargin = params.marginStart
+                    expandedTopMargin = params.topMargin
+                    expandedEndMargin = params.marginEnd
+                    expandedBottomMargin = params.bottomMargin
+                    params.width = 0
+                    params.height = 0
+                    setRelativeMargins(params, 0, 0, 0, 0)
+                }
+                layoutParams = params
+            }
+            super.setVisibility(visibility)
+            refreshHierarchy()
+        }
+
+        override fun setImageBitmap(bm: Bitmap?) {
+            super.setImageBitmap(bm)
+            refreshHierarchy()
+        }
+
+        // StoryThumbnailView.kt keeps start and end margins, so the row mirrors in right-to-left languages.
+        private fun setRelativeMargins(
+            params: ViewGroup.MarginLayoutParams,
+            start: Int,
+            top: Int,
+            end: Int,
+            bottom: Int,
+        ) {
+            params.marginStart = start
+            params.topMargin = top
+            params.marginEnd = end
+            params.bottomMargin = bottom
+        }
+
+        private fun refreshHierarchy() {
+            // Story rows keep aggressive caching enabled, so delayed thumbnail resizes need an explicit redraw.
+            requestLayout()
+            invalidate()
+            (parent as? View)?.invalidate()
         }
     }
-}

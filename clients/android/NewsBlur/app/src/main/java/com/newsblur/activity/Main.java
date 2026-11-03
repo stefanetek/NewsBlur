@@ -7,28 +7,26 @@ import static com.newsblur.service.NbSyncManager.UPDATE_STATUS;
 
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.os.Bundle;
 import android.os.Trace;
-import android.preference.PreferenceManager;
-import android.text.Editable;
-import android.text.TextWatcher;
 import android.view.KeyEvent;
-import android.view.MenuItem;
 import android.view.View;
-import android.view.View.OnKeyListener;
+import android.view.animation.AccelerateInterpolator;
+import android.view.animation.DecelerateInterpolator;
 import android.widget.AbsListView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.StringRes;
-import androidx.appcompat.widget.PopupMenu;
 import androidx.fragment.app.FragmentManager;
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 
+import com.newsblur.NbApplication;
 import com.newsblur.R;
-import com.newsblur.database.BlurDatabaseHelper;
 import com.newsblur.databinding.ActivityMainBinding;
 import com.newsblur.delegate.MainContextMenuDelegate;
 import com.newsblur.delegate.MainContextMenuDelegateImpl;
+import com.newsblur.fragment.AddFeedFragment;
 import com.newsblur.fragment.FeedSelectorFragment;
 import com.newsblur.fragment.FeedsShortcutFragment;
 import com.newsblur.fragment.FolderListFragment;
@@ -36,28 +34,44 @@ import com.newsblur.keyboard.KeyboardEvent;
 import com.newsblur.keyboard.KeyboardListener;
 import com.newsblur.keyboard.KeyboardManager;
 import com.newsblur.service.BootReceiver;
-import com.newsblur.service.NBSyncService;
 import com.newsblur.util.AppConstants;
+import com.newsblur.util.EdgeToEdgeUtil;
 import com.newsblur.util.FeedSet;
 import com.newsblur.util.FeedUtils;
-import com.newsblur.util.PrefsUtils;
+import com.newsblur.util.LastStoryList;
 import com.newsblur.util.ShortcutUtils;
 import com.newsblur.util.StateFilter;
+import com.newsblur.util.StorySplitView;
 import com.newsblur.util.UIUtils;
 import com.newsblur.view.StateToggleButton.StateChangedListener;
+
+import java.lang.ref.WeakReference;
+import java.text.NumberFormat;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import javax.inject.Inject;
 
 import dagger.hilt.android.AndroidEntryPoint;
 
 @AndroidEntryPoint
-public class Main extends NbActivity implements StateChangedListener, SwipeRefreshLayout.OnRefreshListener, AbsListView.OnScrollListener, PopupMenu.OnMenuItemClickListener, KeyboardListener {
+public class Main extends NbActivity implements StateChangedListener, SwipeRefreshLayout.OnRefreshListener, AbsListView.OnScrollListener, KeyboardListener {
+    private static final long SYNC_STATUS_ANIMATION_DURATION_MS = 500L;
+    private static final long SYNC_STATUS_DONE_DURATION_MS = 5000L;
+    private static final DecelerateInterpolator SYNC_STATUS_SHOW_INTERPOLATOR = new DecelerateInterpolator();
+    private static final AccelerateInterpolator SYNC_STATUS_HIDE_INTERPOLATOR = new AccelerateInterpolator();
+    // Main.java's bottom toolbar hugs its contents on screens at least this wide (tablets).
+    private static final int COMPACT_TOOLBAR_MIN_WIDTH_DP = 600;
+    private static WeakReference<Main> visibleMainRef = new WeakReference<>(null);
+
+    private enum SyncStatusAccessory {
+        NONE,
+        SPINNER,
+        DONE,
+    }
 
     @Inject
     FeedUtils feedUtils;
-
-    @Inject
-    BlurDatabaseHelper dbHelper;
 
     public static final String EXTRA_FORCE_SHOW_FEED_ID = "force_show_feed_id";
 
@@ -65,74 +79,78 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
     private FeedSelectorFragment feedSelectorFragment;
     private boolean wasSwipeEnabled = false;
     private ActivityMainBinding binding;
+    private int listenMiniPlayerInset = 0;
     private MainContextMenuDelegate contextMenuDelegate;
     private KeyboardManager keyboardManager;
+    private final NumberFormat unreadCountFormatter = NumberFormat.getIntegerInstance();
+    private boolean hasSeenActiveSyncStatus = false;
+    private boolean isShowingDoneSyncStatus = false;
+    @Inject com.newsblur.onboarding.SetupQueue setupQueue;
+
+    private boolean isShowingLoadingSyncPlaceholder = true;
+    private boolean shouldTrackActiveSyncStatus = false;
+    private int lastForegroundSessionId = 0;
+    private final Runnable hideSyncStatusRunnable = () -> {
+        isShowingDoneSyncStatus = false;
+        hideSyncStatusIndicator(true);
+    };
 
     @Override
-	public void onCreate(Bundle savedInstanceState) {
+    public void onCreate(Bundle savedInstanceState) {
         Trace.beginSection("MainOnCreate");
-        PreferenceManager.setDefaultValues(this, R.xml.activity_settings, false);
 
-		super.onCreate(savedInstanceState);
+        super.onCreate(savedInstanceState);
+        // On tablets the feed list slides over the last story list instead of filling the screen
+        // (FeedListDrawer.kt), so Main.java hands off to that story list and steps aside. Only a
+        // fresh launch does: a Main recreated under an open story list and reader (a foldable
+        // unfolding, a window widening) stays the feed list rather than clearing what's being read,
+        // and one already finishing (NbActivity.kt found no login) leaves the login screen alone.
+        if (!isFinishing() && savedInstanceState == null && !isFeedDrawer() && StorySplitView.usesTabletNavigation(this)) {
+            openStoryListUnderFeedDrawer();
+            Trace.endSection();
+            return;
+        }
+        visibleMainRef = new WeakReference<>(this);
         getWindow().setBackgroundDrawableResource(android.R.color.transparent);
         binding = ActivityMainBinding.inflate(getLayoutInflater());
-        contextMenuDelegate = new MainContextMenuDelegateImpl(this, dbHelper);
+        contextMenuDelegate = new MainContextMenuDelegateImpl(this, prefsRepo);
         keyboardManager = new KeyboardManager();
-        setContentView(binding.getRoot());
+        EdgeToEdgeUtil.applyView(this, binding);
 
-        // set the status bar to an generic loading message when the activity is first created so
-        // that something is displayed while the service warms up
-        binding.mainSyncStatus.setText(R.string.loading);
-        binding.mainSyncStatus.setVisibility(View.VISIBLE);
+        // Show a placeholder sync status while the service warms up.
+        binding.mainSyncStatusText.setText(R.string.loading);
+        binding.mainSyncStatusSpinner.setVisibility(View.VISIBLE);
+        binding.mainSyncStatusDoneIcon.setVisibility(View.GONE);
+        updateSyncStatusIndicatorBackground(SyncStatusAccessory.SPINNER);
+        binding.mainSyncStatusContainer.setAlpha(1f);
+        binding.mainSyncStatusContainer.setTranslationX(0f);
+        binding.mainSyncStatusContainer.setVisibility(View.VISIBLE);
 
-        binding.swipeContainer.setColorSchemeResources(R.color.refresh_1, R.color.refresh_2, R.color.refresh_3, R.color.refresh_4);
-        binding.swipeContainer.setProgressBackgroundColorSchemeResource(UIUtils.getThemedResource(this, R.attr.actionbarBackground, android.R.attr.background));
-        binding.swipeContainer.setOnRefreshListener(this);
+        binding.content.setColorSchemeResources(R.color.refresh_1, R.color.refresh_2, R.color.refresh_3, R.color.refresh_4);
+        binding.content.setProgressBackgroundColorSchemeColor(
+                UIUtils.getThemedColor(this, R.attr.actionbarBackground, android.R.attr.background)
+        );
+        binding.content.setOnRefreshListener(this);
 
         FragmentManager fragmentManager = getSupportFragmentManager();
-		folderFeedList = (FolderListFragment) fragmentManager.findFragmentByTag("folderFeedListFragment");
+        folderFeedList = (FolderListFragment) fragmentManager.findFragmentByTag("folderFeedListFragment");
         feedSelectorFragment = ((FeedSelectorFragment) fragmentManager.findFragmentByTag("feedIntelligenceSelector"));
         feedSelectorFragment.setState(folderFeedList.currentState);
 
         // make sure the interval sync is scheduled, since we are the root Activity
         BootReceiver.scheduleSyncService(this);
 
-        Bitmap userPicture = PrefsUtils.getUserImage(this);
-        if (userPicture != null) {
-            userPicture = UIUtils.clipAndRound(userPicture, true, false);
-            binding.mainUserImage.setImageBitmap(userPicture);
-        }
-        binding.mainUserName.setText(PrefsUtils.getUserDetails(this).username);
-        binding.feedlistSearchQuery.setOnKeyListener(new OnKeyListener() {
-            public boolean onKey(View v, int keyCode, KeyEvent event) {
-                if ((keyCode == KeyEvent.KEYCODE_BACK) && (event.getAction() == KeyEvent.ACTION_DOWN)) {
-                    binding.feedlistSearchQuery.setVisibility(View.GONE);
-                    binding.feedlistSearchQuery.setText("");
-                    checkSearchQuery();
-                    return true;
-                }
-                if ((keyCode == KeyEvent.KEYCODE_ENTER) && (event.getAction() == KeyEvent.ACTION_DOWN)) {
-                    checkSearchQuery();
-                    return true;
-                }
-                return false;
-            }
-        });
-        binding.feedlistSearchQuery.addTextChangedListener(new TextWatcher() {
-            public void onTextChanged(CharSequence s, int start, int before, int count) {
-                checkSearchQuery();
-            }
-            public void afterTextChanged(Editable s) {}
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-        });
+        setUserImageAndName();
 
         feedUtils.currentFolderName = null;
 
         binding.mainMenuButton.setOnClickListener(v -> onClickMenuButton());
         binding.mainAddButton.setOnClickListener(v -> onClickAddButton());
-        binding.mainProfileButton.setOnClickListener(v -> onClickProfileButton());
         binding.mainUserImage.setOnClickListener(v -> onClickUserButton());
-        binding.mainSearchFeedsButton.setOnClickListener(v -> onClickSearchFeedsButton());
+        binding.bottomToolbar.setBackground(com.newsblur.view.FloatingToolbarSurface.background(this, prefsRepo.getResolvedTheme(this)));
+        fitBottomToolbarToContentOnTablets();
+        binding.bottomToolbar.bringToFront();
+        binding.bottomToolbar.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> applyFeedListBottomInset());
 
         // Check whether it's a shortcut intent
         String shortcutExtra = getIntent().getStringExtra(ShortcutUtils.SHORTCUT_EXTRA);
@@ -143,7 +161,7 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
 
         Trace.endSection();
         reportFullyDrawn();
-	}
+    }
 
     @Override
     protected void onNewIntent(Intent intent) {
@@ -161,24 +179,27 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
             com.newsblur.util.Log.e(getClass().getName(), "error resuming Main", e);
             finish();
         }
+        visibleMainRef = new WeakReference<>(this);
 
         String forceShowFeedId = getIntent().getStringExtra(EXTRA_FORCE_SHOW_FEED_ID);
         if (forceShowFeedId != null) {
             folderFeedList.forceShowFeed(forceShowFeedId);
         }
 
-        if (folderFeedList.getSearchQuery() != null) {
-            binding.feedlistSearchQuery.setText(folderFeedList.getSearchQuery());
-            binding.feedlistSearchQuery.setVisibility(View.VISIBLE);
-        }
+        int foregroundSessionId = NbApplication.getForegroundSessionId();
+        shouldTrackActiveSyncStatus = foregroundSessionId != lastForegroundSessionId;
+        lastForegroundSessionId = foregroundSessionId;
 
         // triggerSync() might not actually do enough to push a UI update if background sync has been
         // behaving itself. because the system will re-use the activity, at least one update on resume
         // will be required, however inefficient
         folderFeedList.hasUpdated();
 
-        NBSyncService.resetReadingSession(dbHelper);
-        NBSyncService.flushRecounts();
+        // As the tablet slide-over (FeedListDrawer.kt), the story list beneath still owns the reading session.
+        if (!isFeedDrawer()) {
+            syncServiceState.resetReadingSession(dbHelper); // TODO suspend
+        }
+        syncServiceState.flushRecounts();
 
         updateStatusIndicators();
         folderFeedList.pushUnreadCounts();
@@ -190,38 +211,149 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
     @Override
     protected void onPause() {
         keyboardManager.removeListener();
+        cancelPendingSyncStatusHide();
+        hasSeenActiveSyncStatus = false;
+        isShowingDoneSyncStatus = false;
+        shouldTrackActiveSyncStatus = false;
+        hideSyncStatusIndicator(false);
         super.onPause();
     }
 
     @Override
-	public void changedState(StateFilter state) {
-        if ( !( (state == StateFilter.ALL) ||
-                (state == StateFilter.SOME) ||
-                (state == StateFilter.BEST) ) ) {
-            binding.feedlistSearchQuery.setText("");
-            binding.feedlistSearchQuery.setVisibility(View.GONE);
-            checkSearchQuery();
+    protected void onDestroy() {
+        cancelPendingSyncStatusHide();
+        if (visibleMainRef.get() == this) {
+            visibleMainRef.clear();
         }
+        super.onDestroy();
+    }
 
-		folderFeedList.changeState(state);
-	}
+    // Main.java's floating toolbar spans a phone's width, but on a tablet that stretches the add
+    // button, filter, and settings button across the screen, so there it hugs its contents, centered.
+    // Main.java keeps the last feeds scrollable above the floating toolbar and Listen's mini player.
+    private void applyFeedListBottomInset() {
+        View list = findViewById(R.id.folderfeed_list);
+        if (list == null || binding == null) return;
+        int inset = binding.getRoot().getHeight() - binding.bottomToolbar.getTop() + UIUtils.dp2px(this, 8) + listenMiniPlayerInset;
+        if (list.getPaddingBottom() != inset) list.setPaddingRelative(list.getPaddingStart(), list.getPaddingTop(), list.getPaddingEnd(), inset);
+        if (list instanceof android.view.ViewGroup) ((android.view.ViewGroup) list).setClipToPadding(false);
+    }
 
     @Override
-	public void handleUpdate(int updateType) {
+    protected boolean showsListenMiniPlayer() {
+        return true;
+    }
+
+    @Override
+    protected View listenMiniPlayerAnchor() {
+        return binding != null ? binding.bottomToolbar : null;
+    }
+
+    @Override
+    protected boolean showsListenMiniPlayerInThisPane() {
+        // Main.java leaves the mini player to the story titles or reader beside it in a tablet split.
+        return !StorySplitView.isInSplit(this);
+    }
+
+    @Override
+    protected void onListenMiniPlayerInsetChanged(int insetPx) {
+        listenMiniPlayerInset = insetPx;
+        applyFeedListBottomInset();
+    }
+
+    private void fitBottomToolbarToContentOnTablets() {
+        if (getResources().getConfiguration().smallestScreenWidthDp < COMPACT_TOOLBAR_MIN_WIDTH_DP) return;
+        android.view.ViewGroup.LayoutParams toolbarParams = binding.bottomToolbar.getLayoutParams();
+        toolbarParams.width = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+        binding.bottomToolbar.setLayoutParams(toolbarParams);
+        View selector = feedSelectorFragment.getView();
+        if (selector != null && selector.getLayoutParams() instanceof android.widget.LinearLayout.LayoutParams) {
+            android.widget.LinearLayout.LayoutParams selectorParams = (android.widget.LinearLayout.LayoutParams) selector.getLayoutParams();
+            selectorParams.width = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+            selectorParams.weight = 0f;
+            selectorParams.setMarginStart(UIUtils.dp2px(this, 12));
+            selectorParams.setMarginEnd(UIUtils.dp2px(this, 12));
+            selector.setLayoutParams(selectorParams);
+        }
+    }
+
+    // FeedListDrawer.kt runs Main.java as a slide-over panel on top of a tablet's story list and reader.
+    protected boolean isFeedDrawer() {
+        return false;
+    }
+
+    // Opens the last story list as the root of a fresh task, with the feed list slid over it, or
+    // All Site Stories directly from the launcher shortcut.
+    private void openStoryListUnderFeedDrawer() {
+        BootReceiver.scheduleSyncService(this);
+        Intent storyList;
+        String shortcutExtra = getIntent().getStringExtra(ShortcutUtils.SHORTCUT_EXTRA);
+        if (shortcutExtra != null && shortcutExtra.startsWith(ShortcutUtils.SHORTCUT_ALL_STORIES)) {
+            storyList = new Intent(this, AllStoriesItemsList.class);
+            storyList.putExtra(ItemsList.EXTRA_FEED_SET, FeedSet.allFeeds());
+            storyList.putExtra(ItemsList.EXTRA_VISIBLE_SEARCH, shortcutExtra.equals(ShortcutUtils.SHORTCUT_ALL_STORIES_SEARCH));
+        } else {
+            storyList = LastStoryList.intent(this, dbHelper);
+            storyList.putExtra(ItemsList.EXTRA_OPEN_FEED_DRAWER, true);
+            // Hidden under the slide-over, the last story list loads nothing until the feed list
+            // closes without a pick; a pick switches it to that feed instead (FeedListDrawer.kt).
+            storyList.putExtra(ItemsList.EXTRA_DEFER_STORIES, true);
+            // A feed just added (AddFeedFragment.kt) stays visible in the slide-over's feed list.
+            storyList.putExtra(EXTRA_FORCE_SHOW_FEED_ID, getIntent().getStringExtra(EXTRA_FORCE_SHOW_FEED_ID));
+        }
+        storyList.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        startActivity(storyList);
+        finish();
+    }
+
+    public static Bitmap createVisibleFeedListSnapshot() {
+        Main main = visibleMainRef.get();
+        if (main == null || main.isDestroyed()) {
+            return null;
+        }
+
+        View decorView = main.getWindow().getDecorView();
+        int width = decorView.getWidth();
+        int height = decorView.getHeight();
+        if (width <= 0 || height <= 0) {
+            return null;
+        }
+
+        try {
+            Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bitmap);
+            decorView.draw(canvas);
+            return bitmap;
+        } catch (RuntimeException e) {
+            com.newsblur.util.Log.e(Main.class.getName(), "Unable to snapshot feed list", e);
+            return null;
+        }
+    }
+
+    @Override
+    public void changedState(StateFilter state) {
+        if (!((state == StateFilter.ALL) ||
+                (state == StateFilter.SOME) ||
+                (state == StateFilter.BEST))) {
+            folderFeedList.setSearchQuery(null);
+        }
+
+        folderFeedList.changeState(state);
+    }
+
+    @Override
+    public void handleUpdate(int updateType) {
         if ((updateType & UPDATE_REBUILD) != 0) {
             folderFeedList.reset();
         }
         if ((updateType & UPDATE_DB_READY) != 0) {
-            try {
-                folderFeedList.startLoaders();
-            } catch (IllegalStateException ex) {
-                ; // this might be called multiple times, and startLoaders is *not* idempotent
-            }
+            folderFeedList.loadData();
         }
         if ((updateType & UPDATE_STATUS) != 0) {
             updateStatusIndicators();
         }
-		if ((updateType & UPDATE_METADATA) != 0) {
+        if ((updateType & UPDATE_METADATA) != 0) {
+            setupQueue.metadataRefreshed();
             folderFeedList.hasUpdated();
         }
     }
@@ -246,9 +378,28 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
         return super.onKeyUp(keyCode, event);
     }
 
+    private void setUserImageAndName() {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.execute(() -> {
+            Bitmap rawImage = prefsRepo.getUserImage(this);
+            final Bitmap roundedImage = (rawImage != null)
+                    ? UIUtils.clipAndRound(rawImage, true, false)
+                    : null;
+
+            String username = prefsRepo.getUserName();
+
+            runOnUiThread(() -> {
+                if (roundedImage != null) {
+                    binding.mainUserImage.setImageBitmap(roundedImage);
+                }
+                binding.mainUserName.setText(username);
+            });
+        });
+    }
+
     public void updateUnreadCounts(int neutCount, int posiCount) {
-        binding.mainUnreadCountNeutText.setText(Integer.toString(neutCount));
-        binding.mainUnreadCountPosiText.setText(Integer.toString(posiCount));
+        binding.mainUnreadCountNeutText.setText(unreadCountFormatter.format(neutCount));
+        binding.mainUnreadCountPosiText.setText(unreadCountFormatter.format(posiCount));
     }
 
     /**
@@ -257,8 +408,15 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
      * having to expensively recalculate those totals from the DB.
      */
     public void updateFeedCount(int feedCount) {
-        if (feedCount < 1 ) {
-            if (NBSyncService.isFeedCountSyncRunning() || (!folderFeedList.firstCursorSeenYet)) {
+        setupQueue.feedListRendered();
+        // LanguageChooserDialog.kt asks once which language to use, after a feed list has loaded.
+        if (folderFeedList.firstCursorSeenYet) com.newsblur.compose.LanguageChooserGate.feedListLoaded(this);
+        if (folderFeedList.firstCursorSeenYet && isShowingLoadingSyncPlaceholder && !syncServiceState.isFeedCountSyncRunning()) {
+            updateStatusIndicators();
+        }
+
+        if (feedCount < 1) {
+            if (setupQueue.isPending() || syncServiceState.isFeedCountSyncRunning() || (!folderFeedList.firstCursorSeenYet)) {
                 binding.emptyViewImage.setVisibility(View.INVISIBLE);
                 binding.emptyViewText.setVisibility(View.INVISIBLE);
             } else {
@@ -279,60 +437,168 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
     }
 
     private void updateStatusIndicators() {
-        binding.swipeContainer.setRefreshing(NBSyncService.isFeedFolderSyncRunning());
+        String rawSyncStatus = syncServiceState.getSyncStatusMessage(this, false);
+        if (setupQueue.isPending() && !isOfflineSyncStatus(rawSyncStatus)) rawSyncStatus = getString(R.string.loading);
+        boolean isOfflineSyncStatus = isOfflineSyncStatus(rawSyncStatus);
+        boolean isShowingActiveSyncPill = rawSyncStatus != null && !isOfflineSyncStatus;
+        binding.content.setRefreshing(syncServiceState.isFeedFolderSyncRunning() && !isShowingActiveSyncPill);
 
-        String syncStatus = NBSyncService.getSyncStatusMessage(this, false);
-        if (syncStatus != null)  {
+        String displayedSyncStatus = rawSyncStatus;
+        if (displayedSyncStatus != null) {
             if (AppConstants.VERBOSE_LOG) {
-                syncStatus = syncStatus + UIUtils.getMemoryUsageDebug(this);
+                displayedSyncStatus = displayedSyncStatus + UIUtils.getMemoryUsageDebug(this);
             }
-            binding.mainSyncStatus.setText(syncStatus);
-            binding.mainSyncStatus.setVisibility(View.VISIBLE);
-        } else {
-            binding.mainSyncStatus.setVisibility(View.GONE);
+            isShowingLoadingSyncPlaceholder = false;
+            isShowingDoneSyncStatus = false;
+            if (isOfflineSyncStatus) {
+                hasSeenActiveSyncStatus = false;
+                showSyncStatusIndicator(displayedSyncStatus, SyncStatusAccessory.NONE);
+            } else {
+                if (shouldTrackActiveSyncStatus) {
+                    hasSeenActiveSyncStatus = true;
+                }
+                showSyncStatusIndicator(displayedSyncStatus, SyncStatusAccessory.SPINNER);
+            }
+            return;
+        }
+
+        // FolderListFragment.java may still be reading cached feeds before the service reports any status.
+        if (!folderFeedList.firstCursorSeenYet) {
+            isShowingLoadingSyncPlaceholder = true;
+            showSyncStatusIndicator(getString(R.string.loading), SyncStatusAccessory.SPINNER);
+            return;
+        }
+
+        if (hasSeenActiveSyncStatus) {
+            hasSeenActiveSyncStatus = false;
+            shouldTrackActiveSyncStatus = false;
+            isShowingLoadingSyncPlaceholder = false;
+            showSyncStatusIndicator(getString(R.string.sync_status_done), SyncStatusAccessory.DONE);
+            scheduleDoneSyncStatusHide();
+        } else if (isShowingLoadingSyncPlaceholder) {
+            isShowingLoadingSyncPlaceholder = false;
+            hideSyncStatusIndicator(false);
+        } else if (!isShowingDoneSyncStatus) {
+            hideSyncStatusIndicator(false);
+        }
+    }
+
+    private boolean isOfflineSyncStatus(String syncStatus) {
+        return getString(R.string.sync_status_offline).equals(syncStatus);
+    }
+
+    private void showSyncStatusIndicator(String syncStatus, SyncStatusAccessory accessory) {
+        cancelPendingSyncStatusHide();
+        isShowingDoneSyncStatus = accessory == SyncStatusAccessory.DONE;
+
+        binding.mainSyncStatusText.setText(syncStatus);
+        binding.mainSyncStatusSpinner.setVisibility(accessory == SyncStatusAccessory.SPINNER ? View.VISIBLE : View.GONE);
+        binding.mainSyncStatusDoneIcon.setVisibility(accessory == SyncStatusAccessory.DONE ? View.VISIBLE : View.GONE);
+        updateSyncStatusIndicatorBackground(accessory);
+
+        View container = binding.mainSyncStatusContainer;
+        container.animate().cancel();
+        if (container.getVisibility() != View.VISIBLE) {
+            container.setVisibility(View.VISIBLE);
+            container.post(() -> {
+                container.setTranslationX(getShownSyncStatusStartTranslation());
+                container.setAlpha(0f);
+                container.animate()
+                        .translationX(0f)
+                        .alpha(1f)
+                        .setInterpolator(SYNC_STATUS_SHOW_INTERPOLATOR)
+                        .setDuration(SYNC_STATUS_ANIMATION_DURATION_MS)
+                        .start();
+            });
+            return;
+        }
+
+        container.animate()
+                .translationX(0f)
+                .alpha(1f)
+                .setInterpolator(SYNC_STATUS_SHOW_INTERPOLATOR)
+                .setDuration(SYNC_STATUS_ANIMATION_DURATION_MS)
+                .start();
+    }
+
+    private void updateSyncStatusIndicatorBackground(SyncStatusAccessory accessory) {
+        binding.mainSyncStatusContainer.setBackgroundResource(
+                accessory == SyncStatusAccessory.DONE
+                        ? R.drawable.shape_sync_status_pill_done
+                        : R.drawable.shape_sync_status_pill
+        );
+    }
+
+    private void hideSyncStatusIndicator(boolean animated) {
+        cancelPendingSyncStatusHide();
+
+        View container = binding.mainSyncStatusContainer;
+        container.animate().cancel();
+        if (container.getVisibility() != View.VISIBLE) {
+            return;
+        }
+
+        if (!animated) {
+            container.setVisibility(View.GONE);
+            container.setTranslationX(0f);
+            container.setAlpha(1f);
+            return;
+        }
+
+        container.post(() -> container.animate()
+                .translationX(getHiddenSyncStatusTranslation())
+                .alpha(0f)
+                .setInterpolator(SYNC_STATUS_HIDE_INTERPOLATOR)
+                .setDuration(SYNC_STATUS_ANIMATION_DURATION_MS)
+                .withEndAction(() -> {
+                    container.setVisibility(View.GONE);
+                    container.setTranslationX(0f);
+                    container.setAlpha(1f);
+                })
+                .start());
+    }
+
+    // Main.java slides the sync pill past the end edge, which is the left edge in right-to-left layouts.
+    private float getHiddenSyncStatusTranslation() {
+        return (binding.mainSyncStatusContainer.getWidth() + UIUtils.dp2px(this, 20)) * UIUtils.towardEndSign(this);
+    }
+
+    private float getShownSyncStatusStartTranslation() {
+        return (binding.mainSyncStatusContainer.getWidth() + UIUtils.dp2px(this, 20)) * UIUtils.towardEndSign(this);
+    }
+
+    private void scheduleDoneSyncStatusHide() {
+        binding.mainSyncStatusContainer.removeCallbacks(hideSyncStatusRunnable);
+        binding.mainSyncStatusContainer.postDelayed(hideSyncStatusRunnable, SYNC_STATUS_DONE_DURATION_MS);
+    }
+
+    private void cancelPendingSyncStatusHide() {
+        if (binding != null) {
+            binding.mainSyncStatusContainer.removeCallbacks(hideSyncStatusRunnable);
         }
     }
 
     @Override
     public void onRefresh() {
-        NBSyncService.forceFeedsFolders();
+        shouldTrackActiveSyncStatus = true;
+        syncServiceState.forceFeedsFolders();
         triggerSync();
         folderFeedList.clearRecents();
     }
 
     private void onClickMenuButton() {
-        contextMenuDelegate.onMenuClick(binding.mainMenuButton, this);
-    }
-
-    @Override
-    public boolean onMenuItemClick(MenuItem item) {
-        return contextMenuDelegate.onMenuItemClick(item, folderFeedList);
+        contextMenuDelegate.onMenuClick(binding.mainMenuButton, folderFeedList);
     }
 
     private void onClickAddButton() {
-        Intent i = new Intent(this, FeedSearchActivity.class);
-        startActivity(i);
-    }
-
-    private void onClickProfileButton() {
-        Intent i = new Intent(this, Profile.class);
-        startActivity(i);
+        if (getSupportFragmentManager().findFragmentByTag("add_site") == null) {
+            AddFeedFragment.newInstance().show(getSupportFragmentManager(), "add_site");
+        }
     }
 
     private void onClickUserButton() {
         Intent i = new Intent(this, Profile.class);
         startActivity(i);
-    }
-
-    private void onClickSearchFeedsButton() {
-        if (binding.feedlistSearchQuery.getVisibility() != View.VISIBLE) {
-            binding.feedlistSearchQuery.setVisibility(View.VISIBLE);
-            binding.feedlistSearchQuery.requestFocus();
-        } else {
-            binding.feedlistSearchQuery.setText("");
-            binding.feedlistSearchQuery.setVisibility(View.GONE);
-            checkSearchQuery();
-        }
     }
 
     @Override
@@ -345,18 +611,10 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
         if (binding != null) {
             boolean enable = (firstVisibleItem == 0);
             if (wasSwipeEnabled != enable) {
-                binding.swipeContainer.setEnabled(enable);
+                binding.content.setEnabled(enable);
                 wasSwipeEnabled = enable;
             }
         }
-    }
-
-    private void checkSearchQuery() {
-        String q = binding.feedlistSearchQuery.getText().toString().trim();
-        if (q.length() < 1) {
-            q = null;
-        }
-        folderFeedList.setSearchQuery(q);
     }
 
     private void openAllStories(boolean isAllStoriesSearch) {
@@ -388,7 +646,7 @@ public class Main extends NbActivity implements StateChangedListener, SwipeRefre
         }
     }
 
-    private void setAndNotifySelectorState(StateFilter state, @StringRes  int notifyMsgRes) {
+    private void setAndNotifySelectorState(StateFilter state, @StringRes int notifyMsgRes) {
         feedSelectorFragment.setState(state);
         UIUtils.showSnackBar(binding.getRoot(), getString(notifyMsgRes));
     }

@@ -38,8 +38,10 @@ public class APIConstants {
 	public static final String PATH_USER_ACTIVITIES = "/social/activities";
 	public static final String PATH_USER_INTERACTIONS = "/social/interactions";
 	public static final String PATH_RIVER_STORIES = "/reader/river_stories";
+    public static final String PATH_TRENDING_STORIES = "/reader/trending_stories";
 	public static final String PATH_SHARED_RIVER_STORIES = "/social/river_stories";
 	public static final String PATH_FEED_STORIES = "/reader/feed";
+    public static final String PATH_REFRESH_FEED = "/reader/refresh_feed";
 	public static final String PATH_FEED_UNREAD_COUNT = "/reader/feed_unread_count";
 	public static final String PATH_SOCIALFEED_STORIES = "/social/stories";
 	public static final String PATH_SIGNUP = "/api/signup";
@@ -71,6 +73,7 @@ public class APIConstants {
     public static final String PATH_READ_STORIES = "/reader/read_stories";
     public static final String PATH_MOVE_FEED_TO_FOLDERS = "/reader/move_feed_to_folders";
     public static final String PATH_SAVE_FEED_CHOOSER = "/reader/save_feed_chooser";
+    public static final String PATH_SET_FEED_MUTE = "/reader/set_feed_mute";
     public static final String PATH_SET_NOTIFICATIONS = "/notifications/feed/";
     public static final String PATH_INSTA_FETCH = "/rss_feeds/exception_retry";
     public static final String PATH_RENAME_FEED = "/reader/rename_feed";
@@ -79,11 +82,32 @@ public class APIConstants {
     public static final String PATH_ADD_FOLDER = "/reader/add_folder";
     public static final String PATH_DELETE_FOLDER = "/reader/delete_folder";
     public static final String PATH_RENAME_FOLDER = "/reader/rename_folder";
+    public static final String PATH_DISCOVER_SIMILAR = "/discover/similar/";
+    public static final String PATH_DISCOVER_SIMILAR_FEEDS = "/discover/similar/feeds/";
     public static final String PATH_SAVE_RECEIPT = "/profile/save_android_receipt";
+    public static final String PATH_SET_PREFERENCE = "/profile/set_preference";
     public static final String PATH_FEED_STATISTICS = "/rss_feeds/statistics_embedded/";
     public static final String PATH_FEED_FAVICON_URL = "/rss_feeds/icon/";
     public static final String PATH_EXPORT_OPML = "/import/opml_export";
     public static final String PATH_IMPORT_OPML = "/import/opml_upload";
+    public static final String PATH_ASK_AI_QUESTION = "/ask-ai/question";
+    public static final String PATH_ASK_AI_TRANSCRIBE = "/ask-ai/transcribe";
+    public static final String PATH_BRIEFING_STORIES = "/briefing/stories";
+    public static final String PATH_BRIEFING_PREFERENCES = "/briefing/preferences";
+    public static final String PATH_BRIEFING_GENERATE = "/briefing/generate";
+    // APIConstants.java: ListenApiImpl.kt reads stories aloud through these endpoints.
+    public static final String PATH_LISTEN_VOICES = "/listen/voices";
+    public static final String PATH_LISTEN_LIBRARY = "/listen/library";
+    public static final String PATH_LISTEN_MANIFEST = "/listen/manifest";
+    public static final String PATH_LISTEN_SEGMENT = "/listen/segment";
+    public static final String PATH_LISTEN_PREVIEW = "/listen/preview";
+    public static final String PATH_LISTEN_USAGE = "/listen/usage";
+    public static final String PATH_LISTEN_PROGRESS = "/listen/progress";
+    public static final String PATH_MEDIA_PLAYBACK_STATE = "/media_player/playback_state";
+    public static final String PATH_MEDIA_ADD_TO_QUEUE = "/media_player/add_to_media_queue";
+    public static final String PATH_MEDIA_REMOVE_FROM_QUEUE = "/media_player/remove_from_media_queue";
+    public static final String PATH_MEDIA_REORDER_QUEUE = "/media_player/reorder_media_queue";
+    public static final String PATH_MEDIA_ADD_TO_HISTORY = "/media_player/add_to_media_history";
 
     public static String buildUrl(String path) {
         return CurrentUrlBase + path;
@@ -108,6 +132,7 @@ public class APIConstants {
     public static final String PARAMETER_REPLY_ID = "reply_id";
 	public static final String PARAMETER_COMMENT_USERID = "comment_user_id";
 	public static final String PARAMETER_FEEDID = "feed_id";
+	public static final String PARAMETER_MUTE = "mute";
 	public static final String PARAMETER_REPLY_TEXT = "reply_comments";
 	public static final String PARAMETER_STORY_FEEDID = "story_feed_id";
 	public static final String PARAMETER_SHARE_COMMENT = "comments";
@@ -132,10 +157,12 @@ public class APIConstants {
     public static final String PARAMETER_TAG = "tag";
     public static final String PARAMETER_APPROVED_FEEDS = "approved_feeds";
     public static final String PARAMETER_NOTIFICATION_TYPES = "notification_types";
-	public static final String PAREMETER_USER_TAGS = "user_tags";
+	public static final String PARAMETER_USER_TAGS = "user_tags";
+    public static final String PARAMETER_HIGHLIGHTS = "highlights";
 	public static final String PARAMETER_NOTIFICATION_FILTER = "notification_filter";
     public static final String PARAMETER_RESET_FETCH = "reset_fetch";
     public static final String PARAMETER_INFREQUENT = "infrequent";
+    public static final String PARAMETER_TRENDING_TYPE = "trending_type";
     public static final String PARAMETER_FEEDTITLE = "feed_title";
     public static final String PARAMETER_FOLDER_TO_DELETE = "folder_to_delete";
     public static final String PARAMETER_FOLDER_TO_RENAME = "folder_to_rename";
@@ -143,6 +170,13 @@ public class APIConstants {
     public static final String PARAMETER_ORDER_ID = "order_id";
     public static final String PARAMETER_PRODUCT_ID = "product_id";
     public static final String PARAMETER_SHOW_CHANGES = "show_changes";
+    public static final String PARAMETER_FEED_IDS = "feed_ids";
+    public static final String PARAMETER_QUESTION_ID = "question_id";
+    public static final String PARAMETER_CUSTOM_QUESTION = "custom_question";
+    public static final String PARAMETER_REQUEST_ID = "request_id";
+    public static final String PARAMETER_MODEL = "model";
+    public static final String PARAMETER_CONVERSATION_HISTORY = "conversation_history";
+    public static final String PARAMETER_READ_TIMES = "read_times";
 
     public static final String VALUE_PREFIX_SOCIAL = "social:";
     public static final String VALUE_ALLSOCIAL = "river:blurblogs"; // the magic value passed to the mark-read API for all social feeds
@@ -151,6 +185,8 @@ public class APIConstants {
     public static final String VALUE_TRUE = "true";
     public static final String VALUE_FALSE = "false";
     public static final String VALUE_STARRED = "starred";
-	
+
 	public static final String S3_URL_FEED_ICONS = "https://s3.amazonaws.com/icons.newsblur.com/";
+
+    public static final String NULL_STORY_TEXT = "__NULL_STORY_TEXT__";
 }

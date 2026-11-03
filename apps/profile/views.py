@@ -1,6 +1,15 @@
+"""User profile views: account settings, premium billing, login/signup, and preferences.
+
+Manages user authentication (login, signup, logout), profile settings,
+premium subscription management (Stripe/PayPal), notification preferences,
+and account import/export (OPML).
+"""
+
+import calendar
 import datetime
 import json as python_json
 import re
+from urllib.parse import urlencode
 
 import dateutil
 import requests
@@ -14,10 +23,11 @@ from django.contrib.auth.models import User
 from django.contrib.sites.models import Site
 from django.core.mail import mail_admins
 from django.db.models.aggregates import Sum
-from django.http import HttpResponse, HttpResponseRedirect
-from django.shortcuts import render
+from django.http import HttpResponse, HttpResponseForbidden, HttpResponseRedirect
+from django.shortcuts import get_object_or_404, render
 from django.urls import reverse
-from django.views.decorators.csrf import csrf_exempt, csrf_protect
+from django.utils.translation import gettext, gettext_lazy
+from django.views.decorators.csrf import csrf_exempt, csrf_protect, ensure_csrf_cookie
 from django.views.decorators.http import require_POST
 from paypal.standard.forms import PayPalPaymentsForm
 from paypal.standard.ipn.views import ipn as paypal_standard_ipn
@@ -28,6 +38,7 @@ from apps.analyzer.models import (
     MClassifierTag,
     MClassifierText,
     MClassifierTitle,
+    MClassifierUrl,
 )
 from apps.profile.forms import (
     PLANS,
@@ -39,8 +50,10 @@ from apps.profile.forms import (
     StripePlusPaymentForm,
 )
 from apps.profile.models import (
+    GooglePlayIds,
     MGiftCode,
     MRedeemedCode,
+    MReferral,
     PaymentHistory,
     PaypalIds,
     Profile,
@@ -49,9 +62,10 @@ from apps.profile.models import (
 from apps.reader.forms import LoginForm, SignupForm
 from apps.reader.models import RUserStory, UserSubscription, UserSubscriptionFolders
 from apps.rss_feeds.models import MStarredStory, MStarredStoryCounts
-from apps.social.models import MActivity, MSocialProfile, MSocialServices
+from apps.social.models import MActivity, MSharedStory, MSocialProfile, MSocialServices, MSocialSubscription
 from utils import json_functions as json
 from utils import log as logging
+from utils.languages import normalize_language
 from utils.user_functions import ajax_login_required, get_user
 from utils.view_functions import is_true, render_to
 from vendor.paypalapi.exceptions import PayPalAPIResponseError
@@ -67,6 +81,7 @@ SINGLE_FIELD_PREFS = (
     "has_trained_intelligence",
 )
 SPECIAL_PREFERENCES = (
+    "invoice_text",
     "old_password",
     "new_password",
     "autofollow_friends",
@@ -81,9 +96,13 @@ def set_preference(request):
     code = 1
     message = ""
     new_preferences = request.POST
+    if "language" in new_preferences and normalize_language(new_preferences["language"]) is None:
+        return dict(code=-1, message=gettext("Unsupported language"))
 
     preferences = json.decode(request.user.profile.preferences)
     for preference_name, preference_value in list(new_preferences.items()):
+        if preference_name == "language":
+            preference_value = normalize_language(preference_value)
         if preference_value in ["true", "false"]:
             preference_value = True if preference_value == "true" else False
         if preference_name in SINGLE_FIELD_PREFS:
@@ -108,6 +127,12 @@ def set_preference(request):
             if preference_value in ["true", "false"]:
                 preference_value = True if preference_value == "true" else False
             preferences[preference_name] = preference_value
+            if preference_name == "briefing_enabled":
+                from apps.briefing.models import MBriefingPreferences
+
+                briefing_prefs = MBriefingPreferences.get_or_create(request.user.pk)
+                briefing_prefs.enabled = bool(preference_value)
+                briefing_prefs.save()
         if preference_name == "intro_page":
             logging.user(request, "~FBAdvancing intro to page ~FM~SB%s" % preference_value)
 
@@ -128,7 +153,14 @@ def get_preference(request):
 
     payload = preferences
     if preference_name:
-        payload = preferences.get(preference_name)
+        if preference_name in SINGLE_FIELD_PREFS:
+            # These live on the Profile model, not in the preferences JSON blob
+            # (see set_preference above), so read the field for a fresh value.
+            payload = getattr(request.user.profile, preference_name)
+            if not isinstance(payload, (bool, int, str, type(None))):
+                payload = str(payload)
+        else:
+            payload = preferences.get(preference_name)
 
     response = dict(code=code, payload=payload)
     return response
@@ -153,6 +185,7 @@ def login(request):
 
 
 @csrf_exempt
+@ensure_csrf_cookie
 def signup(request):
     form = SignupForm(prefix="signup")
     recaptcha = request.POST.get("g-recaptcha-response", None)
@@ -176,16 +209,46 @@ def signup(request):
     if request.method == "POST":
         form = SignupForm(data=request.POST, prefix="signup")
         if form.is_valid() and not recaptcha_error:
-            new_user = form.save()
+            new_user = form.save(request=request)
             login_user(request, new_user, backend="django.contrib.auth.backends.ModelBackend")
             logging.user(new_user, "~FG~SB~BBNEW SIGNUP: ~FW%s" % new_user.email)
             new_user.profile.activate_free()
-            return HttpResponseRedirect(request.POST["next"] or reverse("index"))
+
+            # Record referral if present
+            referrer_username = request.COOKIES.get("nb_referrer") or request.POST.get("referrer")
+            if referrer_username:
+                try:
+                    referrer = User.objects.get(username__iexact=referrer_username)
+                    if referrer.pk != new_user.pk:
+                        MReferral.create_referral(referrer.pk, new_user.pk, new_user.username)
+                except User.DoesNotExist:
+                    pass
+
+            # Redeem gift code if present
+            gift_code = request.COOKIES.get("nb_gift_code") or request.POST.get("gift_code")
+            if gift_code:
+                gift = MGiftCode.objects.filter(gift_code__iexact=gift_code).first()
+                if gift and not gift.redeemed_date:
+                    MRedeemedCode.redeem(user=new_user, gift_code=gift_code)
+
+            response = HttpResponseRedirect(request.POST["next"] or reverse("index"))
+            response.delete_cookie("nb_referrer")
+            response.delete_cookie("nb_gift_code")
+            return response
+
+    referrer = request.COOKIES.get("nb_referrer") or request.GET.get("ref", "")
+    gift_code = request.COOKIES.get("nb_gift_code") or request.GET.get("gift", "")
 
     return render(
         request,
         "accounts/signup.html",
-        {"form": form, "recaptcha_error": recaptcha_error, "next": request.POST.get("next", "")},
+        {
+            "form": form,
+            "recaptcha_error": recaptcha_error,
+            "next": request.POST.get("next", ""),
+            "referrer": referrer,
+            "gift_code": gift_code,
+        },
     )
 
 
@@ -223,10 +286,18 @@ def set_account_settings(request):
     else:
         message = form.errors[list(form.errors.keys())[0]][0]
 
+    if "invoice_text" in form.errors:
+        code = -4
+        message = form.errors["invoice_text"][0]
+
+    preferences = json.decode(request.user.profile.preferences)
     payload = {
         "username": request.user.username,
         "email": request.user.email,
         "social_profile": MSocialProfile.profile(request.user.pk),
+        "invoice_text": preferences.get("invoice_text", ""),
+        "send_emails": request.user.profile.send_emails,
+        "notify_before_renewal": preferences.get("notify_before_renewal", False),
     }
     return dict(code=code, message=message, payload=payload)
 
@@ -322,7 +393,7 @@ def get_view_setting(request):
 @json.json_view
 def set_collapsed_folders(request):
     code = 1
-    collapsed_folders = request.POST["collapsed_folders"]
+    collapsed_folders = request.POST.get("collapsed_folders", "[]")
 
     request.user.profile.collapsed_folders = collapsed_folders
     request.user.profile.save()
@@ -373,6 +444,75 @@ def paypal_ipn(request):
         return paypal_webhooks(request)
 
 
+def find_paypal_user(data, custom_field="custom_id"):
+    """Find user from PayPal webhook data with fallbacks.
+
+    Tries multiple methods to find the user:
+    1. custom_id or custom field (set during subscription creation)
+    2. PaypalIds lookup by subscription ID
+    3. User lookup by subscriber email
+
+    Returns None silently for non-NewsBlur webhooks (e.g., Crabigator).
+    """
+    resource = data.get("resource", {})
+
+    # Try custom field first (custom_id or custom)
+    custom_value = resource.get(custom_field)
+    if custom_value:
+        try:
+            return User.objects.get(pk=int(custom_value))
+        except (User.DoesNotExist, ValueError):
+            pass
+
+    # Fallback 1: Look up by subscription ID in PaypalIds.
+    # Use filter() rather than get() because duplicate PaypalIds rows can share
+    # a paypal_sub_id (e.g. retried webhooks). If duplicates all belong to the
+    # same user we can safely return that user; if they span multiple users the
+    # match is ambiguous and we fall through rather than risk applying a webhook
+    # to the wrong account.
+    sub_id = resource.get("id") or resource.get("billing_agreement_id")
+    if sub_id:
+        paypal_ids = list(PaypalIds.objects.filter(paypal_sub_id=sub_id).select_related("user"))
+        distinct_user_ids = {p.user_id for p in paypal_ids if p.user_id}
+        if len(distinct_user_ids) > 1:
+            logging.user(
+                None,
+                f" ~FR~SBPayPal webhook: multiple users share paypal_sub_id={sub_id} "
+                f"users={sorted(distinct_user_ids)} - skipping PaypalIds lookup",
+            )
+        elif paypal_ids:
+            paypal_id = max(paypal_ids, key=lambda p: p.id)
+            if paypal_id.user:
+                return paypal_id.user
+
+    # Fallback 2: Look up by subscriber email
+    subscriber = resource.get("subscriber", {})
+    email = subscriber.get("email_address")
+    if email:
+        try:
+            return User.objects.get(email__iexact=email)
+        except User.DoesNotExist:
+            pass
+
+    # Only log error if there was a custom field (indicating an intended NewsBlur webhook)
+    # If no custom field, this is likely a non-NewsBlur webhook (e.g., Crabigator) - ignore silently
+    if custom_value:
+        logging.user(
+            None,
+            f" ~FR~SBPayPal webhook user not found - "
+            f"event_type={data.get('event_type')} "
+            f"resource_id={resource.get('id')} "
+            f"billing_agreement_id={resource.get('billing_agreement_id')} "
+            f"subscriber_email={email} "
+            f"payer_id={subscriber.get('payer_id')} "
+            f"custom_field={custom_field}={custom_value}",
+        )
+    else:
+        logging.debug(f" ---> PayPal webhook for non-NewsBlur product, ignoring: {data.get('event_type')}")
+
+    return None
+
+
 def paypal_webhooks(request):
     try:
         data = json.decode(request.body)
@@ -380,40 +520,214 @@ def paypal_webhooks(request):
         # Kick it over to paypal ipn
         return paypal_standard_ipn(request)
 
-    logging.user(request, f" ---> Paypal webhooks {data.get('event_type', '<no event_type>')} data: {data}")
+    # json.decode hands an empty body straight back, and a well-formed JSON body can
+    # still be a list or a string, so anything but a dict has no webhook to dispatch.
+    if not isinstance(data, dict):
+        logging.user(request, f" ---> Paypal webhooks unparseable body, ignoring: {request.body[:200]}")
+        return HttpResponse("OK")
+
+    if not data.get("event_type"):
+        logging.user(request, f" ---> Paypal webhooks missing event_type, ignoring: {data}")
+        return HttpResponse("OK")
+
+    logging.user(request, f" ---> Paypal webhooks {data['event_type']} data: {data}")
 
     if data["event_type"] == "BILLING.SUBSCRIPTION.CREATED":
         # Don't start a subscription but save it in case the payment comes before the subscription activation
-        user = User.objects.get(pk=int(data["resource"]["custom_id"]))
-        user.profile.store_paypal_sub_id(data["resource"]["id"], skip_save_primary=True)
+        user = find_paypal_user(data, custom_field="custom_id")
+        if user:
+            user.profile.store_paypal_sub_id(data["resource"]["id"], skip_save_primary=True)
     elif data["event_type"] in ["BILLING.SUBSCRIPTION.ACTIVATED", "BILLING.SUBSCRIPTION.UPDATED"]:
-        user = User.objects.get(pk=int(data["resource"]["custom_id"]))
-        user.profile.store_paypal_sub_id(data["resource"]["id"])
-        # plan_id = data['resource']['plan_id']
-        # if plan_id == Profile.plan_to_paypal_plan_id('premium'):
-        #     user.profile.activate_premium()
-        # elif plan_id == Profile.plan_to_paypal_plan_id('archive'):
-        #     user.profile.activate_archive()
-        # elif plan_id == Profile.plan_to_paypal_plan_id('pro'):
-        #     user.profile.activate_pro()
-        user.profile.cancel_premium_stripe()
-        user.profile.setup_premium_history()
-        if data["event_type"] == "BILLING.SUBSCRIPTION.ACTIVATED":
-            user.profile.cancel_and_prorate_existing_paypal_subscriptions(data)
+        user = find_paypal_user(data, custom_field="custom_id")
+        if user:
+            # Don't promote a SUSPENDED/CANCELLED sub to primary. When upgrading
+            # (e.g. premium -> archive), suspending the old sub fires UPDATED for it,
+            # which would otherwise overwrite paypal_sub_id with the now-dead old sub.
+            resource_status = data["resource"].get("status")
+            is_active_status = resource_status in ["ACTIVE", "APPROVED", "APPROVAL_PENDING"]
+            user.profile.store_paypal_sub_id(data["resource"]["id"], skip_save_primary=not is_active_status)
+            # plan_id = data['resource']['plan_id']
+            # if plan_id == Profile.plan_to_paypal_plan_id('premium'):
+            #     user.profile.activate_premium()
+            # elif plan_id == Profile.plan_to_paypal_plan_id('archive'):
+            #     user.profile.activate_archive()
+            # elif plan_id == Profile.plan_to_paypal_plan_id('pro'):
+            #     user.profile.activate_pro()
+            # Only cancel Stripe when a new PayPal sub is freshly activated. UPDATED
+            # events also fire for SUSPENDED/CANCELLED subs and for the old sub when
+            # swapping plans; those must not nuke a fresh Stripe sub. The previous
+            # guard (active_provider != "stripe") backfired for long-term Stripe
+            # users switching to PayPal — their active_provider was already "stripe",
+            # so the cancel was skipped and the old Stripe sub kept auto-renewing.
+            is_fresh_activation = data["event_type"] == "BILLING.SUBSCRIPTION.ACTIVATED" and is_active_status
+            if is_fresh_activation:
+                if user.profile.stripe_id:
+                    user.profile.refund_prorated_stripe_payment()
+                user.profile.cancel_premium_stripe()
+            user.profile.setup_premium_history()
+            if data["event_type"] == "BILLING.SUBSCRIPTION.ACTIVATED":
+                user.profile.cancel_and_prorate_existing_paypal_subscriptions(data)
     elif data["event_type"] == "PAYMENT.SALE.COMPLETED":
-        user = User.objects.get(pk=int(data["resource"]["custom"]))
-        user.profile.setup_premium_history()
+        user = find_paypal_user(data, custom_field="custom")
+        if user:
+            user.profile.setup_premium_history()
     elif data["event_type"] == "PAYMENT.CAPTURE.REFUNDED":
-        user = User.objects.get(pk=int(data["resource"]["custom_id"]))
-        user.profile.setup_premium_history()
+        user = find_paypal_user(data, custom_field="custom_id")
+        if user:
+            user.profile.setup_premium_history()
     elif data["event_type"] in ["BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED"]:
-        custom_id = data["resource"].get("custom_id", None)
-        if custom_id:
-            user = User.objects.get(pk=int(custom_id))
-        else:
-            paypal_id = PaypalIds.objects.get(paypal_sub_id=data["resource"]["id"])
-            user = paypal_id.user
+        user = find_paypal_user(data, custom_field="custom_id")
+        if user:
+            user.profile.setup_premium_history()
+
+    return HttpResponse("OK")
+
+
+def find_google_play_user(purchase_token):
+    try:
+        gp_id = GooglePlayIds.objects.get(purchase_token=purchase_token)
+        return gp_id.user
+    except GooglePlayIds.DoesNotExist:
+        return None
+
+
+def find_google_play_user_by_order(order_id):
+    if not order_id:
+        return None
+    payment = PaymentHistory.objects.filter(
+        payment_identifier=order_id,
+        payment_provider="android-subscription",
+    ).first()
+    return payment.user if payment else None
+
+
+def get_google_play_subscription(purchase_token):
+    if not getattr(settings, "GOOGLE_PLAY_SERVICE_ACCOUNT_INFO", None):
+        logging.debug(" ---> Google Play service account not configured")
+        return None
+
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        credentials = service_account.Credentials.from_service_account_info(
+            settings.GOOGLE_PLAY_SERVICE_ACCOUNT_INFO,
+            scopes=["https://www.googleapis.com/auth/androidpublisher"],
+        )
+        service = build("androidpublisher", "v3", credentials=credentials)
+        result = (
+            service.purchases()
+            .subscriptionsv2()
+            .get(
+                packageName=settings.GOOGLE_PLAY_PACKAGE_NAME,
+                token=purchase_token,
+            )
+            .execute()
+        )
+        return result
+    except Exception as e:
+        logging.debug(" ---> Google Play API error: %s" % e)
+        return None
+
+
+def handle_google_play_notification(user, notification_type, purchase_token, subscription_id):
+    NOTIFICATION_NAMES = {
+        1: "RECOVERED",
+        2: "RENEWED",
+        3: "CANCELED",
+        4: "PURCHASED",
+        5: "ON_HOLD",
+        6: "IN_GRACE_PERIOD",
+        7: "RESTARTED",
+        9: "DEFERRED",
+        10: "PAUSED",
+        12: "REVOKED",
+        13: "EXPIRED",
+    }
+    type_name = NOTIFICATION_NAMES.get(notification_type, "UNKNOWN(%s)" % notification_type)
+    logging.user(user, "~BM~FBGoogle Play RTDN: %s for %s" % (type_name, subscription_id))
+
+    if notification_type in (1, 2, 4, 7):
+        # RECOVERED, RENEWED, PURCHASED, RESTARTED -> activate/record payment
+        order_id_for_payment = None
+        subscription_info = get_google_play_subscription(purchase_token)
+        if subscription_info:
+            order_id_for_payment = subscription_info.get("latestOrderId")
+
+        user.profile.activate_android_premium(
+            order_id=order_id_for_payment,
+            product_id=subscription_id,
+        )
+        user.profile.active_provider = "google-play"
+        user.profile.premium_renewal = True
+        user.profile.save()
+
+    elif notification_type == 3:
+        # CANCELED -> keep premium until expiry but mark renewal off
+        user.profile.premium_renewal = False
+        user.profile.save()
+
+    elif notification_type in (12, 13):
+        # REVOKED, EXPIRED -> deactivate
         user.profile.setup_premium_history()
+        if user.profile.active_provider == "google-play":
+            user.profile.deactivate_premium()
+
+    elif notification_type in (5, 6):
+        # ON_HOLD, IN_GRACE_PERIOD -> keep premium active for now
+        pass
+
+
+@csrf_exempt
+def google_play_rtdn(request):
+    import base64
+
+    try:
+        envelope = json.decode(request.body)
+        message_data = base64.b64decode(envelope["message"]["data"])
+        notification = json.decode(message_data)
+    except Exception as e:
+        logging.debug(" ---> Google Play RTDN parse error: %s" % e)
+        return HttpResponse("Bad Request", status=400)
+
+    logging.debug(" ---> Google Play RTDN received: %s" % notification)
+
+    sub_notification = notification.get("subscriptionNotification")
+    if not sub_notification:
+        if notification.get("testNotification"):
+            logging.debug(" ---> Google Play RTDN test notification received")
+        return HttpResponse("OK")
+
+    purchase_token = sub_notification["purchaseToken"]
+    notification_type = sub_notification["notificationType"]
+    subscription_id = sub_notification.get("subscriptionId", "")
+
+    logging.debug(
+        " ---> Google Play RTDN type=%s subscription=%s token=%s..."
+        % (notification_type, subscription_id, purchase_token[:20])
+    )
+
+    # Look up user by purchase token
+    user = find_google_play_user(purchase_token)
+
+    # Fallback: call Google Play API to get order ID and match against PaymentHistory
+    if not user:
+        subscription_info = get_google_play_subscription(purchase_token)
+        if subscription_info:
+            latest_order_id = subscription_info.get("latestOrderId", "")
+            user = find_google_play_user_by_order(latest_order_id)
+            if user:
+                user.profile.store_google_play_ids(
+                    purchase_token=purchase_token,
+                    product_id=subscription_id,
+                    order_id=latest_order_id,
+                )
+
+    if not user:
+        logging.debug(" ---> Google Play RTDN user not found for token=%s..." % purchase_token[:20])
+        return HttpResponse("OK")
+
+    handle_google_play_notification(user, notification_type, purchase_token, subscription_id)
 
     return HttpResponse("OK")
 
@@ -484,6 +798,24 @@ def paypal_pro_return(request):
 @login_required
 def activate_premium(request):
     return HttpResponseRedirect(reverse("index"))
+
+
+@login_required
+def activate_premium_trial(request):
+    """Page that activates a premium trial and shows progress like payment returns."""
+    profile = request.user.profile
+    success = profile.start_premium_trial()
+
+    if not success:
+        return HttpResponseRedirect(reverse("index"))
+
+    return render(
+        request,
+        "reader/premium_trial_return.xhtml",
+        {
+            "user_profile": profile,
+        },
+    )
 
 
 @ajax_login_required
@@ -566,7 +898,12 @@ def save_ios_receipt(request):
 
     logging.user(request, "~BM~FBSaving iOS Receipt: %s %s" % (product_identifier, transaction_identifier))
 
-    paid = request.user.profile.activate_ios_premium(transaction_identifier)
+    if product_identifier == "newsblur_premium_pro":
+        paid = request.user.profile.activate_ios_pro(transaction_identifier)
+    elif product_identifier == "newsblur_premium_archive":
+        paid = request.user.profile.activate_ios_archive(transaction_identifier)
+    else:
+        paid = request.user.profile.activate_ios_premium(transaction_identifier)
     if paid:
         logging.user(
             request, "~BM~FBSending iOS Receipt email: %s %s" % (product_identifier, transaction_identifier)
@@ -596,10 +933,22 @@ def save_ios_receipt(request):
 def save_android_receipt(request):
     order_id = request.POST.get("order_id")
     product_id = request.POST.get("product_id")
+    purchase_token = request.POST.get("purchase_token")
 
-    logging.user(request, "~BM~FBSaving Android Receipt: %s %s" % (product_id, order_id))
+    logging.user(
+        request,
+        "~BM~FBSaving Android Receipt: %s %s (token: %s)"
+        % (product_id, order_id, "yes" if purchase_token else "no"),
+    )
 
-    paid = request.user.profile.activate_android_premium(order_id)
+    if purchase_token:
+        request.user.profile.store_google_play_ids(
+            purchase_token=purchase_token,
+            product_id=product_id,
+            order_id=order_id,
+        )
+
+    paid = request.user.profile.activate_android_premium(order_id, product_id=product_id)
     if paid:
         logging.user(request, "~BM~FBSending Android Receipt email: %s %s" % (product_id, order_id))
         subject = "Android Premium: %s (%s)" % (request.user.profile, product_id)
@@ -826,6 +1175,249 @@ def stripe_checkout(request):
     return HttpResponseRedirect(checkout_session.url, status=303)
 
 
+@login_required
+@require_POST
+def setup_usage_billing(request):
+    stripe.api_key = settings.STRIPE_SECRET
+    domain = Site.objects.get_current().domain
+
+    if not settings.STRIPE_PRICE_TEXT_CLASSIFICATION or not settings.STRIPE_PRICE_IMAGE_CLASSIFICATION:
+        logging.user(request, "~BR~FRStripe usage billing prices not configured")
+        return HttpResponseRedirect(reverse("index"))
+
+    # Guard against duplicate subscriptions. Meter events are customer-scoped,
+    # so any extra active sub on the same classifier prices silently double-bills
+    # the user every cycle. Bail out to the billing portal instead of creating
+    # a second subscription.
+    if request.user.profile.stripe_id:
+        classifier_price_ids = {
+            settings.STRIPE_PRICE_TEXT_CLASSIFICATION,
+            settings.STRIPE_PRICE_IMAGE_CLASSIFICATION,
+        }
+        try:
+            existing = stripe.Subscription.list(
+                customer=request.user.profile.stripe_id, status="active", limit=20
+            )
+            for sub in existing.data:
+                for item in sub["items"].data:
+                    if item.price and item.price.id in classifier_price_ids:
+                        logging.user(
+                            request,
+                            "~BR~FRUsage billing already active; redirecting to portal",
+                        )
+                        return HttpResponseRedirect(
+                            "https://%s%s?next=payments&usage_billing=already_active"
+                            % (domain, reverse("index"))
+                        )
+        except stripe.error.StripeError as e:
+            logging.user(request, f"~BR~FRStripe subscription list failed: {e}")
+
+    session_dict = {
+        "line_items": [
+            {
+                "price": settings.STRIPE_PRICE_TEXT_CLASSIFICATION,
+            },
+            {
+                "price": settings.STRIPE_PRICE_IMAGE_CLASSIFICATION,
+            },
+        ],
+        "mode": "subscription",
+        "metadata": {"newsblur_user_id": request.user.pk, "purpose": "usage_billing"},
+        "success_url": "https://%s%s?next=payments&usage_billing=setup_complete" % (domain, reverse("index")),
+        "cancel_url": "https://%s%s?next=payments" % (domain, reverse("index")),
+    }
+    if request.user.profile.stripe_id:
+        session_dict["customer"] = request.user.profile.stripe_id
+    else:
+        session_dict["customer_email"] = request.user.email
+
+    checkout_session = stripe.checkout.Session.create(**session_dict)
+
+    logging.user(request, "~BM~FBLoading Stripe usage billing checkout")
+
+    return HttpResponseRedirect(checkout_session.url, status=303)
+
+
+@login_required
+@require_POST
+def manage_usage_billing(request):
+    stripe.api_key = settings.STRIPE_SECRET
+    domain = Site.objects.get_current().domain
+
+    if not request.user.profile.stripe_id:
+        return HttpResponseRedirect(reverse("index"))
+
+    portal_session = stripe.billing_portal.Session.create(
+        customer=request.user.profile.stripe_id,
+        return_url="https://%s%s?next=payments" % (domain, reverse("index")),
+    )
+
+    return HttpResponseRedirect(portal_session.url, status=303)
+
+
+@ajax_login_required
+@json.json_view
+def usage_billing_history(request):
+    user = request.user
+
+    import calendar
+
+    # Self-hosted: return local spend data without Stripe
+    if user.profile.is_self_hosted_ai and not user.profile.is_usage_billing:
+        current_spend, limit, is_limit_reached = user.profile.get_usage_billing_spend()
+        now = datetime.datetime.utcnow()
+        cycle_start = now.replace(day=1).strftime("%Y-%m-%d")
+        last_day = calendar.monthrange(now.year, now.month)[1]
+        cycle_end = now.replace(day=last_day).strftime("%Y-%m-%d")
+        return {
+            "invoices": [],
+            "upcoming_invoice": None,
+            "current_cycle_spend": round(current_spend, 2),
+            "usage_billing_limit": float(limit) if limit else None,
+            "is_limit_reached": is_limit_reached,
+            "is_self_hosted": True,
+            "cycle_start": cycle_start,
+            "cycle_end": cycle_end,
+        }
+
+    if not user.profile.stripe_id or not user.profile.is_usage_billing:
+        return {"invoices": [], "upcoming_invoice": None}
+
+    stripe.api_key = settings.STRIPE_SECRET
+    usage_price_ids = set(
+        filter(None, [settings.STRIPE_PRICE_TEXT_CLASSIFICATION, settings.STRIPE_PRICE_IMAGE_CLASSIFICATION])
+    )
+
+    if not usage_price_ids:
+        return {"invoices": [], "upcoming_invoice": None}
+
+    invoices = []
+    try:
+        stripe_invoices = stripe.Invoice.list(customer=user.profile.stripe_id, limit=24)
+        for inv in stripe_invoices.data:
+            line_items = []
+            is_usage_invoice = False
+            for line in inv.lines.data:
+                if line.price and line.price.id in usage_price_ids:
+                    is_usage_invoice = True
+                    if line.price.id == settings.STRIPE_PRICE_TEXT_CLASSIFICATION:
+                        desc = "Natural language text classifier"
+                    elif line.price.id == settings.STRIPE_PRICE_IMAGE_CLASSIFICATION:
+                        desc = "Natural language image classifier"
+                    else:
+                        desc = line.description or line.price.nickname or "Natural language classifier usage"
+                    line_items.append(
+                        {
+                            "description": desc,
+                            "quantity": line.quantity,
+                            "amount": line.amount / 100.0,
+                        }
+                    )
+            if is_usage_invoice:
+                invoices.append(
+                    {
+                        "date": datetime.datetime.fromtimestamp(inv.created).strftime("%Y-%m-%d"),
+                        "amount": inv.amount_due / 100.0,
+                        "amount_paid": inv.amount_paid / 100.0,
+                        "status": inv.status,
+                        "hosted_invoice_url": inv.hosted_invoice_url,
+                        "invoice_number": inv.number,
+                        "line_items": line_items,
+                    }
+                )
+    except stripe.error.InvalidRequestError:
+        pass
+
+    upcoming_invoice = None
+    try:
+        upcoming = stripe.Invoice.upcoming(customer=user.profile.stripe_id)
+        upcoming_lines = []
+        is_usage = False
+        for line in upcoming.lines.data:
+            if line.price and line.price.id in usage_price_ids:
+                is_usage = True
+                if line.price.id == settings.STRIPE_PRICE_TEXT_CLASSIFICATION:
+                    desc = "Natural language text classifier"
+                elif line.price.id == settings.STRIPE_PRICE_IMAGE_CLASSIFICATION:
+                    desc = "Natural language image classifier"
+                else:
+                    desc = line.description or line.price.nickname or "Natural language classifier usage"
+                upcoming_lines.append(
+                    {
+                        "description": desc,
+                        "quantity": line.quantity,
+                        "amount": line.amount / 100.0,
+                    }
+                )
+        if is_usage:
+            upcoming_invoice = {
+                "date": datetime.datetime.fromtimestamp(upcoming.period_end).strftime("%Y-%m-%d"),
+                "amount": sum(l["amount"] for l in upcoming_lines),
+                "status": "upcoming",
+                "line_items": upcoming_lines,
+            }
+    except stripe.error.InvalidRequestError:
+        pass
+
+    current_spend, limit, is_limit_reached = user.profile.get_usage_billing_spend()
+
+    now = datetime.datetime.utcnow()
+    cycle_start = now.replace(day=1).strftime("%Y-%m-%d")
+    last_day = calendar.monthrange(now.year, now.month)[1]
+    cycle_end = now.replace(day=last_day).strftime("%Y-%m-%d")
+
+    return {
+        "invoices": invoices,
+        "upcoming_invoice": upcoming_invoice,
+        "current_cycle_spend": round(current_spend, 2),
+        "usage_billing_limit": float(limit) if limit else None,
+        "is_limit_reached": is_limit_reached,
+        "cycle_start": cycle_start,
+        "cycle_end": cycle_end,
+    }
+
+
+@ajax_login_required
+@require_POST
+@json.json_view
+def save_usage_billing_limit(request):
+    """Save or clear the user's monthly spending limit for AI classifiers."""
+    from decimal import Decimal, InvalidOperation
+
+    from utils.llm_costs import LLMCostTracker
+
+    user = request.user
+    if not user.profile.can_use_ai_classifiers:
+        return {"code": -1, "message": gettext("Usage billing not enabled")}
+
+    limit_str = request.POST.get("limit", "").strip()
+
+    if not limit_str:
+        user.profile.usage_billing_limit = None
+        user.profile.save()
+        LLMCostTracker._invalidate_limit_cache(user.pk)
+        logging.user(request, "~BC~FBCleared AI classifier spending limit")
+        return {"code": 1, "limit": None}
+
+    try:
+        limit = Decimal(limit_str)
+    except (InvalidOperation, ValueError):
+        return {"code": -1, "message": gettext("Invalid amount")}
+
+    if limit <= 0:
+        return {"code": -1, "message": gettext("Limit must be a positive amount")}
+
+    if limit > 10000:
+        return {"code": -1, "message": gettext("Limit cannot exceed $10,000")}
+
+    user.profile.usage_billing_limit = limit
+    user.profile.save()
+    LLMCostTracker._invalidate_limit_cache(user.pk)
+    logging.user(request, "~BC~FBSet AI classifier spending limit to $%.2f" % limit)
+
+    return {"code": 1, "limit": float(limit)}
+
+
 @render_to("reader/activities_module.xhtml")
 def load_activities(request):
     user = get_user(request)
@@ -907,10 +1499,42 @@ def payment_history(request):
         "premium_expire": user.profile.premium_expire,
         "premium_renewal": user.profile.premium_renewal,
         "active_provider": user.profile.active_provider,
+        "is_usage_billing": user.profile.is_usage_billing,
         "payments": history,
         "statistics": statistics,
         "next_invoice": next_invoice,
     }
+
+
+@login_required
+def invoice(request, payment_id):
+    """
+    Generate a printable invoice for a specific payment.
+    Staff can view any invoice; regular users can only view their own.
+    """
+    if request.user.is_staff:
+        payment = get_object_or_404(PaymentHistory, id=payment_id)
+    else:
+        payment = get_object_or_404(PaymentHistory, id=payment_id, user=request.user)
+
+    invoice_number = f"NB-{payment.id:08d}"
+
+    # Calculate coverage period (1 year from payment date)
+    coverage_start = payment.payment_date
+    coverage_end = coverage_start + dateutil.relativedelta.relativedelta(years=1)
+
+    return render(
+        request,
+        "profile/invoice.xhtml",
+        {
+            "payment": payment,
+            "invoice_number": invoice_number,
+            "invoice_text": json.decode(payment.user.profile.preferences).get("invoice_text", ""),
+            "user": payment.user,
+            "coverage_start": coverage_start,
+            "coverage_end": coverage_end,
+        },
+    )
 
 
 @ajax_login_required
@@ -1011,13 +1635,23 @@ def forgot_password(request):
     if request.method == "POST":
         form = ForgotPasswordForm(request.POST)
         if form.is_valid():
-            logging.user(request.user, "~BC~FRForgot password: ~SB%s" % request.POST["email"])
+            # Use the cleaned email, since the form strips the surrounding whitespace
+            # that the raw POST value still carries. Looking the raw value up instead
+            # misses the account the form just validated.
+            email = form.cleaned_data["email"]
+            logging.user(request.user, "~BC~FRForgot password: ~SB%s" % email)
             try:
-                user = User.objects.get(email__iexact=request.POST["email"])
+                user = User.objects.get(email__iexact=email)
             except User.MultipleObjectsReturned:
-                user = User.objects.filter(email__iexact=request.POST["email"])[0]
-            user.profile.send_forgot_password_email()
-            return HttpResponseRedirect(reverse("index"))
+                user = User.objects.filter(email__iexact=email)[0]
+            except User.DoesNotExist:
+                # The account went away between form validation and this lookup.
+                logging.user(request.user, "~BC~FRFailed forgot password: ~SB%s~SN" % email)
+                form.add_error("email", "No user has that email address.")
+                user = None
+            if user:
+                user.profile.send_forgot_password_email()
+                return HttpResponseRedirect(reverse("index"))
         else:
             logging.user(request.user, "~BC~FRFailed forgot password: ~SB%s~SN" % request.POST.get("email"))
     else:
@@ -1075,9 +1709,135 @@ def delete_starred_stories(request):
 
 @ajax_login_required
 @json.json_view
+def count_starred_stories(request):
+    timestamp = request.POST.get("timestamp", None)
+    if timestamp:
+        delete_date = datetime.datetime.fromtimestamp(int(timestamp))
+    else:
+        delete_date = datetime.datetime.now()
+    count = MStarredStory.objects.filter(user_id=request.user.pk, starred_date__lte=delete_date).count()
+    return dict(code=1, count=count)
+
+
+@ajax_login_required
+@json.json_view
+def count_shared_stories(request):
+    timestamp = request.POST.get("timestamp", None)
+    if timestamp:
+        delete_date = datetime.datetime.fromtimestamp(int(timestamp))
+    else:
+        delete_date = datetime.datetime.now()
+    count = MSharedStory.objects.filter(user_id=request.user.pk, shared_date__lte=delete_date).count()
+    return dict(code=1, count=count)
+
+
+@ajax_login_required
+@json.json_view
+def delete_shared_stories(request):
+    timestamp = request.POST.get("timestamp", None)
+    if timestamp:
+        delete_date = datetime.datetime.fromtimestamp(int(timestamp))
+    else:
+        delete_date = datetime.datetime.now()
+
+    shared_stories = MSharedStory.objects.filter(user_id=request.user.pk, shared_date__lte=delete_date)
+    stories_deleted = shared_stories.count()
+
+    # Mark social subscriptions for unread recalculation
+    socialsubs = MSocialSubscription.objects.filter(
+        subscription_user_id=request.user.pk, needs_unread_recalc=False
+    )
+    for socialsub in socialsubs:
+        socialsub.needs_unread_recalc = True
+        socialsub.save()
+
+    # Delete each story (triggers cleanup: removes from Redis, removes activity)
+    for story in shared_stories:
+        story.delete()
+
+    # Update shared stories count in profile
+    try:
+        profile = MSocialProfile.objects.get(user_id=request.user.pk)
+        profile.count_follows()
+        shared_stories_count = profile.shared_stories_count
+    except MSocialProfile.DoesNotExist:
+        shared_stories_count = 0
+
+    logging.user(
+        request.user,
+        "~BC~FRDeleting %s/%s shared stories (%s)"
+        % (stories_deleted, stories_deleted + shared_stories_count, delete_date),
+    )
+
+    return dict(code=1, stories_deleted=stories_deleted, shared_stories_count=shared_stories_count)
+
+
+@ajax_login_required
+@json.json_view
+def count_classifiers(request):
+    user_id = request.user.pk
+    counts = {
+        "title": MClassifierTitle.objects.filter(user_id=user_id, is_regex__ne=True).count(),
+        "title_regex": MClassifierTitle.objects.filter(user_id=user_id, is_regex=True).count(),
+        "author": MClassifierAuthor.objects.filter(user_id=user_id, is_regex__ne=True).count(),
+        "author_regex": MClassifierAuthor.objects.filter(user_id=user_id, is_regex=True).count(),
+        "tag": MClassifierTag.objects.filter(user_id=user_id).count(),
+        "text": MClassifierText.objects.filter(user_id=user_id, is_regex__ne=True).count(),
+        "text_regex": MClassifierText.objects.filter(user_id=user_id, is_regex=True).count(),
+        "feed": MClassifierFeed.objects.filter(user_id=user_id).count(),
+        "url": MClassifierUrl.objects.filter(user_id=user_id, is_regex__ne=True).count(),
+        "url_regex": MClassifierUrl.objects.filter(user_id=user_id, is_regex=True).count(),
+    }
+    total = sum(counts.values())
+    return dict(code=1, counts=counts, total=total)
+
+
+@ajax_login_required
+@json.json_view
+def delete_classifiers(request):
+    user_id = request.user.pk
+    categories = request.POST.getlist("categories")
+
+    classifier_map = {
+        "title": (MClassifierTitle, {"is_regex__ne": True}),
+        "title_regex": (MClassifierTitle, {"is_regex": True}),
+        "author": (MClassifierAuthor, {"is_regex__ne": True}),
+        "author_regex": (MClassifierAuthor, {"is_regex": True}),
+        "tag": (MClassifierTag, {}),
+        "text": (MClassifierText, {"is_regex__ne": True}),
+        "text_regex": (MClassifierText, {"is_regex": True}),
+        "feed": (MClassifierFeed, {}),
+        "url": (MClassifierUrl, {"is_regex__ne": True}),
+        "url_regex": (MClassifierUrl, {"is_regex": True}),
+    }
+
+    total_deleted = 0
+    deleted_counts = {}
+    for category in categories:
+        if category in classifier_map:
+            model, extra_filters = classifier_map[category]
+            qs = model.objects.filter(user_id=user_id, **extra_filters)
+            count = qs.count()
+            qs.delete()
+            deleted_counts[category] = count
+            total_deleted += count
+
+    logging.user(
+        request.user,
+        "~BC~FRDeleting %s classifiers (%s)"
+        % (total_deleted, ", ".join("%s: %s" % (k, v) for k, v in deleted_counts.items())),
+    )
+
+    return dict(code=1, total_deleted=total_deleted, deleted_counts=deleted_counts)
+
+
+@ajax_login_required
+@json.json_view
 def delete_all_sites(request):
     request.user.profile.send_opml_export_email(
-        reason="You have deleted all of your sites, so here's a backup of all of your subscriptions just in case."
+        reason=gettext_lazy(
+            "You have deleted all of your sites, so here's a backup of all of your subscriptions just in case."
+        )
     )
 
     subs = UserSubscription.objects.filter(user=request.user)
@@ -1096,23 +1856,83 @@ def delete_all_sites(request):
 @login_required
 @render_to("profile/email_optout.xhtml")
 def email_optout(request):
+    """Unsubscribe from all NewsBlur emails. GET shows a confirmation button so that
+    mail clients pre-loading links don't unsubscribe anybody; only the POST from the
+    button on templates/profile/email_optout.xhtml actually unsubscribes."""
     user = request.user
-    user.profile.send_emails = False
-    user.profile.save()
+    unsubscribed = False
+
+    if request.method == "POST":
+        user.profile.send_emails = False
+        user.profile.save()
+        unsubscribed = True
+        logging.user(user, "~BB~FM~SBUnsubscribed from all NewsBlur emails")
 
     return {
         "user": user,
+        "unsubscribed": unsubscribed,
     }
 
 
+@csrf_exempt
+@render_to("profile/email_optout.xhtml")
+def email_optout_token(request, username, secret):
+    """Tokened unsubscribe link used in email footers (templates/mail/email_base.xhtml).
+    Validates the same secret_token as the autologin links in emails and logs the user
+    in, so no login is required to unsubscribe. GET shows a confirmation button; POST
+    unsubscribes. POST also serves RFC 8058 List-Unsubscribe one-click requests from
+    mail providers, which is why this view is csrf_exempt: the secret token in the URL
+    authorizes the action."""
+    profile = Profile.objects.filter(user__username=username, secret_token=secret).first()
+    if not profile:
+        return HttpResponseForbidden()
+
+    user = profile.user
+    if request.user.pk != user.pk:
+        user.backend = settings.AUTHENTICATION_BACKENDS[0]
+        login_user(request, user, backend="django.contrib.auth.backends.ModelBackend")
+        logging.user(user, "~FG~BB~SKAuto-Login via email unsubscribe link~FW")
+
+    unsubscribed = False
+    if request.method == "POST":
+        profile.send_emails = False
+        profile.save()
+        unsubscribed = True
+        logging.user(user, "~BB~FM~SBUnsubscribed from all NewsBlur emails via email link")
+
+    return {
+        "user": user,
+        "unsubscribed": unsubscribed,
+    }
+
+
+@csrf_exempt
+@require_POST
 @json.json_view
 def ios_subscription_status(request):
-    logging.debug(" ---> iOS Subscription Status: %s" % request.body)
-    data = json.decode(request.body)
-    subject = "iOS Subscription Status: %s" % data.get("notification_type", "[missing]")
-    message = """%s""" % (request.body)
-    mail_admins(subject, message)
+    from appstoreserverlibrary.signed_data_verifier import VerificationException, VerificationStatus
 
+    from apps.profile.apple_notifications import process_apple_notification
+
+    try:
+        if len(request.body) > 128 * 1024:
+            raise ValueError("Oversized notification")
+        data = json.decode(request.body)
+        if not isinstance(data, dict) or not isinstance(data.get("signedPayload"), str):
+            raise ValueError("Missing signed payload")
+        result = process_apple_notification(data["signedPayload"])
+    except VerificationException as exc:
+        # Never log signed receipts or secrets from requests in apps/profile/views.py.
+        logging.debug(" ---> Apple notification verification failed: %s" % exc.status.name)
+        status = 503 if exc.status == VerificationStatus.RETRYABLE_VERIFICATION_FAILURE else 400
+        return HttpResponse(status=status)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return HttpResponse(status=400)
+
+    logging.debug(" ---> Apple notification processed: %s" % result)
+    if result["status"] in ("unmatched", "ambiguous"):
+        # Apple retries while a newly purchased subscription reaches save_ios_receipt.
+        return HttpResponse(status=503)
     return {"code": 1}
 
 
@@ -1120,3 +1940,238 @@ def trigger_error(request):
     logging.user(request.user, "~BR~FW~SBTriggering divison by zero")
     division_by_zero = 1 / 0
     return HttpResponseRedirect(reverse("index"))
+
+
+# = Referral & Gift Views ====================================================
+
+
+def referral_landing(request, username):
+    try:
+        referrer = User.objects.get(username__iexact=username)
+    except User.DoesNotExist:
+        return HttpResponseRedirect(reverse("index"))
+
+    # Don't allow self-referral
+    if request.user.is_authenticated and request.user.pk == referrer.pk:
+        return HttpResponseRedirect(reverse("index"))
+
+    response = HttpResponseRedirect("%s?ref=%s" % (reverse("welcome-signup"), referrer.username))
+    response.set_cookie("nb_referrer", referrer.username, max_age=30 * 24 * 60 * 60)
+    return response
+
+
+@login_required
+@require_POST
+@json.json_view
+def gift_checkout(request):
+    stripe.api_key = settings.STRIPE_SECRET
+    domain = Site.objects.get_current().domain
+    gift_tier = request.POST.get("gift_tier", "premium")
+    gift_duration = request.POST.get("gift_duration", "year")
+
+    if gift_tier not in ("premium", "archive", "pro"):
+        return {"code": -1, "message": gettext("Invalid gift tier.")}
+
+    tier_prices = {"premium": 36, "archive": 99, "pro": 299}
+    payment_amount = tier_prices[gift_tier]
+    if gift_tier == "pro" and gift_duration == "month":
+        payment_amount = 25
+    duration_days = 365 if gift_duration == "year" else 30
+
+    # Staff can gift for free
+    if request.user.is_staff:
+        gift = MGiftCode.add(
+            gifting_user_id=request.user.pk,
+            duration=duration_days,
+            payment=0,
+            gift_tier=gift_tier,
+            is_staff_gift=True,
+        )
+        gift_url = "https://%s/gift/%s/%s/%s" % (domain, gift_tier, request.user.username, gift.gift_code)
+        logging.user(
+            request.user,
+            "~FG~BBStaff gift created: %s tier=%s code=%s"
+            % (request.user.username, gift_tier, gift.gift_code),
+        )
+        return {"code": 1, "gift_url": gift_url, "gift_code": gift.gift_code}
+
+    # Create Stripe Checkout Session for one-time payment
+    checkout_session = stripe.checkout.Session.create(
+        line_items=[
+            {
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": "NewsBlur %s Gift (%s)"
+                        % (gift_tier.title(), "1 year" if gift_duration == "year" else "1 month"),
+                    },
+                    "unit_amount": payment_amount * 100,  # Stripe uses cents
+                },
+                "quantity": 1,
+            }
+        ],
+        mode="payment",
+        metadata={
+            "newsblur_user_id": request.user.pk,
+            "purpose": "gift",
+            "gift_tier": gift_tier,
+            "gift_duration": gift_duration,
+        },
+        success_url="https://%s/?next=gift" % domain,
+        cancel_url="https://%s%s" % (domain, reverse("index")),
+        customer_email=request.user.email,
+    )
+
+    logging.user(request, "~BM~FBLoading Stripe gift checkout for %s" % gift_tier)
+
+    return {"code": 1, "stripe_url": checkout_session.url}
+
+
+@login_required
+def gift_checkout_complete(request):
+    gift_tier = request.GET.get("gift_tier", "premium")
+    # The gift code is created by the stripe_checkout_session_completed webhook.
+    # Find the most recent gift code for this user.
+    recent_gift = (
+        MGiftCode.objects.filter(gifting_user_id=request.user.pk, gift_tier=gift_tier)
+        .order_by("-created_date")
+        .first()
+    )
+
+    domain = Site.objects.get_current().domain
+    gift_url = None
+    gift_code = None
+    if recent_gift:
+        gift_url = "https://%s/gift/%s/%s/%s" % (
+            domain,
+            gift_tier,
+            request.user.username,
+            recent_gift.gift_code,
+        )
+        gift_code = recent_gift.gift_code
+
+    return render(
+        request,
+        "profile/gift_checkout_complete.html",
+        {
+            "gift_url": gift_url,
+            "gift_code": gift_code,
+            "gift_tier": gift_tier,
+        },
+    )
+
+
+def gift_redeem(request, gift_tier, username, gift_code):
+    gift = MGiftCode.objects.filter(gift_code__iexact=gift_code).first()
+    if not gift:
+        return render(request, "profile/gift_redeem.html", {"error": "Invalid gift code."})
+
+    # Resolve gifter username for display
+    gifter_username = username
+    if not gifter_username:
+        try:
+            gifter = User.objects.get(pk=gift.gifting_user_id)
+            gifter_username = gifter.username
+        except User.DoesNotExist:
+            gifter_username = None
+
+    tier_names = {"premium": "Premium", "archive": "Premium Archive", "pro": "Premium Pro"}
+    tier_display = tier_names.get(gift.gift_tier, "Premium")
+
+    if gift.redeemed_date:
+        # If the current user already redeemed this gift, show them the banner again
+        if request.user.is_authenticated:
+            already_redeemed = MRedeemedCode.objects.filter(
+                user_id=request.user.pk, gift_code__iexact=gift_code
+            ).first()
+            if already_redeemed:
+                # Skip actual redemption, just show the banner
+                pass
+            else:
+                return render(
+                    request, "profile/gift_redeem.html", {"error": "This gift has already been redeemed."}
+                )
+        else:
+            return render(
+                request, "profile/gift_redeem.html", {"error": "This gift has already been redeemed."}
+            )
+    elif gift.expires_date and gift.expires_date < datetime.datetime.now():
+        return render(request, "profile/gift_redeem.html", {"error": "This gift has expired."})
+    elif request.user.is_authenticated:
+        MRedeemedCode.redeem(user=request.user, gift_code=gift_code)
+
+    if request.user.is_authenticated:
+        duration_days = gift.duration_days or 365
+        if duration_days >= 365:
+            duration_label = "%d year" % (duration_days // 365)
+            if duration_days // 365 > 1:
+                duration_label += "s"
+        elif duration_days >= 30:
+            duration_label = "%d month" % (duration_days // 30)
+            if duration_days // 30 > 1:
+                duration_label += "s"
+        else:
+            duration_label = "%d days" % duration_days
+        params = urlencode(
+            {
+                "gift_redeemed": tier_display,
+                "gift_duration": duration_label,
+                "gift_from": gifter_username or "",
+            }
+        )
+        return HttpResponseRedirect("%s?%s" % (reverse("index"), params))
+
+    # Not logged in: redirect to signup with gift code and gifter context
+    response = HttpResponseRedirect("%s?gift=%s" % (reverse("welcome-signup"), gift_code))
+    response.set_cookie("nb_gift_code", gift_code, max_age=24 * 60 * 60)
+    return response
+
+
+@ajax_login_required
+@json.json_view
+def referral_data(request):
+    stats = MReferral.get_referral_stats(request.user.pk)
+    stats["referral_url"] = "https://%s/refer/%s" % (
+        Site.objects.get_current().domain,
+        request.user.username,
+    )
+    stats["username"] = request.user.username
+    profile = request.user.profile
+    if profile.is_pro:
+        stats["referrer_tier"] = "pro"
+    elif profile.is_archive:
+        stats["referrer_tier"] = "archive"
+    else:
+        stats["referrer_tier"] = "premium"
+    return stats
+
+
+@ajax_login_required
+@json.json_view
+def gift_data(request):
+    domain = Site.objects.get_current().domain
+    gifts_sent = MGiftCode.objects.filter(gifting_user_id=request.user.pk).order_by("-created_date")
+    gifts_received = MRedeemedCode.objects.filter(user_id=request.user.pk).order_by("-redeemed_date")
+
+    return {
+        "gifts_sent": [
+            {
+                "gift_code": g.gift_code,
+                "gift_tier": getattr(g, "gift_tier", "premium"),
+                "gift_url": "https://%s/gift/%s/%s/%s"
+                % (domain, getattr(g, "gift_tier", "premium"), request.user.username, g.gift_code),
+                "created_date": g.created_date.strftime("%Y-%m-%d") if g.created_date else None,
+                "redeemed": bool(getattr(g, "redeemed_date", None)),
+                "is_staff_gift": getattr(g, "is_staff_gift", False),
+                "refunded": bool(getattr(g, "stripe_refund_id", None)),
+            }
+            for g in gifts_sent
+        ],
+        "gifts_received": [
+            {
+                "gift_code": g.gift_code,
+                "redeemed_date": g.redeemed_date.strftime("%Y-%m-%d") if g.redeemed_date else None,
+            }
+            for g in gifts_received
+        ],
+    }

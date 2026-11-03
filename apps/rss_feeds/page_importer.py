@@ -5,7 +5,6 @@ import time
 import traceback
 import urllib.error
 import urllib.parse
-import urllib.request
 import zlib
 from socket import error as SocketError
 
@@ -13,7 +12,7 @@ import feedparser
 import requests
 from django.conf import settings
 from django.contrib.sites.models import Site
-from django.utils.encoding import smart_bytes
+from django.utils.encoding import smart_bytes, smart_str
 from django.utils.text import compress_string as compress_string_with_gzip
 from mongoengine.queryset import NotUniqueError
 from OpenSSL.SSL import Error as OpenSSLError
@@ -21,8 +20,11 @@ from pyasn1.error import PyAsn1Error
 from sentry_sdk import capture_exception, flush
 
 from apps.rss_feeds.models import MFeedPage
+from apps.rss_feeds.text_importer import is_blocked_response, redact_proxy_error
+from apps.statistics.rscrapingbee import RScrapingBee
 from utils import log as logging
 from utils.feed_functions import TimeoutError, timelimit
+from utils.url_safety import UnsafeUrlError, safe_requests_get, validate_public_url
 
 # from utils.feed_functions import mail_feed_error_to_admin
 
@@ -95,17 +97,18 @@ class PageImporter(object):
                 return
             elif feed_link.startswith("http"):
                 if urllib_fallback:
-                    request = urllib.request.Request(feed_link, headers=self.headers)
-                    response = urllib.request.urlopen(request)
+                    response = safe_requests_get(feed_link, headers=self.headers, timeout=10)
                     time.sleep(0.01)  # Grrr, GIL.
-                    data = response.read().decode(response.headers.get_content_charset() or "utf-8")
+                    data = self._decode_response(response)
                 else:
                     try:
-                        response = requests.get(feed_link, headers=self.headers, timeout=10)
-                        response.connection.close()
+                        response = safe_requests_get(feed_link, headers=self.headers, timeout=10)
+                        if getattr(response, "connection", None):
+                            response.connection.close()
                     except requests.exceptions.TooManyRedirects:
-                        response = requests.get(feed_link, timeout=10)
+                        response = safe_requests_get(feed_link, timeout=10)
                     except (
+                        UnsafeUrlError,
                         AttributeError,
                         SocketError,
                         OpenSSLError,
@@ -119,14 +122,26 @@ class PageImporter(object):
                         )
                         self.save_no_page(reason="Page fetch failed")
                         return
-                    data = response.text
-                    if response.encoding and response.encoding.lower() != "utf-8":
-                        logging.debug(f" -> ~FBEncoding is {response.encoding}, re-encoding...")
-                        try:
-                            data = data.encode("utf-8").decode("utf-8")
-                        except (LookupError, UnicodeEncodeError):
-                            logging.debug(f" -> ~FRRe-encoding failed!")
-                            pass
+                    encoding = response.encoding
+                    content = response.content
+
+                    # When servers don't specify charset in Content-Type header, requests
+                    # defaults to ISO-8859-1 per RFC 2616, but most modern sites use UTF-8.
+                    # Check if the HTML declares UTF-8 charset and use that instead.
+                    if encoding and encoding.lower() in ("iso-8859-1", "latin-1", "latin1"):
+                        content_start = content[:1024].lower()
+                        if (
+                            content.startswith(b"\xef\xbb\xbf")  # UTF-8 BOM
+                            or b'charset="utf-8"' in content_start
+                            or b"charset='utf-8'" in content_start
+                            or b"charset=utf-8" in content_start
+                        ):
+                            encoding = "utf-8"
+
+                    try:
+                        data = content.decode(encoding or "utf-8")
+                    except (UnicodeDecodeError, LookupError):
+                        data = content.decode("utf-8", errors="replace")
             else:
                 try:
                     data = open(feed_link, "r").read()
@@ -150,12 +165,14 @@ class PageImporter(object):
             http.client.BadStatusLine,
             http.client.InvalidURL,
             requests.exceptions.ConnectionError,
+            UnsafeUrlError,
         ) as e:
             logging.debug("   ***> [%-30s] Page fetch failed: %s" % (self.feed.log_title[:30], e))
             self.feed.save_page_history(401, "Bad URL", e)
             try:
+                validate_public_url(self.feed.feed_address)
                 fp = feedparser.parse(self.feed.feed_address)
-            except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            except (UnsafeUrlError, urllib.error.HTTPError, urllib.error.URLError) as e:
                 return html
             feed_link = fp.feed.get("link", "")
             self.feed.save()
@@ -196,7 +213,7 @@ class PageImporter(object):
 
         return html
 
-    @timelimit(10)
+    @timelimit(30)
     def _fetch_story(self):
         html = None
         story_permalink = self.story.story_permalink
@@ -211,9 +228,11 @@ class PageImporter(object):
             return
 
         try:
-            response = requests.get(story_permalink, headers=self.headers, timeout=10)
-            response.connection.close()
+            response = safe_requests_get(story_permalink, headers=self.headers, timeout=10)
+            if getattr(response, "connection", None):
+                response.connection.close()
         except (
+            UnsafeUrlError,
             AttributeError,
             SocketError,
             OpenSSLError,
@@ -223,8 +242,9 @@ class PageImporter(object):
             requests.adapters.ReadTimeout,
         ) as e:
             try:
-                response = requests.get(story_permalink, timeout=10)
+                response = safe_requests_get(story_permalink, timeout=10)
             except (
+                UnsafeUrlError,
                 AttributeError,
                 SocketError,
                 OpenSSLError,
@@ -238,19 +258,16 @@ class PageImporter(object):
                     % (self.feed.log_title[:30], e)
                 )
                 return
-        # try:
-        data = response.text
-        # except (LookupError, TypeError):
-        #     data = response.content
-        # import pdb; pdb.set_trace()
 
-        if response.encoding and response.encoding.lower() != "utf-8":
-            logging.debug(f" -> ~FBEncoding is {response.encoding}, re-encoding...")
-            try:
-                data = data.encode("utf-8").decode("utf-8")
-            except (LookupError, UnicodeEncodeError):
-                logging.debug(f" -> ~FRRe-encoding failed!")
-                pass
+        if self._is_blocked_response(response):
+            logging.user(
+                self.request,
+                "~SN~FYOriginal story ~FRblocked~FY (%s), retrying with ScrapingBee: %s"
+                % (response.status_code, story_permalink),
+            )
+            data = self._fetch_story_with_scrapingbee(story_permalink)
+        else:
+            data = self._decode_response(response)
 
         if data:
             data = data.replace("\xc2\xa0", " ")  # Non-breaking space, is mangled when encoding is not utf-8
@@ -261,6 +278,76 @@ class PageImporter(object):
             self.save_story(html)
 
         return html
+
+    def _decode_response(self, response):
+        encoding = response.encoding
+        content = response.content
+
+        # When servers don't specify charset in Content-Type header, requests
+        # defaults to ISO-8859-1 per RFC 2616, but most modern sites use UTF-8.
+        # Check if the HTML declares UTF-8 charset and use that instead.
+        if encoding and encoding.lower() in ("iso-8859-1", "latin-1", "latin1"):
+            content_start = content[:1024].lower()
+            if (
+                content.startswith(b"\xef\xbb\xbf")  # UTF-8 BOM
+                or b'charset="utf-8"' in content_start
+                or b"charset='utf-8'" in content_start
+                or b"charset=utf-8" in content_start
+            ):
+                encoding = "utf-8"
+
+        try:
+            return content.decode(encoding or "utf-8")
+        except (UnicodeDecodeError, LookupError):
+            return content.decode("utf-8", errors="replace")
+
+    def _is_blocked_response(self, response):
+        """Check if a response indicates the request was blocked by anti-bot protection.
+        The statuses and challenge markers live in apps/rss_feeds/text_importer.py so
+        Story view and Text view agree on what a block looks like."""
+        return is_blocked_response(response)
+
+    def _fetch_story_with_scrapingbee(self, url):
+        """Fetch a story page using ScrapingBee residential proxy."""
+        api_key = getattr(settings, "SCRAPINGBEE_API_KEY", None)
+        if not api_key:
+            logging.user(self.request, "~SN~FRScrapingBee API key not configured")
+            return None
+        try:
+            validate_public_url(url)
+        except UnsafeUrlError as e:
+            logging.user(self.request, "~SN~FRScrapingBee original story URL rejected: %s" % e)
+            return None
+
+        params = {
+            "api_key": api_key,
+            "url": url,
+            "render_js": "false",
+            "return_page_source": "true",
+        }
+
+        try:
+            response = requests.get("https://app.scrapingbee.com/api/v1", params=params, timeout=15)
+            RScrapingBee.record_response("original_story", response, url=url)
+            if response.status_code == 200 and response.content:
+                logging.user(
+                    self.request,
+                    "~SN~FGScrapingBee original story fetch succeeded: ~SB%s bytes" % len(response.content),
+                )
+                return smart_str(response.content)
+            logging.user(
+                self.request,
+                "~SN~FRScrapingBee original story fetch failed: status %s" % response.status_code,
+            )
+        except Exception as e:
+            RScrapingBee.record("original_story", None, url=url)
+            # The raw exception can carry the request URL with the API key in it, see
+            # redact_proxy_error in apps/rss_feeds/text_importer.py.
+            logging.user(
+                self.request,
+                "~SN~FRScrapingBee original story fetch error: %s" % redact_proxy_error(e, api_key),
+            )
+        return None
 
     def save_story(self, html):
         self.story.original_page_z = zlib.compress(smart_bytes(html))

@@ -1,0 +1,175 @@
+//
+//  AddSiteSheetViewController.swift
+//  NewsBlur
+//
+//  Created by Claude on 2026-02-23.
+//  Copyright 2026 NewsBlur. All rights reserved.
+//
+
+import SwiftUI
+
+@available(iOS 15.0, *)
+@objc class AddSiteSheetViewController: BaseViewController {
+    private static var sharedViewModel: AddSiteViewModel?
+    static var viewModelFactory: (() -> AddSiteViewModel)?
+
+    private var hostingController: UIHostingController<AddSiteView>?
+    private var viewModel: AddSiteViewModel?
+    private weak var sheetController: UISheetPresentationController?
+    private var compactDetentIdentifier: UISheetPresentationController.Detent.Identifier = .medium
+    private var isEditingInput = false
+
+    @objc var initialFeedAddress: String?
+    @objc var onDismiss: (() -> Void)?
+    @objc var onSuccess: (() -> Void)?
+    @objc var shouldReloadFeedsOnSuccess = true
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        updateBackgroundColor()
+
+        let viewModel: AddSiteViewModel
+        if let existing = Self.sharedViewModel {
+            viewModel = existing
+            // Only override search text if an explicit address was passed
+            if let address = initialFeedAddress, !address.isEmpty {
+                viewModel.searchText = address
+                viewModel.autocompleteResults = []
+            }
+            // Clear transient state from previous presentation
+            viewModel.isAdding = false
+            viewModel.errorMessage = nil
+            viewModel.addedSuccess = false
+        } else {
+            viewModel = Self.viewModelFactory?() ?? AddSiteViewModel()
+            if let address = initialFeedAddress, !address.isEmpty {
+                viewModel.searchText = address
+            }
+            Self.sharedViewModel = viewModel
+        }
+        self.viewModel = viewModel
+
+        viewModel.onResultsAppeared = { [weak self] in
+            self?.expandSheet()
+        }
+        viewModel.onResultsCleared = { [weak self] in
+            guard let self, !self.isEditingInput else { return }
+            self.shrinkSheet()
+        }
+
+        let addSiteView = AddSiteView(
+            viewModel: viewModel,
+            onDismiss: { [weak self] in
+                self?.dismiss(animated: true)
+            },
+            onEditingChanged: { [weak self] isEditing in
+                guard let self else { return }
+                self.isEditingInput = isEditing
+                if isEditing {
+                    self.expandSheet()
+                } else if self.viewModel?.autocompleteResults.isEmpty == true {
+                    self.shrinkSheet()
+                }
+            },
+            onDiscover: { [weak self] tab in
+                self?.dismiss(animated: true) {
+                    let discover = DiscoverSitesViewController()
+                    discover.initialTab = tab
+                    NewsBlurAppDelegate.shared()?.detailViewController.showDiscoverSites(discover)
+                }
+            }
+        )
+
+
+        let hostingController = UIHostingController(rootView: addSiteView)
+        hostingController.view.backgroundColor = .clear
+        self.hostingController = hostingController
+
+        addChild(hostingController)
+        view.addSubview(hostingController.view)
+        hostingController.didMove(toParent: self)
+
+        hostingController.view.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            hostingController.view.topAnchor.constraint(equalTo: view.topAnchor),
+            hostingController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hostingController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hostingController.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
+        observeSuccess()
+    }
+
+    @objc func setSheetController(_ sheet: UISheetPresentationController?) {
+        self.sheetController = sheet
+        if #available(iOS 16.0, *), UIDevice.current.userInterfaceIdiom == .pad {
+            compactDetentIdentifier = .init("add-site-compact")
+            sheet?.detents = [
+                .custom(identifier: compactDetentIdentifier) { context in
+                    // AddSiteSheetViewController.swift leaves room for the input rows and discovery tiles.
+                    min(context.maximumDetentValue, max(280, context.maximumDetentValue * 0.25))
+                },
+                .large()
+            ]
+        } else {
+            compactDetentIdentifier = .medium
+            sheet?.detents = [.medium(), .large()]
+        }
+        sheet?.selectedDetentIdentifier = compactDetentIdentifier
+        sheet?.prefersGrabberVisible = true
+        sheet?.prefersScrollingExpandsWhenScrolledToEdge = true
+        sheet?.preferredCornerRadius = 12
+    }
+
+    private func expandSheet() {
+        guard let sheet = sheetController ?? navigationController?.sheetPresentationController else { return }
+        sheet.animateChanges {
+            sheet.selectedDetentIdentifier = .large
+        }
+    }
+
+    private func shrinkSheet() {
+        guard let sheet = sheetController ?? navigationController?.sheetPresentationController else { return }
+        sheet.animateChanges {
+            sheet.selectedDetentIdentifier = compactDetentIdentifier
+        }
+    }
+
+    private func observeSuccess() {
+        guard let viewModel = viewModel else { return }
+
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self, weak viewModel] timer in
+            guard let self = self, let viewModel = viewModel else {
+                timer.invalidate()
+                return
+            }
+            if viewModel.addedSuccess {
+                timer.invalidate()
+                Self.sharedViewModel = nil
+                self.dismiss(animated: true) {
+                    self.onSuccess?()
+                    if self.shouldReloadFeedsOnSuccess {
+                        self.appDelegate?.reloadFeedsView(false)
+                    }
+                }
+            }
+        }
+    }
+
+    private func updateBackgroundColor() {
+        let theme = ThemeManager.shared?.effectiveTheme ?? ThemeStyleLight
+        let backgroundColor: UIColor
+        switch theme {
+        case ThemeStyleSepia:
+            backgroundColor = UIColor(red: 0.96, green: 0.90, blue: 0.83, alpha: 1.0)
+        case ThemeStyleMedium:
+            backgroundColor = UIColor(red: 0.24, green: 0.24, blue: 0.24, alpha: 1.0)
+        case ThemeStyleDark:
+            backgroundColor = UIColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1.0)
+        default:
+            backgroundColor = UIColor(red: 0.92, green: 0.93, blue: 0.90, alpha: 1.0)
+        }
+        view.backgroundColor = backgroundColor
+    }
+}

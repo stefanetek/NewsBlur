@@ -1,3 +1,10 @@
+"""Elasticsearch integration models for story and feed indexing.
+
+SearchStory manages the Elasticsearch index lifecycle (create, drop, reindex)
+and provides story search by keyword with feed-scoped queries. SearchFeed
+indexes feed metadata for feed discovery search.
+"""
+
 import datetime
 import html
 import re
@@ -13,6 +20,7 @@ import redis
 import urllib3
 from django.conf import settings
 from django.contrib.auth.models import User
+from mongoengine.queryset import NotUniqueError
 from openai import APITimeoutError, OpenAI
 
 from apps.search.projection_matrix import project_vector
@@ -28,6 +36,7 @@ from apps.search.tasks import (
 from utils import log as logging
 from utils.ai_functions import setup_openai_model
 from utils.feed_functions import chunks
+from utils.llm_costs import LLMCostTracker
 
 
 class MUserSearch(mongo.Document):
@@ -38,6 +47,7 @@ class MUserSearch(mongo.Document):
     last_discover_date = mongo.DateTimeField(null=True, blank=True)
     subscriptions_indexed = mongo.BooleanField(default=False)
     subscriptions_indexing = mongo.BooleanField(default=False)
+    subscriptions_indexing_date = mongo.DateTimeField(null=True, blank=True)
     discover_indexed = mongo.BooleanField(default=False)
     discover_indexing = mongo.BooleanField(default=False)
     discover_indexing_date = mongo.DateTimeField(null=True, blank=True)
@@ -58,7 +68,13 @@ class MUserSearch(mongo.Document):
             user_search = cls.objects.read_preference(pymongo.ReadPreference.PRIMARY).get(user_id=user_id)
         except cls.DoesNotExist:
             if create:
-                user_search = cls.objects.create(user_id=user_id)
+                try:
+                    user_search = cls.objects.create(user_id=user_id)
+                except NotUniqueError:
+                    # A concurrent request created it between the get and the create
+                    user_search = cls.objects.read_preference(pymongo.ReadPreference.PRIMARY).get(
+                        user_id=user_id
+                    )
             else:
                 user_search = None
 
@@ -67,7 +83,30 @@ class MUserSearch(mongo.Document):
     def touch_search_date(self):
         if not self.subscriptions_indexed and not self.subscriptions_indexing:
             self.schedule_index_subscriptions_for_search()
+            self.subscriptions_indexing_date = datetime.datetime.now()
             self.subscriptions_indexing = True
+        one_day = 60 * 60 * 24
+        indexing_expired = (
+            self.subscriptions_indexing_date is None
+            or (datetime.datetime.now() - self.subscriptions_indexing_date).total_seconds() > one_day
+        )
+        if not self.subscriptions_indexed and self.subscriptions_indexing and indexing_expired:
+            user = User.objects.get(pk=self.user_id)
+            if self.subscriptions_indexing_date:
+                logging.user(
+                    user,
+                    f"~FCScheduling indexing ~SBsearch~SN for ~SB%s~SN because it's been more than one day ({(datetime.datetime.now() - self.subscriptions_indexing_date).total_seconds()})..."
+                    % self.user_id,
+                )
+            else:
+                logging.user(
+                    user,
+                    f"~FCScheduling indexing ~SBsearch~SN for ~SB%s~SN, because it's never been indexed..."
+                    % self.user_id,
+                )
+            self.schedule_index_subscriptions_for_search()
+            self.subscriptions_indexing = True
+            self.subscriptions_indexing_date = datetime.datetime.now()
 
         self.last_search_date = datetime.datetime.now()
         self.save()
@@ -158,7 +197,9 @@ class MUserSearch(mongo.Document):
             # Create search indexing tasks
             search_chunks = [
                 IndexSubscriptionsChunkForSearch.s(feed_ids=feed_id_chunk, user_id=self.user_id).set(
-                    queue="search_indexer"
+                    queue="search_indexer",
+                    soft_time_limit=settings.MAX_SECONDS_COMPLETE_ARCHIVE_FETCH - 60,
+                    time_limit=settings.MAX_SECONDS_COMPLETE_ARCHIVE_FETCH,
                 )
                 for feed_id_chunk in feed_id_chunks
             ]
@@ -172,6 +213,7 @@ class MUserSearch(mongo.Document):
             discover_chunks = [
                 IndexSubscriptionsChunkForDiscover.s(feed_ids=feed_id_chunk, user_id=self.user_id).set(
                     queue="discover_indexer",
+                    soft_time_limit=settings.MAX_SECONDS_COMPLETE_ARCHIVE_FETCH - 60,
                     time_limit=settings.MAX_SECONDS_COMPLETE_ARCHIVE_FETCH,
                 )
                 for feed_id_chunk in feed_id_chunks
@@ -245,8 +287,7 @@ class MUserSearch(mongo.Document):
                 continue
 
             feed.index_stories_for_discover()
-
-        r.publish(user.username, "discover_index_complete:feeds:%s" % ",".join([str(f) for f in feed_ids]))
+            r.publish(user.username, "discover_index_complete:feeds:%s" % feed_id)
 
     @classmethod
     def schedule_index_feeds_for_search(cls, feed_ids, user_id):
@@ -496,12 +537,6 @@ class SearchStory:
 
     @classmethod
     def query(cls, feed_ids, query, order, offset, limit, strip=False):
-        try:
-            cls.ES().indices.flush(cls.index_name())
-        except elasticsearch.exceptions.NotFoundError as e:
-            logging.debug(f" ***> ~FRNo search server available: {e}")
-            return []
-
         if strip:
             query = re.sub(
                 r'([^\s\w_\-"])+', " ", query
@@ -524,8 +559,11 @@ class SearchStory:
         }
         try:
             results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except elasticsearch.exceptions.ConnectionError as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
 
         # s = elasticsearch_dsl.Search(using=cls.ES(), index=cls.index_name())
@@ -560,9 +598,113 @@ class SearchStory:
         return result_ids
 
     @classmethod
+    def query_tag(cls, feed_ids, tag, order, offset, limit):
+        """Return story hashes with one exact tag in the selected feeds.
+
+        ``tags.raw`` contains the entire comma-separated tag string. Match the
+        requested tag in each possible token position so a tag does not also
+        match a longer tag that merely contains it. ``None`` means the search
+        failed; an empty list is a successful query with no matches.
+        """
+        tag = html.unescape(tag or "").strip()
+        if not feed_ids or not tag:
+            return []
+
+        wildcard_tag = tag.replace("\\", "\\\\").replace("*", "\\*").replace("?", "\\?")
+        tag_filter = {
+            "bool": {
+                "should": [
+                    {"term": {"tags.raw": tag}},
+                    {"wildcard": {"tags.raw": f"{wildcard_tag}, *"}},
+                    {"wildcard": {"tags.raw": f"*, {wildcard_tag}"}},
+                    {"wildcard": {"tags.raw": f"*, {wildcard_tag}, *"}},
+                ],
+                "minimum_should_match": 1,
+            }
+        }
+        body = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"terms": {"feed_id": feed_ids[:2000]}},
+                        tag_filter,
+                    ]
+                }
+            },
+            "sort": [{"date": {"order": "desc" if order == "newest" else "asc"}}],
+            "from": offset,
+            "size": limit,
+        }
+
+        try:
+            results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+            return [result["_id"] for result in results["hits"]["hits"]]
+        except (
+            elasticsearch.exceptions.TransportError,
+            urllib3.exceptions.NewConnectionError,
+            urllib3.exceptions.ConnectTimeoutError,
+            KeyError,
+            TypeError,
+        ) as e:
+            logging.error(" ***> ~FRUnable to query indexed story tags: %s" % e)
+            return None
+
+    @classmethod
+    def query_briefing_custom(cls, feed_ids, phrase, date_start, date_end, limit=10):
+        """Search stories by exact phrase within a date range, for briefing custom sections.
+
+        Wraps the phrase in quotes so ES query_string treats it as an exact phrase match
+        across title and content fields. Scoped to feed_ids and the briefing period.
+
+        Returns list of story_hash strings, or empty list on error.
+        """
+        if not feed_ids or not phrase or not phrase.strip():
+            return []
+
+        clean_phrase = phrase.strip().replace('"', "")
+        if not clean_phrase:
+            return []
+        quoted_phrase = '"%s"' % clean_phrase
+        quoted_phrase = cls._sanitize_query(quoted_phrase)
+
+        body = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"query_string": {"query": quoted_phrase, "default_operator": "AND"}},
+                        {"terms": {"feed_id": feed_ids[:2000]}},
+                        {"range": {"date": {"gte": date_start, "lte": date_end}}},
+                    ]
+                }
+            },
+            "sort": [{"date": {"order": "desc"}}],
+            "from": 0,
+            "size": limit,
+        }
+
+        try:
+            results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except elasticsearch.exceptions.ConnectionError as e:
+            logging.debug(" ***> ~FRNo search server for briefing custom query: %s" % e)
+            return []
+        except elasticsearch.exceptions.RequestError as e:
+            logging.debug(" ***> ~FRBriefing custom search query error: %s" % e)
+            return []
+
+        logging.debug(
+            " ---> ~FG~SNBriefing custom search for: ~SB%s~SN, ~SB%s~SN results"
+            % (quoted_phrase, len(results["hits"]["hits"]))
+        )
+
+        try:
+            return [r["_id"] for r in results["hits"]["hits"]]
+        except Exception as e:
+            logging.debug(" ---> ~FRBriefing custom search result error: %s" % e)
+            return []
+
+    @classmethod
     def global_query(cls, query, order, offset, limit, strip=False):
         cls.create_elasticsearch_mapping()
-        cls.ES().indices.flush()
 
         if strip:
             query = re.sub(
@@ -585,8 +727,11 @@ class SearchStory:
         }
         try:
             results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except elasticsearch.exceptions.ConnectionError as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
 
         # sort     = "date:desc" if order == "newest" else "date:asc"
@@ -610,12 +755,6 @@ class SearchStory:
 
     @classmethod
     def more_like_this(cls, feed_ids, story_hash, order, offset, limit):
-        try:
-            cls.ES().indices.flush(cls.index_name())
-        except elasticsearch.exceptions.NotFoundError as e:
-            logging.debug(f" ***> ~FRNo search server available: {e}")
-            return []
-
         body = {
             "query": {
                 "bool": {
@@ -644,8 +783,11 @@ class SearchStory:
         }
         try:
             results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except elasticsearch.exceptions.ConnectionError as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
 
         logging.info(
@@ -857,12 +999,6 @@ class DiscoverStory:
         feed_ids_to_exclude=None,
         story_hashes_to_exclude=None,
     ):
-        try:
-            cls.ES().indices.flush(index=cls.index_name())
-        except elasticsearch.exceptions.NotFoundError as e:
-            logging.debug(f" ***> ~FRNo search server available: {e}")
-            return []
-
         must_clauses = [
             {
                 "script_score": {
@@ -900,8 +1036,11 @@ class DiscoverStory:
         logging.debug(f"~FBVector query: {body}")
         try:
             results = cls.ES().search(body=body, index=cls.index_name())
+        except elasticsearch.exceptions.ConnectionError as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
 
         logging.info(
@@ -913,17 +1052,14 @@ class DiscoverStory:
     @classmethod
     def fetch_story_content_vector(cls, story_hash):
         # Fetch the content vector from ES for the specified story_hash
-        try:
-            cls.ES().indices.flush(index=cls.index_name())
-        except elasticsearch.exceptions.NotFoundError as e:
-            logging.debug(f" ***> ~FRNo search server available: {e}")
-            return []
-
         body = {"query": {"ids": {"values": [story_hash]}}}
         try:
             results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except elasticsearch.exceptions.ConnectionError as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
         # logging.debug(f"Results: {results}")
         if len(results["hits"]["hits"]) == 0:
@@ -995,6 +1131,15 @@ class DiscoverStory:
         except APITimeoutError as e:
             logging.debug(f" ***> ~FROpenAI API timeout: {e}")
             return []
+
+        # Track embedding cost
+        LLMCostTracker.record_embedding(
+            model=model_name,
+            input_tokens=response.usage.total_tokens,
+            feature="search_story_embedding",
+            metadata={"story_hash": story_hash},
+        )
+
         story_embedding = response.data[0].embedding
 
         # Project the embedding down to 256 dimensions
@@ -1193,14 +1338,8 @@ class SearchFeed:
         - Wildcard matching on link
         - function_score to boost results by subscriber count while preserving relevance
         """
-        try:
-            cls.ES().indices.flush(index=cls.index_name())
-        except elasticsearch.exceptions.NotFoundError as e:
-            logging.debug(f" ***> ~FRNo search server available: {e}")
-            return []
-
-        # Escape special characters for query_string wildcards
-        escaped_text = text.replace("\\", "\\\\").replace('"', '\\"')
+        # Escape all Elasticsearch query_string reserved characters
+        escaped_text = re.sub(r'([+\-=&|!(){}\[\]^"~*?:\\/])', r"\\\1", text)
 
         body = {
             "query": {
@@ -1259,8 +1398,14 @@ class SearchFeed:
         }
         try:
             results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except (elasticsearch.exceptions.ConnectionError, elasticsearch.exceptions.ConnectionTimeout) as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
+        except elasticsearch.exceptions.NotFoundError as e:
+            logging.debug(f" ***> ~FRSearch index not found: {e}")
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
 
         logging.info(
@@ -1271,12 +1416,6 @@ class SearchFeed:
 
     @classmethod
     def vector_query(cls, query_vector, offset=0, max_results=10, feed_ids_to_exclude=None):
-        try:
-            cls.ES().indices.flush(index=cls.index_name())
-        except elasticsearch.exceptions.NotFoundError as e:
-            logging.debug(f" ***> ~FRNo search server available: {e}")
-            return []
-
         must_not_clauses = []
         if feed_ids_to_exclude:
             must_not_clauses.append({"terms": {"feed_id": feed_ids_to_exclude}})
@@ -1301,8 +1440,14 @@ class SearchFeed:
         }
         try:
             results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except (elasticsearch.exceptions.ConnectionError, elasticsearch.exceptions.ConnectionTimeout) as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
+        except elasticsearch.exceptions.NotFoundError as e:
+            logging.debug(f" ***> ~FRSearch index not found: {e}")
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
 
         logging.info(
@@ -1349,8 +1494,21 @@ class SearchFeed:
 
         # Part 2: Semantic search (generate embedding for query)
         try:
-            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            # Hybrid search backs the interactive autocomplete endpoint, and the semantic
+            # half only refines the text results gathered above. Cap the embedding call
+            # instead of using the client defaults (600s read timeout, two retries), which
+            # leave a typeahead request hanging when OpenAI is slow or unreachable.
+            client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=5.0, max_retries=1)
             response = client.embeddings.create(model="text-embedding-3-small", input=text.lower())
+
+            # Track embedding cost
+            LLMCostTracker.record_embedding(
+                model="text-embedding-3-small",
+                input_tokens=response.usage.total_tokens,
+                feature="search_query_embedding",
+                metadata={"query": text[:100]},
+            )
+
             query_vector = response.data[0].embedding
 
             semantic_results = cls.vector_query(query_vector, max_results=max_results)
@@ -1397,18 +1555,18 @@ class SearchFeed:
     @classmethod
     def fetch_feed_content_vector(cls, feed_id):
         # Fetch the content vector from ES for the specified feed_id
-        try:
-            cls.ES().indices.flush(index=cls.index_name())
-        except (elasticsearch.exceptions.NotFoundError, elasticsearch.exceptions.ConnectionError) as e:
-            logging.debug(f" ***> ~FRNo search server available: {e}")
-            return []
-
         body = {"query": {"term": {"feed_id": feed_id}}}
 
         try:
             results = cls.ES().search(body=body, index=cls.index_name(), doc_type=cls.doc_type())
+        except (elasticsearch.exceptions.ConnectionError, elasticsearch.exceptions.ConnectionTimeout) as e:
+            logging.error(" ***> ~FRNo search server available for querying: %s" % e)
+            return []
+        except elasticsearch.exceptions.NotFoundError as e:
+            logging.debug(f" ***> ~FRSearch index not found: {e}")
+            return []
         except elasticsearch.exceptions.RequestError as e:
-            logging.debug(" ***> ~FRNo search server available for querying: %s" % e)
+            logging.debug(" ***> ~FRSearch query error: %s" % e)
             return []
 
         # logging.debug(f"Results: {results}")
@@ -1470,10 +1628,51 @@ class SearchFeed:
 
         response = client.embeddings.create(model=model_name, input=truncated_text)
 
+        # Track embedding cost
+        LLMCostTracker.record_embedding(
+            model=model_name,
+            input_tokens=response.usage.total_tokens,
+            feature="search_feed_embedding",
+            metadata={"feed_id": feed_id},
+        )
+
         embedding = response.data[0].embedding
         # normalized_embedding = np.array(embedding) / np.linalg.norm(embedding)
 
         return embedding
+
+    @classmethod
+    def generate_content_vector_from_text(cls, text, feature="search_feed_embedding", metadata=None):
+        """Generate a content vector from arbitrary text using OpenAI embeddings.
+        Used for indexing PopularFeed entries that may not have stories yet."""
+        # Clean text
+        text = re.sub(r"http\S+", "", text)
+        text = re.sub(r"[^\w\s]", "", text)
+        text = text.lower()
+        text = " ".join(text.split())
+
+        if not text.strip():
+            return None
+
+        model_name = "text-embedding-3-small"
+        encoding = setup_openai_model(model_name)
+
+        max_tokens = 8191
+        encoded_text = encoding.encode(text)
+        truncated_tokens = encoded_text[:max_tokens]
+        truncated_text = encoding.decode(truncated_tokens)
+
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        response = client.embeddings.create(model=model_name, input=truncated_text)
+
+        LLMCostTracker.record_embedding(
+            model=model_name,
+            input_tokens=response.usage.total_tokens,
+            feature=feature,
+            metadata=metadata or {},
+        )
+
+        return response.data[0].embedding
 
     @classmethod
     def export_csv(cls):

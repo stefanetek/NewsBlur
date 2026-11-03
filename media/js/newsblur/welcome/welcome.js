@@ -2,193 +2,570 @@ NEWSBLUR.Welcome = Backbone.View.extend({
 
     el: '.NB-body-inner',
     flags: {},
-    rotation: 0,
 
     events: {
-        "click .NB-button-login": "show_signin_form",
         "click .NB-button-tryout": "show_tryout",
-        "click .NB-welcome-header-caption": "click_header_caption",
-        "focus input": "stop_rotation",
-        "mouseenter .NB-welcome-header-caption": "enter_header_caption",
-        "mouseleave .NB-welcome-header-caption": "leave_header_caption"
+        "click .NB-button-login": "scroll_to_login",
+        "click .NB-segment-option": "toggle_form_mode",
+        "click .NB-testimonials-nav-prev": "testimonials_prev",
+        "click .NB-testimonials-nav-next": "testimonials_next"
     },
 
     initialize: function () {
-        this.start_rotation();
-        _.delay(_.bind(function () {
-            // this.debug_password_autocomplete();
-        }, this), 500);
+        this.init_webgl_background();
+        this.init_testimonials();
+        this.watch_theme_changes();
         NEWSBLUR.reader.$s.$layout.hide();
     },
 
-    debug_password_autocomplete: function () {
-        console.log(['Triggering focus']);
-        this.$("input[name=login-username]").trigger('focus');
+    // ================
+    // = Testimonials =
+    // ================
+
+    init_testimonials: function () {
+        var self = this;
+        this._track_data = [];
+
+        $('.NB-testimonials-track').each(function (i) {
+            var $track = $(this);
+            var isRightScroll = $track.hasClass('NB-testimonials-row-2') || $track.hasClass('NB-testimonials-row-4');
+
+            // Clone all cards and append them for seamless infinite loop.
+            // CSS animation uses translateX(-50%) which requires exactly 2 copies.
+            var $cards = $track.children('.NB-testimonial-card');
+            $cards.each(function () {
+                var $clone = $(this).clone();
+                $clone.attr('aria-hidden', 'true');
+                $track.append($clone);
+            });
+
+            var duration = parseFloat($track.css('animation-duration')) || 180;
+            var name = $track.css('animation-name') || 'nb-scroll-left';
+
+            self._track_data.push({
+                el: this,
+                $track: $track,
+                duration: duration,
+                animationName: name,
+                isRow2: isRightScroll
+            });
+
+            // Randomize start position so different cards show on each visit
+            var offset = -(Math.random() * duration);
+            $track.css('animation-delay', offset + 's');
+        });
+    },
+
+    testimonials_prev: function (e) {
+        if (e) { e.preventDefault(); e.stopPropagation(); }
+        this.advance_testimonials(-1);
+    },
+
+    testimonials_next: function (e) {
+        if (e) { e.preventDefault(); e.stopPropagation(); }
+        this.advance_testimonials(1);
+    },
+
+    advance_testimonials: function (direction) {
+        if (this.flags.testimonials_animating) return;
+        this.flags.testimonials_animating = true;
+
+        var self = this;
+        var pageWidth = window.innerWidth * 0.75;
+
+        // Phase 1: Freeze each track at its current position and transition to target
+        _.each(this._track_data, function (data) {
+            var el = data.el;
+            var effectiveDir = data.isRow2 ? -direction : direction;
+
+            // Read current animated position from the transform matrix
+            var matrix = new DOMMatrixReadOnly(getComputedStyle(el).transform);
+            var currentX = matrix.m41;
+            var halfWidth = el.scrollWidth / 2;
+
+            // Target: advance by one page in the effective direction
+            var targetX = currentX - (effectiveDir * pageWidth);
+
+            // Never wrap — use the duplicate content for seamless transitions.
+            // If target goes past 0 (backward past start), shift both positions
+            // into the duplicate zone so the transition animates through real content.
+            if (targetX > 0) {
+                currentX -= halfWidth;
+                targetX -= halfWidth;
+            }
+            // If target goes past -halfWidth (forward past end), that's fine —
+            // duplicate content exists there. Phase 2 will normalize back.
+
+            // Store for phase 2
+            data._targetX = targetX;
+            data._halfWidth = halfWidth;
+
+            // Freeze: kill animation, pin at (possibly shifted) current spot
+            el.style.animation = 'none';
+            el.style.transform = 'translateX(' + currentX + 'px)';
+        });
+
+        // Force reflow so browsers register the frozen state
+        void document.body.offsetHeight;
+
+        // Apply transitions to slide to target
+        _.each(this._track_data, function (data) {
+            data.el.style.transition = 'transform 0.6s cubic-bezier(0.25, 0.1, 0.25, 1)';
+            data.el.style.transform = 'translateX(' + data._targetX + 'px)';
+        });
+
+        // Phase 2: After transition, resume CSS animation from the new position
+        setTimeout(function () {
+            _.each(self._track_data, function (data) {
+                var el = data.el;
+
+                // Read where the transition left us
+                var matrix = new DOMMatrixReadOnly(getComputedStyle(el).transform);
+                var finalX = matrix.m41;
+
+                // Normalize back into the -halfWidth..0 range for CSS animation
+                while (finalX < -data._halfWidth) finalX += data._halfWidth;
+                while (finalX > 0) finalX -= data._halfWidth;
+
+                // Calculate animation progress (0..1) from position
+                var progress = Math.abs(finalX) / data._halfWidth;
+                if (data.isRow2) progress = 1 - progress;
+
+                // Use the stored original duration (not the CSS value, which is 0 while animation:none)
+                var newDelay = -(progress * data.duration);
+
+                // Clear inline overrides and restore animation at the calculated offset
+                el.style.transition = '';
+                el.style.transform = '';
+                el.style.animation = '';
+                data.$track.css('animation-delay', newDelay + 's');
+            });
+
+            self.flags.testimonials_animating = false;
+        }, 650);
     },
 
     // ==========
-    // = Header =
+    // = WebGL  =
     // ==========
 
-    fix_misalignment: function (e) {
-        console.log(['Fixing misalignment', e]);
+    init_webgl_background: function () {
+        var canvas = document.getElementById('welcome-canvas');
+        if (!canvas) return;
 
-        this.flags.on_signin = true;
-        this.show_signin_form();
-    },
-
-    click_header_caption: function (e) {
-        this.flags.on_signin = false;
-        this.enter_header_caption(e);
-    },
-
-    enter_header_caption: function (e) {
-        this.flags.on_header_caption = true;
-        var $caption = $(e.currentTarget);
-
-        if (this.flags.on_signin) return;
-
-        if ($caption.hasClass('NB-welcome-header-caption-signin')) {
-            this.flags.on_signin = true;
-            this.show_signin_form();
-        } else {
-            var r = parseInt($caption.data('ss'), 10);
-            this.rotate_screenshots(r);
+        if (NEWSBLUR.WelcomeBackground && NEWSBLUR.WelcomeBackground.init(canvas)) {
+            var isDark = $('body').hasClass('NB-dark');
+            NEWSBLUR.WelcomeBackground.setThemeImmediate(isDark);
+            NEWSBLUR.WelcomeBackground.start();
         }
     },
 
-    leave_header_caption: function (e) {
-        var $caption = $(e.currentTarget);
+    // ==========
+    // = Theme  =
+    // ==========
 
-        if ($caption.hasClass('NB-welcome-header-caption-signin')) {
-
-        } else {
-            this.flags.on_header_caption = false;
-        }
-    },
-
-    start_rotation: function () {
-        if (this.$('.NB-welcome-header-account').hasClass('NB-active')) {
-            this.stop_rotation();
-        }
-        var $first_img = this.$('.NB-welcome-header-image img').eq(0);
-        if ($first_img[0].complete) {
-            setInterval(_.bind(this.rotate_screenshots, this), 3000);
-        } else {
-            $first_img.on('load', _.bind(function () {
-                setInterval(_.bind(this.rotate_screenshots, this), 3000);
-            }, this));
-        }
-    },
-
-    rotate_screenshots: function (force, callback) {
-        if (this.flags.on_header_caption && _.isUndefined(force)) {
-            return;
-        }
-        if (this.flags.on_signin && _.isUndefined(force)) {
-            return;
-        }
-
-        var NUM_CAPTIONS = 3;
-        var r = force ? force - 1 : (this.rotation + 1) % NUM_CAPTIONS;
-        if (!force) {
-            this.rotation += 1;
-        }
-
-        var $images = $('.NB-welcome-header-image').add('.NB-welcome-header-account');
-        var $captions = $('.NB-welcome-header-caption');
-        var $in_img = $images.eq(r);
-        var $out_img = $images.not($in_img);
-        var $in_caption = $captions.eq(r);
-        var $out_caption = $captions.not($in_caption);
-        console.log(['Rotate screenshots', force]);
-        $out_img.removeClass('NB-active');
-        $in_img.addClass('NB-active');
-
-        // $out_img.css({zIndex: 0}).stop(true).animate({
-        //     bottom: -300,
-        //     opacity: 0
-        // }, {easing: 'easeInOutQuart', queue: false, duration: force ? 650 : 1400, complete: callback});
-        // $in_img.css({zIndex: 1}).stop(true).animate({
-        //     bottom: 0,
-        //     opacity: 1
-        // }, {easing: 'easeInOutQuart', queue: false, duration: force ? 650 : 1400});
-        $out_caption.removeClass('NB-active');
-        $in_caption.addClass('NB-active');
-        callback && callback();
-        if (r < 3) {
-            this.$('input').blur();
-        }
-    },
-
-    stop_rotation: function () {
-        console.log(['stop_rotation']);
-        this.flags.on_signin = true;
-    },
-
-    show_signin_form: function () {
-        var open = !NEWSBLUR.reader.flags['sidebar_closed'];
-        this.hide_tryout();
-
-        this.flags.on_header_caption = true;
-        this.flags.on_signin = true;
-
-        var add_url = $.getQueryString('add') || $.getQueryString('url');
-        if (add_url) {
-            this.$("input[name=next]").val("/?add=" + add_url);
-        }
-
-        this.$el.scrollTo(0, 500, { queue: false, easing: 'easeInOutQuint' });
-
-        _.delay(_.bind(function () {
-            this.rotate_screenshots(4, _.bind(function () {
-                _.delay(_.bind(function () {
-                    if (this.$("input:focus").length) {
-                        console.log(['Already focused']);
-                        return;
+    watch_theme_changes: function () {
+        var observer = new MutationObserver(function (mutations) {
+            for (var i = 0; i < mutations.length; i++) {
+                if (mutations[i].attributeName === 'class') {
+                    var isDark = $('body').hasClass('NB-dark');
+                    if (NEWSBLUR.WelcomeBackground) {
+                        NEWSBLUR.WelcomeBackground.setTheme(isDark);
                     }
-                    this.$('input[name=login-username]').focus();
-                }), 50);
-            }, this));
-        }, this), open ? 560 : 0);
+                    break;
+                }
+            }
+        });
+        observer.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+        this._themeObserver = observer;
+    },
 
+    // ====================
+    // = Segment Control  =
+    // ====================
+
+    toggle_form_mode: function (e) {
+        var $option = $(e.currentTarget);
+        var is_signup = $option.hasClass('NB-segment-signup');
+
+        this.$('.NB-segment-option').removeClass('NB-active');
+        $option.addClass('NB-active');
+
+        this.$('.NB-welcome-header-segment')[is_signup ? 'addClass' : 'removeClass']('NB-segment-right');
+
+        var $active = this.$('.NB-formcard-panel.NB-active');
+        var $next = is_signup ? this.$('.NB-formcard-signup') : this.$('.NB-formcard-login');
+        var $card = this.$('.NB-welcome-header-formcard');
+
+        if ($active[0] === $next[0]) return;
+
+        var start_height = $card.height();
+
+        // Stage 1: Fade out the active panel
+        $active.fadeOut(150, function () {
+            $active.removeClass('NB-active');
+
+            // Measure target height with next panel visible but invisible
+            $next.css({ display: 'block', opacity: 0 }).addClass('NB-active');
+            var end_height = $card.height();
+
+            // Lock card at start height
+            $card.css({ height: start_height, overflow: 'hidden' });
+
+            // Stage 2: Animate height to make room, then fade in content
+            $card.animate({ height: end_height }, {
+                duration: 200,
+                easing: 'easeInOutQuint',
+                complete: function () {
+                    $card.css({ height: '', overflow: '' });
+                    // Stage 3: Fade in the new panel
+                    $next.animate({ opacity: 1 }, { duration: 180 });
+                }
+            });
+        });
+    },
+
+    scroll_to_login: function () {
+        this.hide_tryout();
+        this.$el.scrollTo(0, 500, { queue: false, easing: 'easeInOutQuint' });
+        _.delay(_.bind(function () {
+            this.$('.NB-welcome-header-formcard input[type=text]').first().focus();
+        }, this), 520);
+    },
+
+    // ==========
+    // = Tryout =
+    // ==========
+
+    is_mobile: function () {
+        return window.innerWidth <= 768;
+    },
+
+    activate_mobile_layout: function () {
+        if (!NEWSBLUR.reader) return;
+        if (this.flags.mobile_active) return;
+        this.flags.mobile_active = true;
+
+        // Show layout if not already visible
+        if (!this.flags.loaded) {
+            // welcome.js: layout_edge is the feed list pane, east in RTL languages.
+            NEWSBLUR.reader.$s.$layout.layout().hide(NEWSBLUR.utils.layout_edge('west'), true);
+            NEWSBLUR.reader.$s.$layout.show();
+            this.flags.loaded = true;
+        }
+
+        // Size sidebar to full width BEFORE adding classes to prevent flash
+        NEWSBLUR.reader.layout.outerLayout.sizePane(NEWSBLUR.utils.layout_edge('west'), window.innerWidth);
+
+        $('body').addClass('NB-mobile-single-pane NB-welcome-tryout-active');
+        this.$('.NB-welcome-container').addClass('NB-welcome-tryout');
+
+        this.show_signup_banner();
+        this.show_back_to_login_banner();
+        this.show_back_to_feeds_toolbar();
+        this.watch_story_selection();
     },
 
     show_tryout: function () {
         if (!NEWSBLUR.reader) return;
+        var is_mobile = this.is_mobile();
 
         if (!this.flags.loaded) {
-            NEWSBLUR.reader.$s.$layout.layout().hide('west', true);
+            NEWSBLUR.reader.$s.$layout.layout().hide(NEWSBLUR.utils.layout_edge('west'), true);
             NEWSBLUR.reader.$s.$layout.show();
             this.flags.loaded = true;
         }
+
+        // On mobile, set full-width classes and size the pane BEFORE toggling
+        // so the sidebar opens at full width instead of flashing at half-width
+        if (is_mobile) {
+            $('body').addClass('NB-mobile-single-pane NB-welcome-tryout-active');
+            NEWSBLUR.reader.layout.outerLayout.sizePane(NEWSBLUR.utils.layout_edge('west'), window.innerWidth);
+        }
+
         var open = NEWSBLUR.reader.toggle_sidebar();
 
-        this.$('.NB-inner,.NB-inner-account').animate({
-            paddingLeft: open ? 240 : 0
-        }, {
-            queue: false,
-            easing: 'easeInOutQuint',
-            duration: 560
-        });
+        $('body')[open ? 'addClass' : 'removeClass']('NB-welcome-tryout-active');
+        if (is_mobile) {
+            $('body')[open ? 'addClass' : 'removeClass']('NB-mobile-single-pane');
+        }
+
+        if (!is_mobile) {
+            this.$('.NB-welcome-header-hero').animate({
+                paddingLeft: open ? 240 : 0
+            }, {
+                queue: false,
+                easing: 'easeInOutQuint',
+                duration: 560
+            });
+        }
 
         this.$('.NB-welcome-container')[open ? 'addClass' : 'removeClass']('NB-welcome-tryout');
+
+        if (open) {
+            this.show_back_to_login_banner();
+            this.show_back_to_feeds_toolbar();
+            if (is_mobile) {
+                this.watch_story_selection();
+            }
+        } else {
+            this.hide_signup_banner();
+            this.hide_back_to_login_banner();
+            this.hide_back_to_feeds_toolbar();
+        }
     },
 
     hide_tryout: function () {
         if (!NEWSBLUR.reader) return;
 
-        NEWSBLUR.reader.close_sidebar();
-
-        this.$('.NB-inner,.NB-inner-account').animate({
-            paddingLeft: 0
-        }, {
-            queue: false,
-            easing: 'easeInOutQuint',
-            duration: 560
-        });
+        var is_mobile = this.is_mobile();
+        this.flags.mobile_active = false;
 
         this.$('.NB-welcome-container').removeClass('NB-welcome-tryout');
+        this.hide_story_pane();
+        this.unwatch_story_selection();
+        this.hide_signup_banner();
+        this.hide_back_to_login_banner();
+        this.hide_back_to_feeds_toolbar();
+
+        // Reset URL to welcome page
+        if (NEWSBLUR.router) {
+            NEWSBLUR.router.navigate('');
+        }
+
+        // Show welcome content again
+        NEWSBLUR.reader.$s.$body.removeClass('NB-show-reader');
+        NEWSBLUR.reader.flags['splash_page_frontmost'] = true;
+
+        if (is_mobile) {
+            // Remove CSS full-width override so the layout API controls width,
+            // then close sidebar with the built-in slide animation
+            $('body').removeClass('NB-welcome-tryout-active NB-mobile-single-pane');
+
+            if (!NEWSBLUR.reader.flags['sidebar_closed']) {
+                NEWSBLUR.reader.close_sidebar();
+            }
+
+            // Clean up after the slide animation completes (560ms)
+            _.delay(_.bind(function () {
+                NEWSBLUR.reader.reset_feed();
+                NEWSBLUR.reader.$s.$layout.hide();
+                this.flags.loaded = false;
+            }, this), 600);
+        } else {
+            $('body').removeClass('NB-welcome-tryout-active');
+
+            // Close sidebar so toggle_sidebar will open it next time
+            if (!NEWSBLUR.reader.flags['sidebar_closed']) {
+                NEWSBLUR.reader.close_sidebar();
+            }
+
+            // Animate hero padding back, then hide layout after animation
+            this.$('.NB-welcome-header-hero').animate({
+                paddingLeft: 0
+            }, {
+                queue: false,
+                easing: 'easeInOutQuint',
+                duration: 560,
+                complete: _.bind(function () {
+                    NEWSBLUR.reader.reset_feed();
+                    NEWSBLUR.reader.$s.$layout.hide();
+                    this.flags.loaded = false;
+                }, this)
+            });
+        }
+    },
+
+    // ==================
+    // = Signup Banner  =
+    // ==================
+
+    show_signup_banner: function () {
+        if ($('.NB-tryout-signup-banner').length) return;
+        if ($('.NB-tryfeed-signup-banner').length) return;
+
+        var self = this;
+        var $banner = $.make('div', { className: 'NB-tryout-signup-banner' }, [
+            $.make('div', { className: 'NB-tryout-signup-banner-logo' }),
+            $.make('div', { className: 'NB-tryout-signup-banner-content' }, [
+                $.make('div', { className: 'NB-tryout-signup-banner-text' }, gettext('This is just the demo.')),
+                $.make('div', { className: 'NB-tryout-signup-banner-subtext' }, gettext('Sign up to read your own feeds.'))
+            ]),
+            $.make('div', { className: 'NB-tryout-signup-banner-button' }, gettext('Sign up'))
+        ]);
+
+        $banner.on('click', function () {
+            self.scroll_to_login();
+        });
+
+        $('#story_titles').find('.NB-story-titles').before($banner);
+    },
+
+    hide_signup_banner: function () {
+        $('.NB-tryout-signup-banner').remove();
+    },
+
+    // ==========================
+    // = Back to Login Banner   =
+    // ==========================
+
+    show_back_to_login_banner: function () {
+        if ($('.NB-tryout-back-banner').length) return;
+
+        var self = this;
+        var $banner = $.make('div', { className: 'NB-tryout-back-banner' }, [
+            $.make('div', { className: 'NB-tryout-back-banner-arrow' }),
+            $.make('div', { className: 'NB-tryout-back-banner-content' }, [
+                $.make('div', { className: 'NB-tryout-back-banner-text' }, gettext('Log In or Sign Up'))
+            ]),
+            $.make('div', { className: 'NB-tryout-back-banner-cta' }, gettext('Create Account'))
+        ]);
+
+        $banner.on('click', function () {
+            self.scroll_to_login();
+        });
+
+        $('.NB-feeds-header-wrapper').prepend($banner);
+    },
+
+    hide_back_to_login_banner: function () {
+        $('.NB-tryout-back-banner').remove();
+    },
+
+    // ==============================
+    // = Back to Feeds Toolbar      =
+    // ==============================
+
+    show_back_to_feeds_toolbar: function () {
+        if ($('.NB-mobile-back-toolbar-feeds').length) return;
+
+        var self = this;
+        var $toolbar = $.make('div', { className: 'NB-mobile-back-toolbar NB-mobile-back-toolbar-feeds' }, [
+            $.make('div', { className: 'NB-mobile-back-toolbar-arrow' }),
+            $.make('div', { className: 'NB-mobile-back-toolbar-text' }, gettext('Back to feeds'))
+        ]);
+
+        $toolbar.on('click', function () {
+            self.back_to_feeds();
+        });
+
+        $('#story_titles').prepend($toolbar);
+    },
+
+    hide_back_to_feeds_toolbar: function () {
+        $('.NB-mobile-back-toolbar-feeds').remove();
+    },
+
+    back_to_feeds: function () {
+        if (!NEWSBLUR.reader) return;
+
+        this.hide_story_pane();
+
+        // Reset feed state but stay in tryout mode
+        NEWSBLUR.reader.reset_feed();
+        NEWSBLUR.reader.$s.$body.removeClass('NB-show-reader');
+        NEWSBLUR.reader.flags['splash_page_frontmost'] = true;
+
+        // Reset URL to root
+        if (NEWSBLUR.router) {
+            NEWSBLUR.router.navigate('');
+        }
+
+        // Ensure sidebar is open
+        if (NEWSBLUR.reader.flags['sidebar_closed']) {
+            NEWSBLUR.reader.open_sidebar();
+        }
+    },
+
+    // ======================================
+    // = Story Selection & Third Pane       =
+    // ======================================
+
+    watch_story_selection: function () {
+        var self = this;
+        // Use capture phase because story_title_view calls stopPropagation
+        this._story_click_handler = function (e) {
+            if ($(e.target).closest('.NB-story-title').length) {
+                _.delay(function () {
+                    self.show_story_pane();
+                }, 100);
+            }
+        };
+        var el = document.getElementById('story_titles');
+        if (el) el.addEventListener('click', this._story_click_handler, true);
+    },
+
+    unwatch_story_selection: function () {
+        var el = document.getElementById('story_titles');
+        if (el && this._story_click_handler) {
+            el.removeEventListener('click', this._story_click_handler, true);
+        }
+        this._story_click_handler = null;
+    },
+
+    show_story_pane: function () {
+        $('body').addClass('NB-mobile-story-open');
+        this.show_story_back_toolbar();
+        this.show_story_signup_banner();
+    },
+
+    hide_story_pane: function () {
+        $('body').removeClass('NB-mobile-story-open');
+        this.hide_story_back_toolbar();
+        this.hide_story_signup_banner();
+    },
+
+    show_story_back_toolbar: function () {
+        if ($('.NB-mobile-back-toolbar-stories').length) return;
+
+        var self = this;
+        var $toolbar = $.make('div', { className: 'NB-mobile-back-toolbar NB-mobile-back-toolbar-stories' }, [
+            $.make('div', { className: 'NB-mobile-back-toolbar-arrow' }),
+            $.make('div', { className: 'NB-mobile-back-toolbar-text' }, gettext('Back to stories'))
+        ]);
+
+        $toolbar.on('click', function () {
+            self.hide_story_pane();
+        });
+
+        $('#story_pane').prepend($toolbar);
+    },
+
+    hide_story_back_toolbar: function () {
+        $('.NB-mobile-back-toolbar-stories').remove();
+    },
+
+    // ======================================
+    // = Story Pane Signup Banner            =
+    // ======================================
+
+    show_story_signup_banner: function () {
+        if ($('#story_pane .NB-tryout-signup-banner').length) return;
+
+        var self = this;
+        var $banner = $.make('div', { className: 'NB-tryout-signup-banner' }, [
+            $.make('div', { className: 'NB-tryout-signup-banner-logo' }),
+            $.make('div', { className: 'NB-tryout-signup-banner-content' }, [
+                $.make('div', { className: 'NB-tryout-signup-banner-text' }, gettext('This is just the demo.')),
+                $.make('div', { className: 'NB-tryout-signup-banner-subtext' }, gettext('Sign up to read your own feeds.'))
+            ]),
+            $.make('div', { className: 'NB-tryout-signup-banner-button' }, gettext('Sign up'))
+        ]);
+
+        $banner.on('click', function () {
+            self.scroll_to_login();
+        });
+
+        var $toolbar = $('#story_pane .NB-mobile-back-toolbar-stories');
+        if ($toolbar.length) {
+            $banner.insertAfter($toolbar);
+        } else {
+            $('#story_pane').prepend($banner);
+        }
+    },
+
+    hide_story_signup_banner: function () {
+        $('#story_pane .NB-tryout-signup-banner').remove();
     }
 
 });

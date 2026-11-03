@@ -1,3 +1,5 @@
+"""Social tasks: sharing, follower notifications, and third-party integrations."""
+
 from bson.objectid import ObjectId
 from django.contrib.auth.models import User
 
@@ -66,6 +68,14 @@ def SyncFacebookFriends(user_id):
 def SharePopularStories():
     logging.debug(" ---> Sharing popular stories...")
     MSharedStory.share_popular_stories(interactive=False)
+
+
+@app.task(name="curate-global-shared-stories")
+def CurateGlobalSharedStories():
+    from apps.social.curation import curate_global_shared_stories
+
+    logging.debug(" ---> ~FBCurating global shared stories...")
+    return curate_global_shared_stories()
 
 
 @app.task(name="clean-social-spam")

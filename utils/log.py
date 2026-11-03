@@ -1,3 +1,9 @@
+"""Structured logging with per-user context, platform detection, and timing.
+
+Wraps Python's logging module with NewsBlur-specific formatters that include
+username, platform (iOS/Android/web), and request duration in log output.
+"""
+
 import logging
 import re
 import string
@@ -30,7 +36,7 @@ def user(u, msg, request=None, warn_color=True):
     if isinstance(u, WSGIRequest) or request:
         if not request:
             request = u
-            u = request.user
+            u = getattr(request, "user", None)
         platform = extract_user_agent(request)
 
         if hasattr(request, "start_time"):
@@ -40,11 +46,20 @@ def user(u, msg, request=None, warn_color=True):
                 if seconds >= 5:
                     color = "~FR"
                 elif seconds > 1:
-                    color = "~SB~FK"
-            time_elapsed = "[%s%.4ss~SB] " % (
+                    color = "~FY"
+            queue_str = ""
+            if hasattr(request, "_server_timing_start"):
+                queue_seconds = request.start_time - request._server_timing_start
+                if queue_seconds > 0.1:
+                    queue_str = "~FR+%.2fq~SB" % queue_seconds
+            time_elapsed = "[%s%.4ss%s~SB] " % (
                 color,
                 seconds,
+                queue_str,
             )
+    if not u:
+        info(" ---> [~FB~SN%-6s~SB] %s[anonymous] %s" % (platform, time_elapsed, msg))
+        return
     is_premium = u.is_authenticated and u.profile.is_premium
     premium = "*" if is_premium else ""
     if is_premium and u.profile.is_archive:
@@ -98,6 +113,7 @@ def colorize(msg):
     }
     colors = {
         "~SB": Style.BRIGHT,
+        "~SD": Style.DIM,
         "~SN": Style.NORMAL,
         "~SK": Style.BLINK,
         "~SU": Style.UNDERLINE,

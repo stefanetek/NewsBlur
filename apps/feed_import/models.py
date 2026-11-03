@@ -1,12 +1,13 @@
+"""Feed import models: OPML import/export and OAuth token management."""
+
 import base64
 import datetime
 import pickle
 from xml.etree.ElementTree import Comment, Element, SubElement, tostring
 
 import mongoengine as mongo
-from django.conf import settings
 from django.contrib.auth.models import User
-from django.db import models
+from django.db import models, transaction
 from lxml import etree
 from mongoengine.queryset import OperationError
 from oauth2client.client import Error as OAuthError
@@ -17,7 +18,7 @@ from apps.rss_feeds.models import DuplicateFeed, Feed
 from utils import json_functions as json
 from utils import log as logging
 from utils import urlnorm
-from utils.feed_functions import add_object_to_folder, timelimit
+from utils.feed_functions import add_object_to_folder
 
 
 class OAuthToken(models.Model):
@@ -69,7 +70,7 @@ class OPMLExporter(Importer):
         folders = self.get_folders()
         body = SubElement(root, "body")
         self.process_outline(body, folders, verbose=verbose)
-        return tostring(root, encoding="utf8", method="xml")
+        return tostring(root, encoding="utf-8", method="xml")
 
     def process_outline(self, body, folders, verbose=False):
         for obj in folders:
@@ -118,38 +119,64 @@ class OPMLImporter(Importer):
         self.user = user
         self.opml_xml = opml_xml
 
-    def try_processing(self):
-        # Disable timeout in test environment
-        if getattr(settings, "TEST_DEBUG", False):
-            folders = self.process()
-            return folders
-
-        @timelimit(10)
-        def _timed_process():
-            return self.process()
-
-        folders = _timed_process()
-        return folders
+    @staticmethod
+    def get_outline_attr(item, *attrs):
+        for attr in attrs:
+            try:
+                return getattr(item, attr)
+            except AttributeError:
+                continue
+        return None
 
     def process(self):
         # self.clear_feeds()
 
         outline = opml.from_string(self.opml_xml)
-        folders = self.get_folders()
         try:
-            folders = self.process_outline(outline, folders)
+            # apps/feed_import/models.py collects only imported placements while resolving feeds without row locks.
+            imported = self.process_outline(outline, [])
         except AttributeError:
             folders = None
         else:
-            # self.clear_folders()
-            self.usf.folders = json.encode(folders)
-            self.usf.save()
+            with transaction.atomic():
+                # Match subscription_batch.py's lock order, then merge into the latest committed folder tree.
+                User.objects.select_for_update().get(pk=self.user.pk)
+                self.usf, _ = UserSubscriptionFolders.objects.get_or_create(user=self.user)
+                self.usf = UserSubscriptionFolders.objects.select_for_update().get(pk=self.usf.pk)
+                folders = json.decode(self.usf.folders or "[]")
+                self.merge_folders(folders, imported)
+                self.usf.folders = json.encode(folders)
+                self.usf.save(update_fields=["folders"])
 
         return folders
 
+    @classmethod
+    def merge_folders(cls, destination, imported):
+        # apps/feed_import/models.py merges corresponding paths without replacing concurrent placements.
+        for item in imported:
+            if isinstance(item, dict):
+                for name, children in item.items():
+                    existing = next(
+                        (
+                            contents
+                            for folder in destination
+                            if isinstance(folder, dict)
+                            for title, contents in folder.items()
+                            if title.lower() == name.lower()
+                        ),
+                        None,
+                    )
+                    if existing is None:
+                        destination.append({name: children})
+                    else:
+                        cls.merge_folders(existing, children)
+            elif item not in destination:
+                destination.append(item)
+
     def process_outline(self, outline, folders, in_folder=""):
         for item in outline:
-            if not hasattr(item, "xmlUrl") and (hasattr(item, "text") or hasattr(item, "title")):
+            xml_url = self.get_outline_attr(item, "xmlUrl", "xmlURL")
+            if not xml_url and (hasattr(item, "text") or hasattr(item, "title")):
                 folder = item
                 title = getattr(item, "text", None) or getattr(item, "title", None)
                 # if hasattr(folder, 'text'):
@@ -157,70 +184,146 @@ class OPMLImporter(Importer):
                 obj = {title: []}
                 folders = add_object_to_folder(obj, in_folder, folders)
                 folders = self.process_outline(folder, folders, title)
-            elif hasattr(item, "xmlUrl"):
+            elif xml_url:
                 feed = item
-                if not hasattr(feed, "htmlUrl"):
-                    setattr(feed, "htmlUrl", None)
+                html_url = self.get_outline_attr(feed, "htmlUrl", "htmlURL")
                 # If feed title matches what's in the DB, don't override it on subscription.
                 feed_title = getattr(feed, "title", None) or getattr(feed, "text", None)
                 if not feed_title:
-                    setattr(feed, "title", feed.htmlUrl or feed.xmlUrl)
+                    feed_title = html_url or xml_url
                     user_feed_title = None
                 else:
-                    setattr(feed, "title", feed_title)
-                    user_feed_title = feed.title
-
-                feed_address = urlnorm.normalize(feed.xmlUrl)
-                feed_link = urlnorm.normalize(feed.htmlUrl)
-                if not feed_address:
-                    continue
-                if len(feed_address) > Feed._meta.get_field("feed_address").max_length:
-                    continue
-                if feed_link and len(feed_link) > Feed._meta.get_field("feed_link").max_length:
-                    continue
-                # logging.info(' ---> \t~FR%s - %s - %s' % (feed.title, feed_link, feed_address,))
-                feed_data = dict(feed_address=feed_address, feed_link=feed_link, feed_title=feed.title)
-                # feeds.append(feed_data)
-
-                # See if it exists as a duplicate first
-                duplicate_feed = DuplicateFeed.objects.filter(duplicate_address=feed_address)
-                if duplicate_feed:
-                    feed_db = duplicate_feed[0].feed
-                else:
-                    feed_data["active_subscribers"] = 1
-                    feed_data["num_subscribers"] = 1
-                    feed_db, _ = Feed.find_or_create(
-                        feed_address=feed_address, feed_link=feed_link, defaults=dict(**feed_data)
-                    )
-
-                if user_feed_title == feed_db.feed_title:
-                    user_feed_title = None
+                    user_feed_title = feed_title
 
                 try:
-                    us = UserSubscription.objects.get(feed=feed_db, user=self.user)
-                except UserSubscription.DoesNotExist:
-                    us = None
-
-                if not us:
-                    us = UserSubscription(
-                        feed=feed_db,
-                        user=self.user,
-                        needs_unread_recalc=True,
-                        mark_read_date=datetime.datetime.utcnow() - datetime.timedelta(days=1),
-                        active=self.user.profile.is_premium,
-                        user_title=user_feed_title,
+                    folders = self.process_feed(
+                        xml_url, html_url, feed_title, user_feed_title, folders, in_folder
                     )
-                    us.save()
+                except Exception as e:
+                    logging.error(" ---> ~FROPML import skipping feed %s: %s" % (xml_url, e))
 
-                if self.user.profile.is_premium and not us.active:
-                    us.active = True
-                    us.save()
-                if not us.needs_unread_recalc:
-                    us.needs_unread_recalc = True
-                    us.save()
+        return folders
 
-                folders = add_object_to_folder(feed_db.pk, in_folder, folders)
+    # apps/feed_import/models.py
+    # NewsBlur-internal feed addresses that must never be re-created as new feeds on
+    # import. Email newsletters (newsletter:<user_id>:...) are user-specific, and web
+    # feeds (webfeed:...) are scraped internally. A NewsBlur OPML export writes these
+    # addresses out verbatim, so re-importing that export would otherwise mint a
+    # duplicate feed for every newsletter/web feed the user already subscribes to.
+    INTERNAL_ADDRESS_PREFIXES = (
+        "newsletter:",
+        "http://newsletter:",
+        "https://newsletter:",
+        "webfeed:",
+    )
 
+    def existing_feed_match(self, feed_address, feed_link, feed_title):
+        # Return the feed_id of a subscription the user already had (before this import)
+        # that represents the same source, matched by normalized address, then normalized
+        # link, then case-insensitive title. Built once and cached; not updated during the
+        # import so a fresh account (no prior subs) never de-dupes against itself.
+        if getattr(self, "_existing_feed_index", None) is None:
+            by_address, by_link, by_title = {}, {}, {}
+            subs = UserSubscription.objects.filter(user=self.user).select_related("feed")
+            for us in subs:
+                feed = us.feed
+                if not feed:
+                    continue
+                address = urlnorm.normalize(feed.feed_address or "")
+                link = urlnorm.normalize(feed.feed_link or "")
+                title = (feed.feed_title or "").strip().lower()
+                if address:
+                    by_address.setdefault(address, feed.pk)
+                if link:
+                    by_link.setdefault(link, feed.pk)
+                if title:
+                    by_title.setdefault(title, feed.pk)
+            self._existing_feed_index = (by_address, by_link, by_title)
+
+        by_address, by_link, by_title = self._existing_feed_index
+        if feed_address and feed_address in by_address:
+            return by_address[feed_address]
+        if feed_link and feed_link in by_link:
+            return by_link[feed_link]
+        title = (feed_title or "").strip().lower()
+        if title and title in by_title:
+            return by_title[title]
+        return None
+
+    def process_feed(self, xml_url, html_url, feed_title, user_feed_title, folders, in_folder):
+        raw_url = (xml_url or "").strip()
+        if raw_url.startswith(self.INTERNAL_ADDRESS_PREFIXES):
+            # Reuse the user's existing subscription for this internal address rather than
+            # creating a duplicate feed; skip entirely if they aren't already subscribed.
+            existing = UserSubscription.objects.filter(user=self.user, feed__feed_address=raw_url).first()
+            if existing:
+                folders = add_object_to_folder(existing.feed_id, in_folder, folders)
+            else:
+                logging.info(
+                    " ---> [%s] ~FROPML import skipping internal feed address: %s" % (self.user, raw_url[:80])
+                )
+            return folders
+
+        feed_address = urlnorm.normalize(xml_url)
+        feed_link = urlnorm.normalize(html_url)
+        if not feed_address:
+            return folders
+        if len(feed_address) > Feed._meta.get_field("feed_address").max_length:
+            return folders
+        if feed_link and len(feed_link) > Feed._meta.get_field("feed_link").max_length:
+            return folders
+
+        # Auto de-dupe on merge: if the user already subscribes to a feed for this same
+        # source under a drifted address/link/title, reuse it instead of minting a
+        # duplicate. Matching is limited to subscriptions that existed before this import
+        # began, so a fresh import (empty account) is never affected.
+        existing_feed_id = self.existing_feed_match(feed_address, feed_link, feed_title)
+        if existing_feed_id:
+            folders = add_object_to_folder(existing_feed_id, in_folder, folders)
+            return folders
+
+        # logging.info(' ---> \t~FR%s - %s - %s' % (feed_title, feed_link, feed_address,))
+        feed_data = dict(feed_address=feed_address, feed_link=feed_link, feed_title=feed_title)
+        # feeds.append(feed_data)
+
+        # See if it exists as a duplicate first
+        duplicate_feed = DuplicateFeed.objects.filter(duplicate_address=feed_address)
+        if duplicate_feed:
+            feed_db = duplicate_feed[0].feed
+        else:
+            feed_data["active_subscribers"] = 1
+            feed_data["num_subscribers"] = 1
+            feed_db, _ = Feed.find_or_create(
+                feed_address=feed_address, feed_link=feed_link, defaults=dict(**feed_data)
+            )
+
+        if user_feed_title == feed_db.feed_title:
+            user_feed_title = None
+
+        try:
+            us = UserSubscription.objects.get(feed=feed_db, user=self.user)
+        except UserSubscription.DoesNotExist:
+            us = None
+
+        if not us:
+            us = UserSubscription(
+                feed=feed_db,
+                user=self.user,
+                needs_unread_recalc=True,
+                mark_read_date=datetime.datetime.utcnow() - datetime.timedelta(days=1),
+                active=self.user.profile.is_premium,
+                user_title=user_feed_title,
+            )
+            us.save()
+
+        if self.user.profile.is_premium and not us.active:
+            us.active = True
+            us.save()
+        if not us.needs_unread_recalc:
+            us.needs_unread_recalc = True
+            us.save()
+
+        folders = add_object_to_folder(feed_db.pk, in_folder, folders)
         return folders
 
     def count_feeds_in_opml(self):
@@ -241,6 +344,6 @@ class UploadedOPML(mongo.Document):
     meta = {
         "collection": "uploaded_opml",
         "allow_inheritance": False,
-        "order": "-upload_date",
+        "ordering": ["-upload_date"],
         "indexes": ["user_id", "-upload_date"],
     }

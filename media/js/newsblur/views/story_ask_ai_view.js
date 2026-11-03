@@ -17,7 +17,8 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         "click .NB-story-ask-ai-usage-message a": "open_premium_modal",
         "click .NB-reask-dropdown .NB-model-option": "handle_reask_model_click",
         "click .NB-send-dropdown .NB-model-option": "handle_send_model_click",
-        "click .NB-finish-recording-dropdown .NB-model-option": "handle_finish_recording_model_click"
+        "click .NB-finish-recording-dropdown .NB-model-option": "handle_finish_recording_model_click",
+        "click .NB-thinking-toggle-option": "handle_thinking_toggle"
     },
 
     initialize: function (options) {
@@ -25,11 +26,12 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         this.question_id = options.question_id;
         this.custom_question = options.custom_question;
         this.transcription_error = options.transcription_error;
-        this.model = options.model || 'opus';  // Default to opus
+        this.model = this.normalize_model_key(options.model) || 'anthropic';  // Default to the server's default model key
+        this.thinking = options.thinking || false;
 
         // If there's a transcription error, show "Audio not transcribed" as the question text
         if (this.transcription_error) {
-            this.question_text = '<em>Audio not transcribed</em>';
+            this.question_text = '<em>' + _.escape(gettext('Audio not transcribed')) + '</em>';
         } else {
             this.question_text = this.custom_question || this.get_question_text(this.question_id);
         }
@@ -44,6 +46,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         this.original_question_id = this.question_id;  // Store for re-ask
         this.original_custom_question = this.custom_question;  // Store for re-ask
         this.response_model = this.model;  // Track which model produced current response
+        this.response_thinking = this.thinking;  // Track thinking mode of current response
         this.is_comparison_response = false;  // Track if comparing multiple model responses
         this.section_models = [];  // Track models for each answer section (for pills)
 
@@ -63,11 +66,16 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
             question_id: this.question_id
         }));
 
+        // Populate model dropdowns from backend data
+        var dropdown_html = this.build_model_dropdown_html();
+        this.$('.NB-story-ask-ai-model-dropdown').html(dropdown_html);
+
         // Store view instance on DOM element for Socket.IO handler access
         this.$el.data('view', this);
 
-        // Set the model dropdown to the current model
+        // Set the model dropdown to the current model and thinking toggle
         this.update_model_dropdown_selection();
+        this.update_thinking_toggle_selection();
 
         // If there's a transcription error, display it instead of sending a question
         if (this.transcription_error) {
@@ -108,11 +116,14 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
     },
 
     get_provider_display_name: function (provider) {
+        var models = (NEWSBLUR.Globals && NEWSBLUR.Globals.ask_ai_models) || [];
+        var match = _.find(models, function (m) { return m.vendor === provider; });
+        if (match) return match.vendor_display;
         var names = {
             'anthropic': 'Anthropic',
             'openai': 'OpenAI',
             'google': 'Google',
-            'xai': 'xAI'
+            'xai': 'SpaceXSI'
         };
         return names[provider] || provider;
     },
@@ -122,7 +133,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         this.$el.removeClass('NB-thinking');
         this.show_loading_pill_error();
 
-        var error_text = 'Request timed out. The AI service took too long to respond. Please try again.';
+        var error_text = gettext('Request timed out. The AI service took too long to respond. Please try again.');
 
         // Track error separately so it can be cleared if response arrives late
         this.pending_error = error_text;
@@ -137,7 +148,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         this.$el.removeClass('NB-thinking');
         this.show_loading_pill_error();
 
-        var error_text = 'Stream interrupted. No response received for 10 seconds.';
+        var error_text = gettext('Stream interrupted. No response received for 10 seconds.');
 
         // Track error separately so it can be cleared if response arrives late
         this.pending_error = error_text;
@@ -151,7 +162,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         // Render response with pending error appended (but not baked into response_text)
         var $answer = this.$('.NB-story-ask-ai-answer');
         if (this.response_text) {
-            var display_text = this.response_text + '\n\n**Error:** ' + this.pending_error;
+            var display_text = this.response_text + '\n\n**' + gettext('Error:') + '** ' + this.pending_error;
             var html = this.markdown_to_html(display_text);
             $answer.html(html);
         } else {
@@ -174,52 +185,37 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
             </div>\
             <div class="NB-story-ask-ai-response">\
                 <div class="NB-story-ask-ai-error">\
-                    <strong>Request timed out.</strong> The AI service took too long to respond. Please try again.\
+                    <strong><%- gettext("Request timed out.") %></strong> <%- gettext("The AI service took too long to respond. Please try again.") %>\
                 </div>\
                 <div class="NB-story-ask-ai-answer" style="display: none;"></div>\
                 <div class="NB-story-ask-ai-usage-message" style="display: none;"></div>\
             </div>\
             <div class="NB-story-ask-ai-followup-wrapper" style="display: none;">\
                 <div class="NB-story-ask-ai-input-row">\
-                    <div class="NB-story-ask-ai-voice-button" title="Record voice question">\
+                    <div class="NB-story-ask-ai-voice-button" title="<%- gettext("Record voice question") %>">\
                         <img src="/media/img/icons/nouns/microphone.svg" class="NB-story-ask-ai-voice-icon" />\
                     </div>\
-                    <input type="text" class="NB-story-ask-ai-followup-input" placeholder="Follow up..." />\
+                    <input type="text" class="NB-story-ask-ai-followup-input" placeholder="<%- gettext("Follow up...") %>" />\
                     <div class="NB-story-ask-ai-reask-menu">\
-                        <div class="NB-button NB-story-ask-ai-reask-button" title="Re-ask original question">\
-                            <span>Re-ask</span>\
+                        <div class="NB-button NB-story-ask-ai-reask-button" title="<%- gettext("Re-ask original question") %>">\
+                            <span><%- gettext("Re-ask") %></span>\
                             <span class="NB-dropdown-arrow">▾</span>\
                         </div>\
-                        <div class="NB-story-ask-ai-model-dropdown NB-reask-dropdown">\
-                            <div class="NB-model-option" data-model="opus"><span class="NB-provider-pill NB-provider-anthropic">Anthropic</span> Claude Opus 4.5</div>\
-                            <div class="NB-model-option" data-model="gpt-5.1"><span class="NB-provider-pill NB-provider-openai">OpenAI</span> GPT 5.1</div>\
-                            <div class="NB-model-option" data-model="gemini-3"><span class="NB-provider-pill NB-provider-google">Google</span> Gemini 3 Pro</div>\
-                            <div class="NB-model-option" data-model="grok-4.1"><span class="NB-provider-pill NB-provider-xai">xAI</span> Grok 4.1 Fast</div>\
-                        </div>\
+                        <div class="NB-story-ask-ai-model-dropdown NB-reask-dropdown"></div>\
                     </div>\
                     <div class="NB-story-ask-ai-send-menu" style="display: none;">\
-                        <div class="NB-button NB-story-ask-ai-send-button">Send</div>\
-                        <div class="NB-story-ask-ai-send-dropdown-trigger" title="Choose model">\
+                        <div class="NB-button NB-story-ask-ai-send-button"><%- gettext("Send") %></div>\
+                        <div class="NB-story-ask-ai-send-dropdown-trigger" title="<%- gettext("Choose model") %>">\
                             <span class="NB-dropdown-arrow">▾</span>\
                         </div>\
-                        <div class="NB-story-ask-ai-model-dropdown NB-send-dropdown">\
-                            <div class="NB-model-option" data-model="opus"><span class="NB-provider-pill NB-provider-anthropic">Anthropic</span> Claude Opus 4.5</div>\
-                            <div class="NB-model-option" data-model="gpt-5.1"><span class="NB-provider-pill NB-provider-openai">OpenAI</span> GPT 5.1</div>\
-                            <div class="NB-model-option" data-model="gemini-3"><span class="NB-provider-pill NB-provider-google">Google</span> Gemini 3 Pro</div>\
-                            <div class="NB-model-option" data-model="grok-4.1"><span class="NB-provider-pill NB-provider-xai">xAI</span> Grok 4.1 Fast</div>\
-                        </div>\
+                        <div class="NB-story-ask-ai-model-dropdown NB-send-dropdown"></div>\
                     </div>\
                     <div class="NB-story-ask-ai-finish-recording-menu" style="display: none;">\
-                        <div class="NB-button NB-story-ask-ai-finish-recording-button">Finish recording...</div>\
-                        <div class="NB-story-ask-ai-finish-recording-dropdown-trigger" title="Choose model">\
+                        <div class="NB-button NB-story-ask-ai-finish-recording-button"><%- gettext("Finish recording...") %></div>\
+                        <div class="NB-story-ask-ai-finish-recording-dropdown-trigger" title="<%- gettext("Choose model") %>">\
                             <span class="NB-dropdown-arrow">▾</span>\
                         </div>\
-                        <div class="NB-story-ask-ai-model-dropdown NB-finish-recording-dropdown">\
-                            <div class="NB-model-option" data-model="opus"><span class="NB-provider-pill NB-provider-anthropic">Anthropic</span> Claude Opus 4.5</div>\
-                            <div class="NB-model-option" data-model="gpt-5.1"><span class="NB-provider-pill NB-provider-openai">OpenAI</span> GPT 5.1</div>\
-                            <div class="NB-model-option" data-model="gemini-3"><span class="NB-provider-pill NB-provider-google">Google</span> Gemini 3 Pro</div>\
-                            <div class="NB-model-option" data-model="grok-4.1"><span class="NB-provider-pill NB-provider-xai">xAI</span> Grok 4.1 Fast</div>\
-                        </div>\
+                        <div class="NB-story-ask-ai-model-dropdown NB-finish-recording-dropdown"></div>\
                     </div>\
                 </div>\
             </div>\
@@ -236,16 +232,16 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
 
     get_question_text: function (question_id) {
         var questions = {
-            'sentence': 'Summarize in one sentence',
-            'bullets': 'Summarize in bullet points',
-            'paragraph': 'Summarize in a paragraph',
-            'context': "What's the context and background?",
-            'people': 'Identify key people and relationships',
-            'arguments': 'What are the main arguments?',
-            'factcheck': 'Fact check this story',
-            'custom': 'Ask a custom question...'
+            'sentence': gettext('Summarize in one sentence'),
+            'bullets': gettext('Summarize in bullet points'),
+            'paragraph': gettext('Summarize in a paragraph'),
+            'context': gettext("What's the context and background?"),
+            'people': gettext('Identify key people and relationships'),
+            'arguments': gettext('What are the main arguments?'),
+            'factcheck': gettext('Fact check this story'),
+            'custom': gettext('Ask a custom question...')
         };
-        return this.get_prompt_short_text(question_id, questions[question_id] || 'Unknown question');
+        return this.get_prompt_short_text(question_id, questions[question_id] || gettext('Unknown question'));
     },
 
     generate_request_id: function () {
@@ -296,11 +292,13 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         var params = {
             story_hash: this.story_hash,
             question_id: this.question_id,
-            model: this.model
+            model: this.model,
+            thinking: this.thinking
         };
 
-        // Track which model is producing this response
+        // Track which model and thinking mode is producing this response
         this.response_model = this.model;
+        this.response_thinking = this.thinking;
 
         var request_id = this.generate_request_id();
         this.active_request_id = request_id;
@@ -333,7 +331,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
             }
             return;
         }
-        this.handle_response_error(data.message || 'Unknown error');
+        this.handle_response_error(data.message || gettext('Unknown error'));
     },
 
     handle_response_error: function (error) {
@@ -347,15 +345,15 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
                 error_message = error.message;
             } else if (error.statusText) {
                 // jQuery XHR object
-                error_message = 'Server error: ' + error.statusText;
+                error_message = interpolate(gettext('Server error: %(status)s'), {status: error.statusText}, true);
             } else if (error.responseText) {
-                error_message = 'Server error';
+                error_message = gettext('Server error');
             }
         }
 
         // Ensure error_message is a string
         if (typeof error_message !== 'string') {
-            error_message = 'An error occurred. Please try again.';
+            error_message = gettext('An error occurred. Please try again.');
         }
 
         // Check if this is a usage limit error
@@ -501,14 +499,16 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
                 section_index = 1;
             }
 
-            // Add pills after each <hr> for subsequent sections (only show if different from previous)
+            // Add pills after each <hr> for subsequent sections
+            // Always show pill in comparison mode, otherwise only show if model differs
             html = html.replace(/<hr>/g, function () {
                 var pill_html = '';
                 if (self.section_models[section_index]) {
                     var current_model = self.section_models[section_index];
                     var prev_model = self.section_models[section_index - 1];
                     var is_different = current_model !== prev_model;
-                    pill_html = self.create_model_pill_html(current_model, has_any_model_change && is_different);
+                    var should_show = self.is_comparison_response || (has_any_model_change && is_different);
+                    pill_html = self.create_model_pill_html(current_model, should_show);
                     section_index++;
                 }
                 return '<hr>\n' + pill_html;
@@ -587,8 +587,9 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         this.$('.NB-story-ask-ai-reask-menu').show();
         this.$('.NB-story-ask-ai-send-menu').hide();
 
-        // Update model dropdown selection
+        // Update model dropdown and thinking toggle selection
         this.update_model_dropdown_selection();
+        this.update_thinking_toggle_selection();
     },
 
     show_error: function (error_message) {
@@ -608,32 +609,20 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
     },
 
     show_usage_message: function (message) {
-        // Display usage message below the answer
-        // Convert "Upgrade to Premium/Premium Archive" text to a clickable link
-        var html_message = _.escape(message);
-
-        // Replace "Upgrade to Premium Archive" with a link (do this first, more specific)
-        html_message = html_message.replace(
-            /Upgrade to Premium Archive/g,
-            '<a href="#" class="NB-story-ask-ai-upgrade-link">Upgrade to Premium Archive</a>'
-        );
-
-        // Replace "Upgrade to Premium" with a link (for free users)
-        // Use negative lookahead to not match "Upgrade to Premium Archive"
-        html_message = html_message.replace(
-            /Upgrade to Premium(?! Archive)/g,
-            '<a href="#" class="NB-story-ask-ai-upgrade-link">Upgrade to Premium</a>'
-        );
-
-        // Convert newlines to <br> tags
-        html_message = html_message.replace(/\n/g, '<br>');
-
-        this.$('.NB-story-ask-ai-usage-message').html(html_message).show();
+        // story_ask_ai_view.js: Display the usage/limit message below the answer as the
+        // shared Premium Archive callout strip (reader_utils.js make_archive_callout).
+        // The callout's badge already says "Premium Archive", so trim the backend's
+        // "Upgrade to Premium Archive ..." sentence down to just "Upgrade ...".
+        var text = message.replace(/\n+/g, ' ')
+            .replace(/Upgrade to Premium Archive/g, 'Upgrade')
+            .replace(/Upgrade to Premium(?! Archive)/g, 'Upgrade');
+        var $callout = NEWSBLUR.utils.make_archive_callout(text, { highlight_feature: 'ask-ai' });
+        this.$('.NB-story-ask-ai-usage-message').empty().append($callout).show();
     },
 
     open_premium_modal: function (e) {
         e.preventDefault();
-        NEWSBLUR.reader.open_feedchooser_modal({ premium_only: true });
+        NEWSBLUR.reader.open_premium_upgrade_modal({ highlight_feature: 'ask-ai' });
     },
 
     handle_followup_keypress: function (e) {
@@ -661,7 +650,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         });
 
         // Add a visual separator for the follow-up to response_text
-        this.response_text += '\n\n---\n\n**You:** ' + followup_text + '\n\n';
+        this.response_text += '\n\n---\n\n**' + gettext('You:') + '** ' + followup_text + '\n\n';
 
         // Render the updated text with markdown
         var $answer = this.$('.NB-story-ask-ai-answer');
@@ -699,8 +688,8 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
             this.voice_recorder = new NEWSBLUR.VoiceRecorder({
                 on_recording_start: function () {
                     $voice_button.addClass('NB-recording');
-                    $input.attr('placeholder', 'Recording...');
-                    $voice_button.attr('title', 'Stop recording');
+                    $input.attr('placeholder', gettext('Recording...'));
+                    $voice_button.attr('title', gettext('Stop recording'));
                     // Hide Re-ask and Send, show Finish Recording during recording
                     self.$('.NB-story-ask-ai-reask-menu').hide();
                     self.$('.NB-story-ask-ai-send-menu').hide();
@@ -709,15 +698,15 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
                 on_recording_stop: function () {
                     $voice_button.removeClass('NB-recording');
                     $voice_button.addClass('NB-transcribing');
-                    $input.attr('placeholder', 'Transcribing...');
-                    $voice_button.attr('title', 'Transcribing audio');
+                    $input.attr('placeholder', gettext('Transcribing...'));
+                    $voice_button.attr('title', gettext('Transcribing audio'));
                     // Hide finish recording menu during transcription
                     self.$('.NB-story-ask-ai-finish-recording-menu').hide();
                 },
                 on_recording_cancel: function () {
                     $voice_button.removeClass('NB-recording NB-transcribing');
-                    $voice_button.attr('title', 'Record voice question');
-                    $input.attr('placeholder', 'Follow up...');
+                    $voice_button.attr('title', gettext('Record voice question'));
+                    $input.attr('placeholder', gettext('Follow up...'));
                     // Reset button visibility
                     self.$('.NB-story-ask-ai-finish-recording-menu').hide();
                     if (!$input.val().trim()) {
@@ -733,8 +722,8 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
                 },
                 on_transcription_complete: function (text) {
                     $voice_button.removeClass('NB-transcribing');
-                    $voice_button.attr('title', 'Record voice question');
-                    $input.attr('placeholder', 'Follow up...');
+                    $voice_button.attr('title', gettext('Record voice question'));
+                    $input.attr('placeholder', gettext('Follow up...'));
 
                     // Set the transcribed text and submit the question automatically
                     $input.val(text);
@@ -746,7 +735,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
                 },
                 on_transcription_error: function (error) {
                     $voice_button.removeClass('NB-recording NB-transcribing');
-                    $voice_button.attr('title', 'Record voice question');
+                    $voice_button.attr('title', gettext('Record voice question'));
 
                     // Check if this is a quota/limit error
                     var is_quota_error = error && (error.includes('limit') || error.includes('used all') || error.includes('reached'));
@@ -755,10 +744,10 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
                         // Show quota error in the usage message box (blue box)
                         self.show_usage_message(error);
                         // Put a subtle placeholder in the input
-                        $input.attr('placeholder', 'Quota exceeded');
+                        $input.attr('placeholder', gettext('Quota exceeded'));
                     } else {
                         // Show other errors as notifications
-                        $input.attr('placeholder', 'Follow up...');
+                        $input.attr('placeholder', gettext('Follow up...'));
                         NEWSBLUR.reader.show_feed_hidden_story_title_indicator(error, false);
                     }
                     // Reset buttons if no text
@@ -831,13 +820,13 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
             e.preventDefault();
             e.stopPropagation();
         }
-        var selected_model = this.$(e.target).data('model');
+        var selected_model = this.$(e.target).closest('.NB-model-option').data('model');
 
         // Close dropdown
         this.$('.NB-story-ask-ai-reask-menu').removeClass('NB-dropdown-open');
 
-        // Only re-ask if model is different from current response
-        if (selected_model === this.response_model) {
+        // Only re-ask if model or thinking mode is different from current response
+        if (selected_model === this.response_model && this.thinking === this.response_thinking) {
             return;
         }
 
@@ -852,7 +841,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
             e.preventDefault();
             e.stopPropagation();
         }
-        var selected_model = this.$(e.target).data('model');
+        var selected_model = this.$(e.target).closest('.NB-model-option').data('model');
         this.model = selected_model;
         NEWSBLUR.assets.preference('ask_ai_model', selected_model);
         this.update_model_dropdown_selection();
@@ -872,24 +861,97 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
         });
     },
 
+    update_thinking_toggle_selection: function () {
+        var thinking = this.thinking;
+        this.$('.NB-thinking-toggle-option').each(function () {
+            var $option = $(this);
+            var is_thinking = $option.data('thinking') === true || $option.data('thinking') === 'true';
+            if (is_thinking === thinking) {
+                $option.addClass('NB-selected');
+            } else {
+                $option.removeClass('NB-selected');
+            }
+        });
+    },
+
+    handle_thinking_toggle: function (e) {
+        if (e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+        var $option = this.$(e.currentTarget);
+        var thinking = $option.data('thinking') === true || $option.data('thinking') === 'true';
+
+        // Update selected state
+        this.$('.NB-thinking-toggle-option').removeClass('NB-selected');
+        $option.addClass('NB-selected');
+
+        // Save preference
+        this.thinking = thinking;
+        NEWSBLUR.assets.preference('ask_ai_thinking', thinking);
+
+        // Re-ask if thinking mode changed from what produced the current response
+        if (thinking !== this.response_thinking) {
+            this.reask_with_new_model();
+        }
+    },
+
+    // Legacy model keys from before keys became vendor slugs (Aug 2026).
+    // Cached responses and saved preferences may still carry them.
+    LEGACY_MODEL_KEYS: {
+        'opus': 'anthropic',
+        'haiku': 'anthropic',
+        'gpt-5.2': 'openai',
+        'gpt-5-mini': 'openai',
+        'gemini-3': 'google',
+        'gemini-flash-lite': 'google',
+        'grok-4.1': 'xai',
+        'grok-4.1-fast': 'xai'
+    },
+
+    normalize_model_key: function (model) {
+        if (!model) return model;
+        var models = (NEWSBLUR.Globals && NEWSBLUR.Globals.ask_ai_models) || [];
+        if (_.find(models, function (m) { return m.key === model; })) return model;
+        return this.LEGACY_MODEL_KEYS[model] || model;
+    },
+
     get_model_display_name: function (model) {
-        var names = {
-            'opus': 'Claude Opus 4.5',
-            'gpt-5.1': 'GPT 5.1',
-            'gemini-3': 'Gemini 3 Pro',
-            'grok-4.1': 'Grok 4.1 Fast'
-        };
-        return names[model] || model;
+        model = this.normalize_model_key(model);
+        var models = (NEWSBLUR.Globals && NEWSBLUR.Globals.ask_ai_models) || [];
+        var match = _.find(models, function (m) { return m.key === model; });
+        return (match && match.display_name) || model;
     },
 
     get_model_provider: function (model) {
-        var providers = {
-            'opus': 'anthropic',
-            'gpt-5.1': 'openai',
-            'gemini-3': 'google',
-            'grok-4.1': 'xai'
-        };
-        return providers[model] || 'unknown';
+        model = this.normalize_model_key(model);
+        var models = (NEWSBLUR.Globals && NEWSBLUR.Globals.ask_ai_models) || [];
+        var match = _.find(models, function (m) { return m.key === model; });
+        return (match && match.vendor) || 'unknown';
+    },
+
+    build_model_dropdown_html: function () {
+        var models = (NEWSBLUR.Globals && NEWSBLUR.Globals.ask_ai_models) || [];
+        var html = '';
+        _.each(models, function (m) {
+            html += '<div class="NB-model-option" data-model="' + _.escape(m.key) + '">' +
+                    '<span class="NB-provider-pill NB-provider-' + _.escape(m.vendor) + '">' +
+                    _.escape(m.vendor_display) + '</span> ' +
+                    _.escape(m.display_name) + '</div>';
+        });
+        html += '<div class="NB-thinking-toggle-wrapper">' +
+            '<div class="NB-thinking-toggle-segmented">' +
+                '<div class="NB-thinking-toggle-option NB-thinking-fast NB-selected" data-thinking="false">' +
+                    '<img src="/media/img/icons/nouns/lightning-bolt.svg" class="NB-thinking-toggle-icon" />' +
+                    '<span>' + _.escape(gettext('Fast')) + '</span>' +
+                '</div>' +
+                '<div class="NB-thinking-toggle-option NB-thinking-thinking" data-thinking="true">' +
+                    '<img src="/media/img/icons/nouns/ai-brain.svg" class="NB-thinking-toggle-icon" />' +
+                    '<span>' + _.escape(gettext('Thinking')) + '</span>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+        return html;
     },
 
     create_model_pill_html: function (model, visible, loading) {
@@ -984,7 +1046,7 @@ NEWSBLUR.Views.StoryAskAiView = Backbone.View.extend({
             e.preventDefault();
             e.stopPropagation();
         }
-        var selected_model = this.$(e.target).data('model');
+        var selected_model = this.$(e.target).closest('.NB-model-option').data('model');
         this.model = selected_model;
         NEWSBLUR.assets.preference('ask_ai_model', selected_model);
         this.update_model_dropdown_selection();

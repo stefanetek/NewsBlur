@@ -1,6 +1,5 @@
 package com.newsblur.activity;
 
-import android.content.Context;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.CheckBox;
@@ -8,16 +7,16 @@ import android.widget.ImageView;
 
 import com.newsblur.R;
 import com.newsblur.domain.Feed;
+import com.newsblur.preference.PrefsRepo;
 import com.newsblur.util.FeedUtils;
 import com.newsblur.util.ImageLoader;
-import com.newsblur.util.PrefsUtils;
 
 import java.util.ArrayList;
 
 public class WidgetConfigAdapter extends FeedChooserAdapter {
 
-    WidgetConfigAdapter(Context context, FeedUtils feedUtils, ImageLoader iconLoader) {
-        super(context, feedUtils, iconLoader);
+    WidgetConfigAdapter(FeedUtils feedUtils, ImageLoader iconLoader, PrefsRepo prefsRepo) {
+        super(feedUtils, iconLoader, prefsRepo);
     }
 
     @Override
@@ -25,7 +24,7 @@ public class WidgetConfigAdapter extends FeedChooserAdapter {
         View groupView = super.getGroupView(groupPosition, isExpanded, convertView, parent);
 
         groupView.setOnClickListener(v -> {
-            ArrayList<Feed> folderChild = WidgetConfigAdapter.this.folderChildren.get(groupPosition);
+            ArrayList<Feed> folderChild = getSubtreeFeeds(groupPosition);
             // check all is selected
             boolean allSelected = true;
             for (Feed feed : folderChild) {
@@ -41,7 +40,7 @@ public class WidgetConfigAdapter extends FeedChooserAdapter {
                     feedIds.add(feed.feedId);
                 }
             }
-            setWidgetFeedIds(parent.getContext());
+            setWidgetFeedIds();
             notifyDataChanged();
         });
         return groupView;
@@ -63,12 +62,12 @@ public class WidgetConfigAdapter extends FeedChooserAdapter {
             } else {
                 feedIds.remove(feed.feedId);
             }
-            setWidgetFeedIds(parent.getContext());
+            setWidgetFeedIds();
         });
         return childView;
     }
 
-    private void setWidgetFeedIds(Context context) {
-        PrefsUtils.setWidgetFeedIds(context, feedIds);
+    private void setWidgetFeedIds() {
+        prefsRepo.setWidgetFeedIds(feedIds);
     }
 }

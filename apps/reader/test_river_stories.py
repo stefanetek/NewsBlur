@@ -7,7 +7,9 @@ ZUNIONSTORE operations across all feeds.
 """
 
 import datetime
+from unittest.mock import patch
 
+import redis
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import connection
@@ -15,12 +17,28 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.client import Client
 from django.urls import reverse
 
+from apps.analyzer.models import (
+    MClassifierAuthor,
+    MClassifierFeed,
+    MClassifierPrompt,
+    MClassifierTag,
+    MClassifierText,
+    MClassifierTitle,
+    MClassifierUrl,
+)
+from apps.profile.middleware import SQLLogToConsoleMiddleware
 from apps.reader.models import UserSubscription
 from apps.rss_feeds.models import Feed, MStory
+from apps.search.models import SearchStory
+from apps.statistics.rtrending import RTrendingStory
 from utils import json_functions as json
 
 
+# DEBUG_QUERIES turns on query recording and the Redis instrumentation these tests count. The console
+# logger would read the recorded queries and turn recording off at the end of each request
+# (apps/profile/middleware.py), so it passes responses through and count_queries reads them instead.
 @override_settings(DEBUG_QUERIES=True)
+@patch.object(SQLLogToConsoleMiddleware, "process_response", lambda self, request, response: response)
 class Test_RiverStories(TransactionTestCase):
     """
     Test river stories endpoint with query counting to prevent performance regressions.
@@ -35,8 +53,6 @@ class Test_RiverStories(TransactionTestCase):
 
     def setUp(self):
         from datetime import datetime, timezone
-
-        import redis
 
         # Clear Redis keys for test feeds (using db=10 for tests)
         redis_story_port = (
@@ -58,15 +74,18 @@ class Test_RiverStories(TransactionTestCase):
             self.r.delete(f"zU:3:{feed_id}")
             self.r.delete(f"uU:3:{feed_id}")
 
-        # Clear dashboard caches
+        # Clear dashboard caches for both current and legacy key formats.
+        dashboard_feeds = list(range(1, 11))
+        dashboard_key, dashboard_unread_key = UserSubscription.get_river_cache_keys(
+            3, dashboard_feeds, "dashboard:"
+        )
+        self.r.delete(dashboard_key)
+        self.r.delete(dashboard_unread_key)
         self.r.delete("dashboard:zU:3:feeds:1,2,3,4,5,6,7,8,9,10")
         self.r.delete("dashboard:zhU:3:feeds:1,2,3,4,5,6,7,8,9,10")
 
         self.client = Client()
         self.user = User.objects.get(username="conesus")
-
-        # Create test stories dynamically (10+ stories across 5+ feeds)
-        import time
 
         from django.utils import timezone as django_tz
 
@@ -90,24 +109,33 @@ class Test_RiverStories(TransactionTestCase):
         # Create 3 stories per feed (15 total)
         for feed_id in self.test_feeds:
             for i in range(3):
-                unique_id = f"{int(time.time() * 1000000)}{feed_id}{i}"
-                story_hash = f"{feed_id}:test{unique_id}"
+                story_guid_base = f"river-test-{feed_id}-{i}"
+                story_guid = story_guid_base
+                suffix = 0
+
+                while (
+                    MStory.objects(story_hash=MStory.feed_guid_hash_unsaved(feed_id, story_guid))
+                    .only("story_hash")
+                    .first()
+                ):
+                    suffix += 1
+                    story_guid = f"{story_guid_base}-{suffix}"
+
                 story = MStory(
-                    story_hash=story_hash,
                     story_feed_id=feed_id,
                     story_date=django_tz.now(),
                     story_title=f"Test Story {feed_id}-{i}",
                     story_content=f"Content {i}",
-                    story_guid=f"guid-{unique_id}",
-                    story_permalink=f"http://example.com/{unique_id}",
+                    story_guid=story_guid,
+                    story_permalink=f"http://example.com/{story_guid}",
                     story_author_name=f"Author {i}",
                 )
                 story.save()
-                self.test_story_hashes.append(story_hash)
+                self.test_story_hashes.append(story.story_hash)
 
                 # Add to Redis zF: set to simulate fresh feed data
                 timestamp = int(django_tz.now().timestamp())
-                self.r.zadd(f"zF:{feed_id}", {story_hash: timestamp})
+                self.r.zadd(f"zF:{feed_id}", {story.story_hash: timestamp})
 
         print(f"\n>>> Created {len(self.test_story_hashes)} test stories across {len(self.test_feeds)} feeds")
 
@@ -200,6 +228,603 @@ class Test_RiverStories(TransactionTestCase):
         print(
             f">>> Normal aggregation used redis_story: {counts['redis_story']} queries (expected for multi-feed)"
         )
+
+    @patch.object(SearchStory, "query_tag", create=True)
+    def test_river_tag_filter_queries_matching_tags_instead_of_recent_story_batch(self, query_tag):
+        """Folder tag filters should paginate indexed matches, not post-filter a raw river window."""
+        self.client.login(username="conesus", password="test")
+        self.user.profile.is_premium = True
+        self.user.profile.is_archive = True
+        self.user.profile.save()
+
+        source_story = MStory.objects.get(story_hash=self.test_story_hashes[0])
+        source_story.story_tags = ["deep-folder-tag"]
+        source_story.save()
+        indexed_story_hashes = self.test_story_hashes[1:13]
+        for indexed_story in MStory.objects(story_hash__in=indexed_story_hashes):
+            indexed_story.story_tags = ["deep-folder-tag"]
+            indexed_story.save()
+        # Simulate a full search-index page that does not yet contain the
+        # story whose tag the user just clicked.
+        query_tag.return_value = indexed_story_hashes
+
+        response = self.client.post(
+            reverse("load-river-stories"),
+            {
+                "feeds": self.test_feeds,
+                "read_filter": "all",
+                "page": 1,
+                "classifier_filter_type": "tag",
+                "classifier_filter_value": "deep-folder-tag",
+                "classifier_filter_scope": "folder",
+                "classifier_filter_source_story": source_story.story_hash,
+            },
+        )
+        content = json.decode(response.content)
+
+        self.assertEqual(response.status_code, 200)
+        query_tag.assert_called_once_with(
+            self.test_feeds,
+            "deep-folder-tag",
+            order="newest",
+            offset=0,
+            limit=12,
+        )
+        self.assertEqual(
+            len(content["stories"]),
+            13,
+        )
+        self.assertEqual(
+            {story["story_hash"] for story in content["stories"]},
+            set(indexed_story_hashes) | {source_story.story_hash},
+        )
+
+    def test_trending_stories__training_applies_to_well_read_and_long_reads(self):
+        """Widely Read and Long Reads should include story classifier scores."""
+        self.client.login(username="conesus", password="test")
+
+        self.user.profile.is_usage_billing = True
+        self.user.profile.save()
+
+        feed_id = self.test_feeds[0]
+        story_hash = self.test_story_hashes[0]
+        story_date = int(MStory.objects.get(story_hash=story_hash).story_date.timestamp())
+        MClassifierTitle.objects(user_id=self.user.pk, feed_id=feed_id, title="Test Story").delete()
+        MClassifierPrompt.objects(
+            user_id=self.user.pk, feed_id=feed_id, prompt="stories about test content"
+        ).delete()
+        self.addCleanup(
+            lambda: MClassifierTitle.objects(
+                user_id=self.user.pk, feed_id=feed_id, title="Test Story"
+            ).delete()
+        )
+        self.addCleanup(
+            lambda: MClassifierPrompt.objects(
+                user_id=self.user.pk, feed_id=feed_id, prompt="stories about test content"
+            ).delete()
+        )
+        UserSubscription.objects.filter(user=self.user, feed_id=feed_id).update(is_trained=True)
+
+        r_stats = redis.Redis(connection_pool=settings.REDIS_STATISTICS_POOL)
+        r_stats.delete(RTrendingStory.WELL_READ_KEY)
+        r_stats.delete(RTrendingStory.LONG_READS_KEY)
+        self.addCleanup(lambda: r_stats.delete(RTrendingStory.WELL_READ_KEY, RTrendingStory.LONG_READS_KEY))
+        r_stats.zadd(RTrendingStory.WELL_READ_KEY, {story_hash: story_date})
+        r_stats.zadd(RTrendingStory.LONG_READS_KEY, {story_hash: story_date})
+
+        MClassifierTitle(
+            user_id=self.user.pk,
+            feed_id=feed_id,
+            title="Test Story",
+            score=1,
+        ).save()
+        prompt = MClassifierPrompt(
+            user_id=self.user.pk,
+            feed_id=feed_id,
+            prompt="stories about test content",
+            classifier_type="focus",
+        ).save()
+        self.addCleanup(MClassifierPrompt.invalidate_cache, self.user.pk, str(prompt.id))
+        MClassifierPrompt.set_cached_scores(
+            self.user.pk,
+            str(prompt.id),
+            feed_id,
+            {story_hash: 1},
+        )
+
+        for trending_type in ["well_read", "long_reads"]:
+            response = self.client.get(
+                reverse("load-trending-stories"),
+                {"trending_type": trending_type, "read_filter": "all"},
+            )
+            content = json.decode(response.content)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(content["stories"]), 1)
+            story = content["stories"][0]
+            self.assertEqual(story["story_hash"], story_hash)
+            self.assertEqual(story["intelligence"]["title"], 1)
+            self.assertEqual(story["intelligence"]["prompt"], 1)
+            self.assertEqual(
+                story["prompt_classifiers"],
+                [
+                    {
+                        "prompt": "stories about test content",
+                        "score": 1,
+                        "include_images": False,
+                    }
+                ],
+            )
+
+    def test_good_reads_loads_for_everyone(self):
+        """Good Reads is open to every reader, not just staff."""
+        self.client.login(username="conesus", password="test")
+
+        story_hash = self.test_story_hashes[0]
+        story_date = int(MStory.objects.get(story_hash=story_hash).story_date.timestamp())
+        r_stats = redis.Redis(connection_pool=settings.REDIS_STATISTICS_POOL)
+        r_stats.delete(RTrendingStory.GOOD_READS_KEY, RTrendingStory.GOOD_READS_DIVERSE_KEY)
+        self.addCleanup(
+            lambda: r_stats.delete(RTrendingStory.GOOD_READS_KEY, RTrendingStory.GOOD_READS_DIVERSE_KEY)
+        )
+        r_stats.zadd(RTrendingStory.GOOD_READS_KEY, {story_hash: story_date})
+
+        self.user.is_staff = False
+        self.user.save(update_fields=["is_staff"])
+        response = self.client.get(
+            reverse("load-trending-stories"),
+            {"trending_type": "good_reads", "read_filter": "all"},
+        )
+        content = json.decode(response.content)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([story["story_hash"] for story in content["stories"]], [story_hash])
+
+    def test_trending_stories__feed_classifiers_apply_without_subscription(self):
+        """Widely Read and Long Reads should apply feed-scoped classifiers to unsubscribed feeds."""
+        self.client.login(username="conesus", password="test")
+
+        self.user.profile.is_premium = True
+        self.user.profile.is_archive = True
+        self.user.profile.is_pro = True
+        self.user.profile.has_scoped_classifiers = False
+        self.user.profile.save()
+
+        feed_id = self.test_feeds[0]
+        story_hash = self.test_story_hashes[0]
+        story = MStory.objects.get(story_hash=story_hash)
+        story.story_tags = ["test-tag"]
+        story.save()
+        story_date = int(story.story_date.timestamp())
+
+        UserSubscription.objects.filter(user=self.user, feed_id=feed_id).delete()
+
+        r_stats = redis.Redis(connection_pool=settings.REDIS_STATISTICS_POOL)
+        r_stats.delete(RTrendingStory.WELL_READ_KEY)
+        r_stats.delete(RTrendingStory.LONG_READS_KEY)
+        self.addCleanup(lambda: r_stats.delete(RTrendingStory.WELL_READ_KEY, RTrendingStory.LONG_READS_KEY))
+        r_stats.zadd(RTrendingStory.WELL_READ_KEY, {story_hash: story_date})
+        r_stats.zadd(RTrendingStory.LONG_READS_KEY, {story_hash: story_date})
+
+        created_classifiers = [
+            MClassifierFeed(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                score=-1,
+            ).save(),
+            MClassifierTitle(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                title="Test Story",
+                score=-2,
+            ).save(),
+            MClassifierTitle(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                title=r"^Test Story",
+                score=-2,
+                is_regex=True,
+            ).save(),
+            MClassifierAuthor(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                author="Author 0",
+                score=-2,
+            ).save(),
+            MClassifierAuthor(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                author=r"^Author",
+                score=-2,
+                is_regex=True,
+            ).save(),
+            MClassifierTag(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                tag="test-tag",
+                score=-2,
+            ).save(),
+            MClassifierText(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                text="Content 0",
+                score=-2,
+            ).save(),
+            MClassifierText(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                text=r"Content\s+0",
+                score=-2,
+                is_regex=True,
+            ).save(),
+            MClassifierUrl(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                url="example.com",
+                score=-2,
+            ).save(),
+            MClassifierUrl(
+                user_id=self.user.pk,
+                feed_id=feed_id,
+                social_user_id=0,
+                url=r"example\.com",
+                score=-2,
+                is_regex=True,
+            ).save(),
+        ]
+        self.addCleanup(lambda: [classifier.delete() for classifier in created_classifiers])
+
+        for trending_type in ["well_read", "long_reads"]:
+            response = self.client.get(
+                reverse("load-trending-stories"),
+                {"trending_type": trending_type, "read_filter": "all"},
+            )
+            content = json.decode(response.content)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(content["stories"]), 1)
+            returned_story = content["stories"][0]
+            self.assertEqual(returned_story["story_hash"], story_hash)
+            self.assertEqual(
+                returned_story["intelligence"],
+                {
+                    "feed": -1,
+                    "author": -2,
+                    "author_regex": -2,
+                    "tags": -2,
+                    "title": -2,
+                    "title_regex": -2,
+                    "text": -2,
+                    "text_regex": -2,
+                    "url": -2,
+                    "url_regex": -2,
+                    "prompt": 0,
+                },
+            )
+            # Super dislikes ship their real -2 in the API (so clients can tell
+            # them apart from a -1 dislike) instead of collapsing to -1.
+            self.assertEqual(returned_story["score"], -2)
+
+        author_regex_classifier = next(
+            classifier
+            for classifier in created_classifiers
+            if isinstance(classifier, MClassifierAuthor) and classifier.is_regex
+        )
+        for classifier in created_classifiers:
+            if classifier != author_regex_classifier:
+                classifier.delete()
+
+        for trending_type in ["well_read", "long_reads"]:
+            response = self.client.get(
+                reverse("load-trending-stories"),
+                {"trending_type": trending_type, "read_filter": "all"},
+            )
+            content = json.decode(response.content)
+            returned_story = content["stories"][0]
+
+            self.assertEqual(returned_story["intelligence"]["author"], 0)
+            self.assertEqual(returned_story["intelligence"]["author_regex"], -2)
+            self.assertEqual(returned_story["score"], -2)
+
+    def test_river_stories__newest_backfills_past_stale_redis_hashes(self):
+        """Newest river loads should skip stale Redis hashes that no longer exist in Mongo."""
+        self.client.login(username="conesus", password="test")
+
+        self.user.profile.is_premium = True
+        self.user.profile.save()
+
+        feed_id = self.test_feeds[0]
+        stale_story_hashes = []
+        future_timestamp = int((datetime.datetime.now() + datetime.timedelta(days=1)).timestamp())
+
+        for i in range(12):
+            story_hash = f"{feed_id}:stale{i}"
+            stale_story_hashes.append(story_hash)
+            self.r.sadd(f"F:{feed_id}", story_hash)
+            self.r.zadd(f"zF:{feed_id}", {story_hash: future_timestamp - i})
+
+        ranked_key, unread_key = UserSubscription.get_river_cache_keys(self.user.pk, self.test_feeds, "")
+        self.r.delete(ranked_key)
+        self.r.delete(unread_key)
+        for test_feed_id in self.test_feeds:
+            self.r.delete(f"zU:{self.user.pk}:{test_feed_id}")
+
+        for read_filter in ["all", "unread"]:
+            response = self.client.post(
+                reverse("load-river-stories"),
+                {
+                    "feeds": self.test_feeds,
+                    "read_filter": read_filter,
+                    "order": "newest",
+                    "page": 1,
+                    "include_hidden": "true",
+                },
+            )
+
+            content = json.decode(response.content)
+            returned_hashes = [story["story_hash"] for story in content.get("stories", [])]
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                len(returned_hashes),
+                12,
+                f"Expected newest/{read_filter} to backfill past stale hashes, got {returned_hashes}",
+            )
+            self.assertFalse(
+                set(returned_hashes) & set(stale_story_hashes),
+                f"Newest/{read_filter} should not return stale Redis hashes",
+            )
+
+    def test_river_stories__all_filter_marks_older_unread_on_later_page(self):
+        """All-story river pages should mark returned stories unread using the all-story page."""
+        self.user.profile.is_premium = True
+        self.user.profile.save()
+        self.client.login(username="conesus", password="test")
+
+        from django.utils import timezone as django_tz
+
+        feed_id = self.test_feeds[0]
+        feed = Feed.objects.get(pk=feed_id)
+        base_date = django_tz.now()
+        story_hashes = []
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+
+        r.delete(f"F:{feed_id}")
+        r.delete(f"zF:{feed_id}")
+        r.delete(f"zU:{self.user.pk}:{feed_id}")
+        r.delete(f"RS:{self.user.pk}:{feed_id}")
+        r.delete(f"RS:{self.user.pk}")
+        ranked_key, unread_key = UserSubscription.get_river_cache_keys(self.user.pk, [feed_id], "")
+        r.delete(ranked_key)
+        r.delete(unread_key)
+
+        UserSubscription.objects.filter(user=self.user, feed=feed).update(
+            unread_count_neutral=1,
+            unread_count_positive=0,
+            unread_count_negative=0,
+            needs_unread_recalc=True,
+            mark_read_date=base_date - datetime.timedelta(days=10),
+        )
+
+        for i in range(4):
+            story_guid_base = f"river-all-read-status-{feed_id}-{i}"
+            story_guid = story_guid_base
+            suffix = 0
+            while (
+                MStory.objects(story_hash=MStory.feed_guid_hash_unsaved(feed_id, story_guid))
+                .only("story_hash")
+                .first()
+            ):
+                suffix += 1
+                story_guid = f"{story_guid_base}-{suffix}"
+
+            story_date = base_date - datetime.timedelta(minutes=i)
+            story = MStory(
+                story_feed_id=feed_id,
+                story_date=story_date,
+                story_title=f"All filter read status {i}",
+                story_content=f"Content {i}",
+                story_guid=story_guid,
+                story_permalink=f"http://example.com/{story_guid}",
+                story_author_name=f"Author {i}",
+            )
+            story.save()
+            story_hashes.append(story.story_hash)
+
+            timestamp = int(story_date.timestamp())
+            r.sadd(f"F:{feed_id}", story.story_hash)
+            r.zadd(f"zF:{feed_id}", {story.story_hash: timestamp})
+
+        for read_hash in story_hashes[:3]:
+            r.sadd(f"RS:{self.user.pk}", read_hash)
+            r.sadd(f"RS:{self.user.pk}:{feed_id}", read_hash)
+
+        usersub = UserSubscription.objects.get(user=self.user, feed=feed)
+        page_hashes, unread_hashes = UserSubscription.feed_stories(
+            user_id=self.user.pk,
+            feed_ids=[feed_id],
+            offset=3,
+            limit=3,
+            order="newest",
+            read_filter="all",
+            usersubs=[usersub],
+            cutoff_date=self.user.profile.unread_cutoff,
+        )
+        page_hashes = [h.decode() if isinstance(h, bytes) else h for h in page_hashes]
+        unread_hashes = [h.decode() if isinstance(h, bytes) else h for h in unread_hashes]
+
+        self.assertIn(story_hashes[3], page_hashes)
+        self.assertNotIn(story_hashes[0], unread_hashes)
+        self.assertNotIn(story_hashes[1], unread_hashes)
+        self.assertNotIn(story_hashes[2], unread_hashes)
+        self.assertIn(story_hashes[3], unread_hashes)
+
+        cached_page_hashes, cached_unread_hashes = UserSubscription.feed_stories(
+            user_id=self.user.pk,
+            feed_ids=[feed_id],
+            offset=3,
+            limit=3,
+            order="newest",
+            read_filter="all",
+            usersubs=[usersub],
+            cutoff_date=self.user.profile.unread_cutoff,
+        )
+        cached_page_hashes = [h.decode() if isinstance(h, bytes) else h for h in cached_page_hashes]
+        cached_unread_hashes = [h.decode() if isinstance(h, bytes) else h for h in cached_unread_hashes]
+
+        self.assertIn(story_hashes[3], cached_page_hashes)
+        self.assertIn(story_hashes[3], cached_unread_hashes)
+
+    def test_feed_stories__all_filter_does_not_build_unread_river_cache(self):
+        """
+        All-story river pages only need read status for returned stories.
+
+        Building a full unread companion river on every all-story page causes
+        large accounts to repeatedly rebuild per-feed unread caches.
+        """
+        self.user.profile.is_premium = True
+        self.user.profile.save()
+
+        usersubs = list(
+            UserSubscription.subs_for_feeds(self.user.pk, feed_ids=self.test_feeds, read_filter="all")
+        )
+        feed_ids = [sub.feed_id for sub in usersubs]
+
+        with patch(
+            "apps.reader.models.UserSubscription.story_hashes",
+            wraps=UserSubscription.story_hashes,
+        ) as story_hashes:
+            page_hashes, unread_hashes = UserSubscription.feed_stories(
+                user_id=self.user.pk,
+                feed_ids=feed_ids,
+                offset=3,
+                limit=3,
+                order="newest",
+                read_filter="all",
+                usersubs=usersubs,
+                cutoff_date=self.user.profile.unread_cutoff,
+            )
+
+        unread_calls = [
+            call for call in story_hashes.call_args_list if call.kwargs.get("read_filter") == "unread"
+        ]
+
+        self.assertTrue(page_hashes)
+        self.assertIsNotNone(unread_hashes)
+        self.assertFalse(
+            unread_calls,
+            f"All-story read-status checks should not build unread river caches: {unread_calls}",
+        )
+
+    def test_river_stories__free_user_first_page_is_capped_at_three_stories(self):
+        """Free users should only receive the first three river stories on page one."""
+        self.client.login(username="conesus", password="test")
+
+        self.user.profile.is_premium = False
+        self.user.profile.is_archive = False
+        self.user.profile.is_pro = False
+        self.user.profile.save()
+
+        with patch("apps.reader.views.logging.user") as user_log:
+            with patch(
+                "apps.reader.views.UserSubscription.feed_stories", wraps=UserSubscription.feed_stories
+            ) as feed_stories:
+                response = self.client.post(
+                    reverse("load-river-stories"),
+                    {
+                        "feeds": self.test_feeds,
+                        "read_filter": "all",
+                        "page": 1,
+                        "include_hidden": "true",
+                    },
+                )
+
+        content = json.decode(response.content)
+        logged_messages = [call.args[1] for call in user_log.call_args_list if len(call.args) > 1]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(content["code"], 0)
+        self.assertEqual(content["message"], "The full River of News is a premium feature.")
+        self.assertEqual(len(content["stories"]), 3)
+        self.assertEqual(feed_stories.call_args.kwargs["limit"], 3)
+        self.assertTrue(
+            any(
+                "Free user river limited" in message
+                and "page=1" in message
+                and "read_filter=all" in message
+                and "requested_limit=12" in message
+                and "effective_limit=3" in message
+                for message in logged_messages
+            )
+        )
+
+    def test_river_stories__free_user_later_pages_return_empty_without_aggregation(self):
+        """Free users should be blocked before river aggregation on page two and beyond."""
+        self.client.login(username="conesus", password="test")
+
+        self.user.profile.is_premium = False
+        self.user.profile.is_archive = False
+        self.user.profile.is_pro = False
+        self.user.profile.save()
+
+        with patch("apps.reader.views.logging.user") as user_log:
+            with patch("apps.reader.views.UserSubscription.feed_stories") as feed_stories:
+                response = self.client.post(
+                    reverse("load-river-stories"),
+                    {
+                        "feeds": self.test_feeds,
+                        "read_filter": "unread",
+                        "page": 2,
+                        "include_hidden": "true",
+                    },
+                )
+
+        content = json.decode(response.content)
+        logged_messages = [call.args[1] for call in user_log.call_args_list if len(call.args) > 1]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(content["code"], 0)
+        self.assertEqual(content["message"], "The full River of News is a premium feature.")
+        self.assertEqual(content["stories"], [])
+        self.assertFalse(feed_stories.called)
+        self.assertTrue(
+            any(
+                "Free user river blocked" in message
+                and "page=2" in message
+                and "read_filter=unread" in message
+                and "requested_limit=12" in message
+                for message in logged_messages
+            )
+        )
+
+    def test_river_stories__over_page_limit_returns_404_without_aggregation(self):
+        """River pages past the reader safety limit should stop before aggregation."""
+        self.client.login(username="conesus", password="test")
+
+        self.user.profile.is_premium = True
+        self.user.profile.save()
+
+        with patch("apps.reader.views.UserSubscription.feed_stories", return_value=([], [])) as feed_stories:
+            response = self.client.post(
+                reverse("load-river-stories"),
+                {
+                    "feeds": self.test_feeds,
+                    "read_filter": "all",
+                    "page": 401,
+                },
+            )
+
+        self.assertEqual(response.status_code, 404)
+        feed_stories.assert_not_called()
 
     def test_river_stories__specific_story_hashes(self):
         """
@@ -575,6 +1200,41 @@ class Test_RiverStories(TransactionTestCase):
 
         print(f">>> ✓ Cache key generation is consistent")
 
+    def test_cache_key_consistency__large_feed_lists_do_not_collide(self):
+        """
+        Large river feed lists that only differ after the first few ids must not
+        share the same cache key.
+        """
+        from apps.reader.models import UserSubscription
+
+        print(f"\n>>> Testing cache key helper method for large feed list collisions")
+
+        shared_prefix_feeds = list(range(1, 17))
+        feeds1 = shared_prefix_feeds + [1001]
+        feeds2 = shared_prefix_feeds + [2002]
+
+        old_prefix1 = ",".join(str(f) for f in sorted(feeds1))[:30]
+        old_prefix2 = ",".join(str(f) for f in sorted(feeds2))[:30]
+        self.assertEqual(
+            old_prefix1,
+            old_prefix2,
+            "Sanity check failed: these feed lists should collide with the old 30-char prefix",
+        )
+
+        key1, unread_key1 = UserSubscription.get_river_cache_keys(3, feeds1, "")
+        key2, unread_key2 = UserSubscription.get_river_cache_keys(3, feeds2, "")
+
+        print(f">>> Colliding old prefix: {old_prefix1}")
+        print(f">>> New key from {feeds1[-1]}: {key1}")
+        print(f">>> New key from {feeds2[-1]}: {key2}")
+
+        self.assertNotEqual(key1, key2, "Distinct large feed lists should not share a cache key")
+        self.assertNotEqual(
+            unread_key1, unread_key2, "Distinct large feed lists should not share unread cache keys"
+        )
+
+        print(f">>> ✓ Large river feed lists now generate distinct cache keys")
+
     def test_cache_key_consistency__feed_validation(self):
         """
         Test that invalid feed IDs don't affect cache key generation.
@@ -630,7 +1290,6 @@ class Test_RiverStories(TransactionTestCase):
         # The fix: both now use settings.REDIS_STORY_HASH_POOL
         # Before: feed_stories used POOL, truncate_river used TEMP_POOL (different DBs!)
 
-        import redis
         from django.conf import settings
 
         pool_story = settings.REDIS_STORY_HASH_POOL
@@ -640,3 +1299,829 @@ class Test_RiverStories(TransactionTestCase):
         self.assertIsNotNone(pool_story, "Redis story pool should be configured")
 
         print(f">>> ✓ Both feed_stories() and truncate_river() use same Redis pool")
+
+    def test_lazy_merge__returns_stories_sorted_newest_first(self):
+        """
+        Test that lazy merge (k-way heap) returns stories in correct newest-first order.
+        All river loads now use lazy merge instead of ZUNIONSTORE.
+        """
+        self.client.login(username="conesus", password="test")
+
+        print(f"\n>>> Testing lazy merge returns stories sorted newest-first")
+
+        connection.queriesx = []
+
+        response = self.client.post(
+            reverse("load-river-stories"),
+            {"feeds": self.test_feeds, "read_filter": "all", "page": 1, "order": "newest"},
+        )
+
+        content = json.decode(response.content)
+        self.assertEqual(response.status_code, 200)
+
+        stories = content.get("stories", [])
+        if len(stories) > 1:
+            # Verify stories are sorted newest-first by story_date
+            dates = [s.get("story_date") for s in stories]
+            for i in range(len(dates) - 1):
+                self.assertGreaterEqual(
+                    dates[i],
+                    dates[i + 1],
+                    f"Stories not sorted newest-first: {dates[i]} < {dates[i+1]}",
+                )
+
+        counts = self.count_queries()
+        print(f">>> Lazy merge newest-first: {len(stories)} stories, queries: {counts}")
+        print(f">>> ✓ Stories correctly sorted newest-first")
+
+    def test_lazy_merge__returns_stories_sorted_oldest_first(self):
+        """
+        Test that lazy merge works with oldest-first ordering.
+        """
+        self.client.login(username="conesus", password="test")
+
+        print(f"\n>>> Testing lazy merge with oldest-first order")
+
+        connection.queriesx = []
+
+        response = self.client.post(
+            reverse("load-river-stories"),
+            {"feeds": self.test_feeds, "read_filter": "all", "page": 1, "order": "oldest"},
+        )
+
+        content = json.decode(response.content)
+        self.assertEqual(response.status_code, 200)
+
+        stories = content.get("stories", [])
+        if len(stories) > 1:
+            dates = [s.get("story_date") for s in stories]
+            for i in range(len(dates) - 1):
+                self.assertLessEqual(
+                    dates[i],
+                    dates[i + 1],
+                    f"Stories not sorted oldest-first: {dates[i]} > {dates[i+1]}",
+                )
+
+        counts = self.count_queries()
+        print(f">>> Lazy merge oldest-first: {len(stories)} stories, queries: {counts}")
+        print(f">>> ✓ Stories correctly sorted oldest-first")
+
+    def test_lazy_merge__unread_filter(self):
+        """
+        Test that lazy merge works with read_filter='unread'.
+        """
+        self.client.login(username="conesus", password="test")
+
+        print(f"\n>>> Testing lazy merge with unread filter")
+
+        connection.queriesx = []
+
+        response = self.client.post(
+            reverse("load-river-stories"),
+            {"feeds": self.test_feeds, "read_filter": "unread", "page": 1},
+        )
+
+        content = json.decode(response.content)
+        self.assertEqual(response.status_code, 200)
+
+        counts = self.count_queries()
+        stories = content.get("stories", [])
+        print(f">>> Lazy merge unread filter: {len(stories)} stories, queries: {counts}")
+        self.assertLess(counts["total"], 50, "Queries should be reasonable with unread filter")
+        print(f">>> ✓ Unread filter works with lazy merge")
+
+    def test_lazy_merge__pagination_extends_cache(self):
+        """
+        Test that lazy merge pagination works: page 2 extends the cache from page 1
+        rather than replacing it, so subsequent pages load correctly.
+        """
+        self.client.login(username="conesus", password="test")
+
+        print(f"\n>>> Testing lazy merge pagination (page 1 then page 2)")
+
+        # Page 1
+        connection.queriesx = []
+        response1 = self.client.post(
+            reverse("load-river-stories"),
+            {"feeds": self.test_feeds, "read_filter": "all", "page": 1},
+        )
+        content1 = json.decode(response1.content)
+        self.assertEqual(response1.status_code, 200)
+        stories_page1 = content1.get("stories", [])
+        page1_hashes = {s.get("story_hash") for s in stories_page1}
+        counts1 = self.count_queries()
+        print(f">>> Page 1: {len(stories_page1)} stories, queries: {counts1}")
+
+        # Page 2
+        connection.queriesx = []
+        response2 = self.client.post(
+            reverse("load-river-stories"),
+            {"feeds": self.test_feeds, "read_filter": "all", "page": 2},
+        )
+        content2 = json.decode(response2.content)
+        self.assertEqual(response2.status_code, 200)
+        stories_page2 = content2.get("stories", [])
+        page2_hashes = {s.get("story_hash") for s in stories_page2}
+        counts2 = self.count_queries()
+        print(f">>> Page 2: {len(stories_page2)} stories, queries: {counts2}")
+
+        # Pages should not overlap (no duplicate stories)
+        overlap = page1_hashes & page2_hashes
+        self.assertEqual(
+            len(overlap), 0, f"Pages should not overlap, got {len(overlap)} duplicates: {overlap}"
+        )
+
+        # If we have enough stories for 2 pages, page 2 should have stories
+        total_stories = len(self.test_story_hashes)
+        stories_per_page = 6  # default limit
+        if total_stories > stories_per_page:
+            self.assertGreater(len(stories_page2), 0, "Page 2 should have stories when enough exist")
+
+        print(f">>> ✓ Pagination works: {len(stories_page1)} + {len(stories_page2)} stories, no overlap")
+
+    def test_lazy_merge__no_zunionstore_in_river(self):
+        """
+        Test that river loading does NOT use ZUNIONSTORE for aggregation.
+        The lazy merge path should avoid the blocking ZUNIONSTORE entirely.
+        Only small ZUNIONSTORE on cached results (for unread key copy) is acceptable.
+        """
+        self.client.login(username="conesus", password="test")
+
+        print(f"\n>>> Testing that lazy merge avoids ZUNIONSTORE for aggregation")
+
+        connection.queriesx = []
+
+        response = self.client.post(
+            reverse("load-river-stories"),
+            {"feeds": self.test_feeds, "read_filter": "all", "page": 1},
+        )
+
+        content = json.decode(response.content)
+        self.assertEqual(response.status_code, 200)
+
+        # Check Redis commands — there should be no ZUNIONSTORE on feed keys.
+        # The lazy merge path uses per-feed ZRANGEBYSCORE + Python heap merge.
+        # We verify by checking that the query count is low — ZUNIONSTORE on
+        # N feeds generates significantly more Redis operations than lazy merge.
+        counts = self.count_queries()
+        print(f">>> River load queries: {counts}")
+
+        # With lazy merge, Redis story ops should scale linearly with feed count
+        # (one ZRANGEBYSCORE per feed), not quadratically like ZUNIONSTORE
+        max_expected_redis = len(self.test_feeds) * 4 + 10  # generous allowance
+        self.assertLess(
+            counts["redis_total"],
+            max_expected_redis,
+            f"Redis ops ({counts['redis_total']}) should scale linearly, not exceed {max_expected_redis}",
+        )
+
+        print(f">>> ✓ Lazy merge used: {counts['redis_total']} Redis ops for {len(self.test_feeds)} feeds")
+
+    def test_lazy_merge__pagination_stable_after_mark_read(self):
+        """
+        Test that marking stories as read between page loads doesn't cause
+        stories to be skipped on subsequent pages (read_filter='unread').
+
+        Compares paginated-with-mark-read results against a ground truth
+        (single-pass fetch of all stories). The bug causes page 2 to skip
+        stories because the offset is applied to a shifted unread list.
+        """
+        from django.conf import settings
+
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+        test_limit = 4
+
+        usersubs = UserSubscription.subs_for_feeds(self.user.pk, feed_ids=self.test_feeds, read_filter="all")
+        feed_ids = [sub.feed_id for sub in usersubs]
+        self.assertGreater(len(feed_ids), 0, "Need subscriptions")
+
+        def clean_state():
+            """Reset all caches and recalc flags for a clean query."""
+            UserSubscription.objects.filter(user=self.user, feed_id__in=feed_ids).update(
+                needs_unread_recalc=True
+            )
+            for fid in feed_ids:
+                r.delete(f"zU:{self.user.pk}:{fid}")
+            ranked_key, unread_key = UserSubscription.get_river_cache_keys(self.user.pk, feed_ids, "")
+            r.delete(ranked_key)
+            r.delete(unread_key)
+
+        # Ground truth: fetch top 2*test_limit stories in a single pass (no mark-as-read)
+        clean_state()
+        truth_hashes, _ = UserSubscription.feed_stories(
+            user_id=self.user.pk,
+            feed_ids=feed_ids,
+            offset=0,
+            limit=test_limit * 2,
+            order="newest",
+            read_filter="unread",
+            usersubs=usersubs,
+            cutoff_date=self.user.profile.unread_cutoff,
+        )
+        truth = [h.decode() if isinstance(h, bytes) else h for h in truth_hashes[: test_limit * 2]]
+        self.assertGreaterEqual(len(truth), test_limit * 2, "Need enough stories for the test")
+        truth_p1 = set(truth[:test_limit])
+        truth_p2 = set(truth[test_limit : test_limit * 2])
+
+        # Now do the paginated flow: page 1, mark as read, page 2
+        clean_state()
+
+        # Page 1
+        p1_hashes, _ = UserSubscription.feed_stories(
+            user_id=self.user.pk,
+            feed_ids=feed_ids,
+            offset=0,
+            limit=test_limit,
+            order="newest",
+            read_filter="unread",
+            usersubs=usersubs,
+            cutoff_date=self.user.profile.unread_cutoff,
+        )
+        p1 = {h.decode() if isinstance(h, bytes) else h for h in p1_hashes[:test_limit]}
+        self.assertEqual(p1, truth_p1, "Page 1 should match ground truth")
+
+        # Mark page 1 stories as read
+        for story_hash in p1:
+            fid = int(story_hash.split(":")[0])
+            r.sadd(f"RS:{self.user.pk}", story_hash)
+            r.sadd(f"RS:{self.user.pk}:{fid}", story_hash)
+
+        # Trigger unread recalc (mimics mark_story_hashes_as_read)
+        for fid in feed_ids:
+            UserSubscription.objects.filter(user=self.user, feed_id=fid).update(needs_unread_recalc=True)
+            r.delete(f"zU:{self.user.pk}:{fid}")
+
+        # Page 2: the drift bug causes this to skip stories
+        p2_hashes, _ = UserSubscription.feed_stories(
+            user_id=self.user.pk,
+            feed_ids=feed_ids,
+            offset=test_limit,
+            limit=test_limit,
+            order="newest",
+            read_filter="unread",
+            usersubs=usersubs,
+            cutoff_date=self.user.profile.unread_cutoff,
+        )
+        p2 = {h.decode() if isinstance(h, bytes) else h for h in p2_hashes[:test_limit]}
+
+        # THE KEY ASSERTION: page 2 should return the same stories as ground truth page 2.
+        # Without the fix, the offset is applied to the shifted unread list,
+        # causing stories from truth_p2 to be skipped entirely.
+        self.assertEqual(
+            p2,
+            truth_p2,
+            f"Page 2 should match ground truth.\n"
+            f"  Expected: {truth_p2}\n"
+            f"  Got:      {p2}\n"
+            f"  Missing:  {truth_p2 - p2}\n"
+            f"  Extra:    {p2 - truth_p2}\n"
+            f"  This indicates pagination drift from mark-as-read shifting the offset.",
+        )
+
+        print(f">>> Pagination stable after mark-read: " f"p1={len(p1)}, p2={len(p2)}, ground truth matched")
+
+    def test_lazy_merge__pagination_stable_when_unread_feed_drops_out(self):
+        """
+        A folder river's cache key must stay anchored to the validated requested
+        feed set even when one feed reaches zero unread stories between pages.
+        """
+        from django.utils import timezone as django_tz
+
+        feed_ids = self.test_feeds[:3]
+        dropped_feed_id = feed_ids[0]
+        active_feed_ids = feed_ids[1:]
+        test_limit = 4
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+
+        class RedisWithDecodedRiverCache:
+            def __init__(self, redis_client, decoded_key):
+                self.redis_client = redis_client
+                self.decoded_key = decoded_key
+                self.full_cache_reads = 0
+
+            def __getattr__(self, name):
+                return getattr(self.redis_client, name)
+
+            def zrange(self, key, *args, **kwargs):
+                values = self.redis_client.zrange(key, *args, **kwargs)
+                if key == self.decoded_key:
+                    if args[:2] == (0, -1):
+                        self.full_cache_reads += 1
+                    return [v.decode("utf-8") if isinstance(v, bytes) else v for v in values]
+                return values
+
+        def normalize(story_hash):
+            return story_hash.decode("utf-8") if isinstance(story_hash, bytes) else story_hash
+
+        def story_feed_id(story_hash):
+            return int(story_hash.split(":")[0])
+
+        r.delete(f"RS:{self.user.pk}")
+        for river_feed_ids in (feed_ids, active_feed_ids):
+            ranked_key, unread_key = UserSubscription.get_river_cache_keys(self.user.pk, river_feed_ids, "")
+            r.delete(ranked_key)
+            r.delete(unread_key)
+        for feed_id in feed_ids:
+            r.delete(f"RS:{self.user.pk}:{feed_id}")
+            r.delete(f"zF:{feed_id}")
+            r.delete(f"zU:{self.user.pk}:{feed_id}")
+
+        now = django_tz.now()
+        for i in range(15):
+            feed_id = feed_ids[i % len(feed_ids)]
+            story_guid = f"river-dropout-page-{feed_id}-{now.timestamp()}-{i}"
+            story = MStory(
+                story_feed_id=feed_id,
+                story_date=now - datetime.timedelta(seconds=i),
+                story_title=f"Dropout River Story {i}",
+                story_content=f"Content {i}",
+                story_guid=story_guid,
+                story_permalink=f"http://example.com/{story_guid}",
+                story_author_name=f"Author {i}",
+            )
+            story.save()
+            r.zadd(f"zF:{feed_id}", {story.story_hash: int(story.story_date.timestamp())})
+
+        UserSubscription.objects.filter(user=self.user, feed_id__in=feed_ids).update(
+            needs_unread_recalc=True,
+            unread_count_neutral=5,
+            unread_count_positive=0,
+            unread_count_negative=0,
+        )
+        usersubs = UserSubscription.subs_for_feeds(self.user.pk, feed_ids=feed_ids, read_filter="unread")
+        truth_hashes, _ = UserSubscription.feed_stories(
+            user_id=self.user.pk,
+            feed_ids=feed_ids,
+            all_feed_ids=feed_ids,
+            offset=0,
+            limit=15,
+            order="newest",
+            read_filter="unread",
+            usersubs=usersubs,
+            cutoff_date=self.user.profile.unread_cutoff,
+        )
+        truth = [normalize(h) for h in truth_hashes]
+        self.assertGreaterEqual(len(truth), test_limit * 2)
+
+        ranked_key, unread_key = UserSubscription.get_river_cache_keys(self.user.pk, feed_ids, "")
+        r.delete(ranked_key)
+        r.delete(unread_key)
+        self.assertEqual(r.zcard(ranked_key), 0)
+
+        page1_hashes, _ = UserSubscription.feed_stories(
+            user_id=self.user.pk,
+            feed_ids=feed_ids,
+            all_feed_ids=feed_ids,
+            offset=0,
+            limit=test_limit,
+            order="newest",
+            read_filter="unread",
+            usersubs=usersubs,
+            cutoff_date=self.user.profile.unread_cutoff,
+        )
+        page1 = [normalize(h) for h in page1_hashes]
+        self.assertEqual(page1, truth[:test_limit])
+        self.assertEqual(r.zcard(ranked_key), test_limit)
+
+        for story_hash in truth:
+            if story_feed_id(story_hash) == dropped_feed_id:
+                r.sadd(f"RS:{self.user.pk}", story_hash)
+                r.sadd(f"RS:{self.user.pk}:{dropped_feed_id}", story_hash)
+
+        UserSubscription.objects.filter(user=self.user, feed_id=dropped_feed_id).update(
+            needs_unread_recalc=False,
+            unread_count_neutral=0,
+            unread_count_positive=0,
+        )
+        UserSubscription.objects.filter(user=self.user, feed_id__in=active_feed_ids).update(
+            needs_unread_recalc=True
+        )
+        for feed_id in active_feed_ids:
+            r.delete(f"zU:{self.user.pk}:{feed_id}")
+
+        expected_page2 = [
+            story_hash
+            for story_hash in truth
+            if story_feed_id(story_hash) in active_feed_ids and story_hash not in page1
+        ][:test_limit]
+        usersubs = UserSubscription.subs_for_feeds(
+            self.user.pk, feed_ids=active_feed_ids, read_filter="unread"
+        )
+        stable_ranked_key, _ = UserSubscription.get_river_cache_keys(self.user.pk, feed_ids, "")
+
+        redis_wrapper = RedisWithDecodedRiverCache(r, stable_ranked_key)
+        with patch("apps.reader.models.redis.Redis", return_value=redis_wrapper):
+            page2_hashes, _ = UserSubscription.feed_stories(
+                user_id=self.user.pk,
+                feed_ids=active_feed_ids,
+                all_feed_ids=feed_ids,
+                offset=test_limit,
+                limit=test_limit,
+                order="newest",
+                read_filter="unread",
+                usersubs=usersubs,
+                cutoff_date=self.user.profile.unread_cutoff,
+            )
+
+        page2 = [normalize(h) for h in page2_hashes]
+        self.assertEqual(page2, expected_page2)
+        self.assertEqual(
+            redis_wrapper.full_cache_reads,
+            0,
+            "River page extension should not reread the full cached page set.",
+        )
+
+    def test_single_feed_unread_paging_stable_after_mark_read_cache_rebuild(self):
+        """
+        Single-feed unread pagination should not skip stories when read marks
+        make the unread cache dirty between page loads.
+        """
+        from django.utils import timezone as django_tz
+
+        feed_id = self.test_feeds[0]
+        feed = Feed.objects.get(pk=feed_id)
+        usersub = UserSubscription.objects.get(user=self.user, feed=feed)
+        test_limit = 4
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+
+        r.delete(f"RS:{self.user.pk}")
+        r.delete(f"RS:{self.user.pk}:{feed_id}")
+        r.delete(f"zF:{feed_id}")
+        r.delete(f"zU:{self.user.pk}:{feed_id}")
+        r.delete(f"zUP:{self.user.pk}:{feed_id}")
+
+        now = django_tz.now()
+        story_hashes = []
+        story_scores = {}
+        for i in range(12):
+            story_guid = f"single-feed-page-{feed_id}-{now.timestamp()}-{i}"
+            story = MStory(
+                story_feed_id=feed_id,
+                story_date=now - datetime.timedelta(seconds=i),
+                story_title=f"Single Feed Story {i}",
+                story_content=f"Content {i}",
+                story_guid=story_guid,
+                story_permalink=f"http://example.com/{story_guid}",
+                story_author_name=f"Author {i}",
+            )
+            story.save()
+            story_hashes.append(story.story_hash)
+            story_scores[story.story_hash] = int(story.story_date.timestamp())
+
+        r.delete(f"zF:{feed_id}")
+        r.zadd(f"zF:{feed_id}", story_scores)
+
+        UserSubscription.objects.filter(pk=usersub.pk).update(
+            needs_unread_recalc=True,
+            unread_count_neutral=len(story_hashes),
+            unread_count_positive=0,
+            unread_count_negative=0,
+        )
+        usersub.refresh_from_db()
+
+        truth = story_hashes[: test_limit * 2]
+        page1 = [
+            story["story_hash"]
+            for story in usersub.get_stories(offset=0, limit=test_limit, read_filter="unread")
+        ]
+        self.assertEqual(page1, truth[:test_limit])
+
+        for story_hash in page1:
+            r.sadd(f"RS:{self.user.pk}", story_hash)
+            r.sadd(f"RS:{self.user.pk}:{feed_id}", story_hash)
+
+        UserSubscription.objects.filter(pk=usersub.pk).update(needs_unread_recalc=True)
+        usersub.refresh_from_db()
+        r.delete(f"zU:{self.user.pk}:{feed_id}")
+
+        page2 = [
+            story["story_hash"]
+            for story in usersub.get_stories(offset=test_limit, limit=test_limit, read_filter="unread")
+        ]
+
+        self.assertEqual(
+            page2,
+            truth[test_limit : test_limit * 2],
+            "Page 2 should be anchored to already-returned stories, not a shifted unread offset.",
+        )
+
+    def test_single_feed_unread_paging_extends_page_cache_from_existing_unread_cache(self):
+        """
+        Page 2 should extend the single-feed page cache from the existing zU key.
+
+        Opening page 1 marks the subscription dirty at the end of the request,
+        but mark-read intentionally leaves zU intact while the user is paging.
+        Rebuilding zU on page 2 adds avoidable Redis work.
+        """
+        from django.utils import timezone as django_tz
+
+        feed_id = self.test_feeds[0]
+        feed = Feed.objects.get(pk=feed_id)
+        usersub = UserSubscription.objects.get(user=self.user, feed=feed)
+        test_limit = 4
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+
+        r.delete(f"RS:{self.user.pk}")
+        r.delete(f"RS:{self.user.pk}:{feed_id}")
+        r.delete(f"zF:{feed_id}")
+        r.delete(f"zU:{self.user.pk}:{feed_id}")
+        r.delete(f"zUP:{self.user.pk}:{feed_id}")
+
+        now = django_tz.now()
+        story_hashes = []
+        story_scores = {}
+        for i in range(12):
+            story_guid = f"single-feed-page-cache-{feed_id}-{now.timestamp()}-{i}"
+            story = MStory(
+                story_feed_id=feed_id,
+                story_date=now - datetime.timedelta(seconds=i),
+                story_title=f"Single Feed Page Cache Story {i}",
+                story_content=f"Content {i}",
+                story_guid=story_guid,
+                story_permalink=f"http://example.com/{story_guid}",
+                story_author_name=f"Author {i}",
+            )
+            story.save()
+            story_hashes.append(story.story_hash)
+            story_scores[story.story_hash] = int(story.story_date.timestamp())
+
+        r.zadd(f"zF:{feed_id}", story_scores)
+        UserSubscription.objects.filter(pk=usersub.pk).update(
+            needs_unread_recalc=True,
+            unread_count_neutral=len(story_hashes),
+            unread_count_positive=0,
+            unread_count_negative=0,
+        )
+        usersub.refresh_from_db()
+
+        truth = story_hashes[: test_limit * 2]
+        page1 = [
+            story["story_hash"]
+            for story in usersub.get_stories(offset=0, limit=test_limit, read_filter="unread")
+        ]
+        self.assertEqual(page1, truth[:test_limit])
+        self.assertTrue(r.exists(f"zU:{self.user.pk}:{feed_id}"))
+        self.assertTrue(r.exists(f"zUP:{self.user.pk}:{feed_id}"))
+
+        for story_hash in page1:
+            r.sadd(f"RS:{self.user.pk}", story_hash)
+            r.sadd(f"RS:{self.user.pk}:{feed_id}", story_hash)
+
+        UserSubscription.objects.filter(pk=usersub.pk).update(needs_unread_recalc=True)
+        usersub.refresh_from_db()
+
+        with patch(
+            "apps.reader.models.UserSubscription.story_hashes",
+            wraps=UserSubscription.story_hashes,
+        ) as story_hashes_method:
+            page2 = [
+                story["story_hash"]
+                for story in usersub.get_stories(offset=test_limit, limit=test_limit, read_filter="unread")
+            ]
+
+        self.assertEqual(page2, truth[test_limit : test_limit * 2])
+        self.assertEqual(
+            story_hashes_method.call_count,
+            0,
+            "Page 2 should not rebuild zU while the preserved unread cache can extend zUP.",
+        )
+
+    def test_single_feed_unread_paging_handles_decoded_page_cache_hashes(self):
+        """
+        Staging Redis can return decoded strings for cached hashes. Keep
+        membership checks type-normalized so page 2 does not collapse to 1 story.
+        """
+        from django.utils import timezone as django_tz
+
+        feed_id = self.test_feeds[0]
+        feed = Feed.objects.get(pk=feed_id)
+        usersub = UserSubscription.objects.get(user=self.user, feed=feed)
+        test_limit = 4
+        r = redis.Redis(connection_pool=settings.REDIS_STORY_HASH_POOL)
+
+        class RedisWithDecodedPageCache:
+            def __init__(self, redis_client):
+                self.redis_client = redis_client
+
+            def __getattr__(self, name):
+                return getattr(self.redis_client, name)
+
+            def zrange(self, key, *args, **kwargs):
+                values = self.redis_client.zrange(key, *args, **kwargs)
+                if key == f"zUP:{usersub.user_id}:{usersub.feed_id}":
+                    return [v.decode("utf-8") if isinstance(v, bytes) else v for v in values]
+                return values
+
+        r.delete(f"RS:{self.user.pk}")
+        r.delete(f"RS:{self.user.pk}:{feed_id}")
+        r.delete(f"zF:{feed_id}")
+        r.delete(f"zU:{self.user.pk}:{feed_id}")
+        r.delete(f"zUP:{self.user.pk}:{feed_id}")
+
+        now = django_tz.now()
+        story_hashes = []
+        story_scores = {}
+        for i in range(12):
+            story_guid = f"single-feed-decoded-page-{feed_id}-{now.timestamp()}-{i}"
+            story = MStory(
+                story_feed_id=feed_id,
+                story_date=now - datetime.timedelta(seconds=i),
+                story_title=f"Decoded Page Story {i}",
+                story_content=f"Content {i}",
+                story_guid=story_guid,
+                story_permalink=f"http://example.com/{story_guid}",
+                story_author_name=f"Author {i}",
+            )
+            story.save()
+            story_hashes.append(story.story_hash)
+            story_scores[story.story_hash] = int(story.story_date.timestamp())
+
+        r.delete(f"zF:{feed_id}")
+        r.zadd(f"zF:{feed_id}", story_scores)
+
+        UserSubscription.objects.filter(pk=usersub.pk).update(
+            needs_unread_recalc=True,
+            unread_count_neutral=len(story_hashes),
+            unread_count_positive=0,
+            unread_count_negative=0,
+        )
+        usersub.refresh_from_db()
+
+        truth = story_hashes[: test_limit * 2]
+        page1 = [
+            story["story_hash"]
+            for story in usersub.get_stories(offset=0, limit=test_limit, read_filter="unread")
+        ]
+        self.assertEqual(page1, truth[:test_limit])
+
+        r.sadd(f"RS:{self.user.pk}", page1[0])
+        r.sadd(f"RS:{self.user.pk}:{feed_id}", page1[0])
+        UserSubscription.objects.filter(pk=usersub.pk).update(needs_unread_recalc=True)
+        usersub.refresh_from_db()
+        r.delete(f"zU:{self.user.pk}:{feed_id}")
+
+        with patch("apps.reader.models.redis.Redis", return_value=RedisWithDecodedPageCache(r)):
+            page2 = [
+                story["story_hash"]
+                for story in usersub.get_stories(offset=test_limit, limit=test_limit, read_filter="unread")
+            ]
+
+        self.assertEqual(page2, truth[test_limit : test_limit * 2])
+
+    def test_lazy_merge__single_feed_folder(self):
+        """
+        Test that lazy merge works correctly even for a single-feed river.
+        This verifies there's no regression from removing the ZUNIONSTORE path.
+        """
+        self.client.login(username="conesus", password="test")
+
+        print(f"\n>>> Testing lazy merge with single feed")
+
+        connection.queriesx = []
+
+        response = self.client.post(
+            reverse("load-river-stories"),
+            {"feeds": [self.test_feeds[0]], "read_filter": "all", "page": 1},
+        )
+
+        content = json.decode(response.content)
+        self.assertEqual(response.status_code, 200)
+
+        stories = content.get("stories", [])
+        counts = self.count_queries()
+        print(f">>> Single feed river: {len(stories)} stories, queries: {counts}")
+
+        # Should work and return stories
+        self.assertGreater(len(stories), 0, "Single feed river should return stories")
+        self.assertLess(counts["total"], 30, "Single feed should have minimal queries")
+        print(f">>> ✓ Single feed lazy merge works")
+
+    def test_story_hashes__unread_skips_clean_zero_unread_feeds(self):
+        """
+        The unread helper sometimes receives an all-subs list from higher-level callers.
+        In that case it should only consider feeds that can actually contribute unread stories.
+        Clean feeds with zero unread stories should not be rebuilt on every river request.
+        """
+        feed_ids = self.test_feeds[:3]
+        unread_feed = feed_ids[0]
+        empty_feeds = feed_ids[1:]
+
+        self.r.delete(f"RS:{self.user.pk}")
+        for feed_id in feed_ids:
+            self.r.delete(f"RS:{self.user.pk}:{feed_id}")
+            self.r.delete(f"zU:{self.user.pk}:{feed_id}")
+
+        for story_hash in self.test_story_hashes:
+            feed_id = int(story_hash.split(":")[0])
+            if feed_id in empty_feeds:
+                self.r.sadd(f"RS:{self.user.pk}", story_hash)
+                self.r.sadd(f"RS:{self.user.pk}:{feed_id}", story_hash)
+
+        UserSubscription.objects.filter(user=self.user, feed_id=unread_feed).update(
+            unread_count_neutral=3,
+            unread_count_positive=0,
+            needs_unread_recalc=True,
+        )
+        UserSubscription.objects.filter(user=self.user, feed_id__in=empty_feeds).update(
+            unread_count_neutral=0,
+            unread_count_positive=0,
+            needs_unread_recalc=False,
+        )
+
+        usersubs = list(UserSubscription.subs_for_feeds(self.user.pk, feed_ids=feed_ids, read_filter="all"))
+        with patch(
+            "redis.client.Pipeline.zdiffstore",
+            autospec=True,
+            wraps=self.r.pipeline().__class__.zdiffstore,
+        ) as mocked_zdiffstore:
+            unread_story_hashes = UserSubscription.story_hashes(
+                user_id=self.user.pk,
+                feed_ids=feed_ids,
+                usersubs=usersubs,
+                read_filter="unread",
+                cutoff_date=self.user.profile.unread_cutoff,
+                metrics_source="river_request",
+            )
+        rebuilt_keys = {call.args[1] for call in mocked_zdiffstore.call_args_list}
+
+        unread_story_hashes = [h.decode() if isinstance(h, bytes) else h for h in unread_story_hashes]
+        self.assertIn(
+            f"zU:{self.user.pk}:{unread_feed}",
+            rebuilt_keys,
+            "Expected unread Redis work for the feed that actually has unread stories",
+        )
+        self.assertFalse(
+            any(f"zU:{self.user.pk}:{feed_id}" in rebuilt_keys for feed_id in empty_feeds),
+            f"Clean zero-unread feeds should not be scanned, got rebuild keys: {sorted(rebuilt_keys)}",
+        )
+        self.assertTrue(unread_story_hashes, "Expected unread markers for the unread feed")
+        self.assertTrue(
+            all(hash_.startswith(f"{unread_feed}:") for hash_ in unread_story_hashes),
+            f"Unread markers should only come from feed {unread_feed}, got {unread_story_hashes}",
+        )
+
+    def test_story_hashes__unread_keeps_dirty_zero_count_feeds(self):
+        """
+        Dirty feeds still need unread reconstruction even when cached unread counts are zero.
+
+        This protects against over-filtering: we want to skip clean zero-unread feeds,
+        but we must still include dirty feeds because their unread counts may be stale.
+        """
+        feed_ids = self.test_feeds[:2]
+        dirty_feed = feed_ids[0]
+        empty_feed = feed_ids[1]
+
+        self.r.delete(f"RS:{self.user.pk}")
+        for feed_id in feed_ids:
+            self.r.delete(f"RS:{self.user.pk}:{feed_id}")
+            self.r.delete(f"zU:{self.user.pk}:{feed_id}")
+
+        for story_hash in self.test_story_hashes:
+            feed_id = int(story_hash.split(":")[0])
+            if feed_id == empty_feed:
+                self.r.sadd(f"RS:{self.user.pk}", story_hash)
+                self.r.sadd(f"RS:{self.user.pk}:{feed_id}", story_hash)
+
+        UserSubscription.objects.filter(user=self.user, feed_id=dirty_feed).update(
+            unread_count_neutral=0,
+            unread_count_positive=0,
+            needs_unread_recalc=True,
+        )
+        UserSubscription.objects.filter(user=self.user, feed_id=empty_feed).update(
+            unread_count_neutral=0,
+            unread_count_positive=0,
+            needs_unread_recalc=False,
+        )
+
+        usersubs = list(UserSubscription.subs_for_feeds(self.user.pk, feed_ids=feed_ids, read_filter="all"))
+        with patch(
+            "redis.client.Pipeline.zdiffstore",
+            autospec=True,
+            wraps=self.r.pipeline().__class__.zdiffstore,
+        ) as mocked_zdiffstore:
+            unread_story_hashes = UserSubscription.story_hashes(
+                user_id=self.user.pk,
+                feed_ids=feed_ids,
+                usersubs=usersubs,
+                read_filter="unread",
+                cutoff_date=self.user.profile.unread_cutoff,
+                metrics_source="river_request",
+            )
+        rebuilt_keys = {call.args[1] for call in mocked_zdiffstore.call_args_list}
+
+        unread_story_hashes = [h.decode() if isinstance(h, bytes) else h for h in unread_story_hashes]
+        self.assertIn(
+            f"zU:{self.user.pk}:{dirty_feed}",
+            rebuilt_keys,
+            "Dirty feed should still participate in unread reconstruction",
+        )
+        self.assertNotIn(
+            f"zU:{self.user.pk}:{empty_feed}",
+            rebuilt_keys,
+            "Clean zero-unread feed should stay out of unread reconstruction",
+        )
+        self.assertTrue(unread_story_hashes, "Dirty feed should contribute unread stories")
+        self.assertTrue(
+            all(hash_.startswith(f"{dirty_feed}:") for hash_ in unread_story_hashes),
+            f"Unread hashes should come from dirty feed {dirty_feed}, got {unread_story_hashes}",
+        )

@@ -1,0 +1,11 @@
+---
+# Deploy MCP server (single instance on happ-count-1)
+
+- name: DEPLOY MCP
+  hosts: hmcp
+  gather_facts: false
+  vars_files:
+    - ../env_vars/base.yml
+    - roles/letsencrypt/defaults/main.yml
+  tasks:
+    - include_tasks: deploy_mcp_group.yml

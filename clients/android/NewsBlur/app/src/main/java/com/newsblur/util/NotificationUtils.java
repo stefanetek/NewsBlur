@@ -93,14 +93,13 @@ public class NotificationUtils {
      * creates notification channels necessary for 26+, if applicable
      */
     public static void createNotificationChannel(Context context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            CharSequence name = context.getString(R.string.story_notification_channel_name);
-            String id = context.getString(R.string.story_notification_channel_id);
-            NotificationChannel channel = new NotificationChannel(id, name, NotificationManager.IMPORTANCE_DEFAULT);
+        // NotificationUtils.java names the channel in the app language, which Android shows in notification settings.
+        CharSequence name = LanguageSettings.INSTANCE.localizedContext(context).getString(R.string.story_notification_channel_name);
+        String id = context.getString(R.string.story_notification_channel_id);
+        NotificationChannel channel = new NotificationChannel(id, name, NotificationManager.IMPORTANCE_DEFAULT);
 
-            NotificationManager notificationManager = context.getSystemService(NotificationManager.class);
-            notificationManager.createNotificationChannel(channel);
-        }
+        NotificationManager notificationManager = context.getSystemService(NotificationManager.class);
+        notificationManager.createNotificationChannel(channel);
     }
 
     private static Notification buildStoryNotification(Story story, Cursor cursor, Context context, FileCache iconCache) {
@@ -141,18 +140,20 @@ public class NotificationUtils {
         String faviconUrl = cursor.getString(cursor.getColumnIndex(DatabaseConstants.FEED_FAVICON_URL));
         Bitmap feedIcon = ImageLoader.getCachedImageSynchro(iconCache, faviconUrl);
 
+        // NotificationUtils.java often runs from SyncService.kt with no activity, so it resolves labels in the app language explicitly.
+        Context strings = LanguageSettings.INSTANCE.localizedContext(context);
         NotificationCompat.Builder nb = new NotificationCompat.Builder(context, context.getString(R.string.story_notification_channel_id))
                 .setContentTitle(title.toString())
                 .setContentText(story.shortContent)
-                .setSmallIcon(R.drawable.ic_logo_monochrome)
+                .setSmallIcon(R.drawable.logo_monochrome)
                 .setContentIntent(pendingIntent)
                 .setDeleteIntent(dismissPendingIntent)
                 .setAutoCancel(true)
                 .setOnlyAlertOnce(true)
                 .setWhen(story.timestamp)
-                .addAction(0, "Mark Read", markreadPendingIntent)
-                .addAction(0, "Save", savePendingIntent)
-                .addAction(0, "Share", sharePendingIntent)
+                .addAction(0, strings.getString(R.string.menu_mark_story_as_read), markreadPendingIntent)
+                .addAction(0, strings.getString(R.string.save_this), savePendingIntent)
+                .addAction(0, strings.getString(R.string.share_this), sharePendingIntent)
                 .setColor(NOTIFY_COLOUR);
         if (feedIcon != null) {
             nb.setLargeIcon(feedIcon);

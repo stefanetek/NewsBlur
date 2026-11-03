@@ -1,10 +1,13 @@
+from unittest.mock import MagicMock, patch
+
+import redis
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.test import TestCase, TransactionTestCase
 from django.test.client import Client
 from django.urls import reverse
 
-from apps.reader.models import UserSubscriptionFolders
+from apps.reader.models import UserSubscription, UserSubscriptionFolders
 from utils import json_functions as json
 
 
@@ -234,3 +237,375 @@ class Test_Reader(TransactionTestCase):
         compact_folders = usf.folders
 
         self.assertNotEquals(dupe_folders, compact_folders)
+
+    def test_save_feed_chooser(self):
+        """Test save_feed_chooser endpoint handles parameters correctly."""
+        self.client.login(username="conesus", password="test")
+
+        # Test with approved_feeds - should not raise NameError for approve_all
+        response = self.client.post(
+            reverse("save-feed-chooser"),
+            {"approved_feeds[]": ["1", "2", "3"]},
+        )
+        content = json.decode(response.content)
+        self.assertIn("activated", content)
+        self.assertIn("muted", content)
+
+    def test_save_feed_chooser_approve_all(self):
+        """Test save_feed_chooser with approve_all parameter."""
+        self.client.login(username="conesus", password="test")
+
+        # Test with approve_all=true - should skip safety check logging
+        response = self.client.post(
+            reverse("save-feed-chooser"),
+            {"approved_feeds[]": ["1"], "approve_all": "true"},
+        )
+        content = json.decode(response.content)
+        self.assertIn("activated", content)
+        self.assertIn("muted", content)
+
+    def test_add_folder_case_insensitive(self):
+        """Creating a folder with different case should not create a duplicate."""
+        self.client.login(username="conesus", password="test")
+
+        response = self.client.get(reverse("load-feeds"))
+        feeds = json.decode(response.content)
+        # Initial state has a "Tech" folder
+        tech_count = sum(1 for f in feeds["folders"] if isinstance(f, dict) and "Tech" in f)
+        self.assertEqual(tech_count, 1)
+
+        # Try to create "tech" (lowercase) via model - should not create a duplicate
+        usf = UserSubscriptionFolders.objects.get(user__username="conesus")
+        usf.add_folder("", "tech")
+
+        response = self.client.get(reverse("load-feeds"))
+        feeds = json.decode(response.content)
+        # Should still only have one Tech folder (case-insensitive dedup)
+        tech_folders = [
+            f for f in feeds["folders"] if isinstance(f, dict) and any(k.lower() == "tech" for k in f)
+        ]
+        self.assertEqual(len(tech_folders), 1)
+
+    def test_delete_feed_substring_folder(self):
+        """Deleting a feed from 'Tech' should not affect 'Deep Tech'."""
+        self.client.login(username="conesus", password="test")
+
+        response = self.client.get(reverse("load-feeds"))
+        feeds = json.decode(response.content)
+        # Initial: Tech has [1, 4, 5, {Deep Tech: [6, 7]}], feed 1 is also top-level
+        self.assertEqual(
+            feeds["folders"], [{"Tech": [1, 4, 5, {"Deep Tech": [6, 7]}]}, 2, 3, 8, 9, {"Blogs": [8, 9]}, 1]
+        )
+
+        # Manually set up folders with a feed in both "Tech" and "Deep Tech"
+        usf = UserSubscriptionFolders.objects.get(user__username="conesus")
+        usf.folders = json.encode([{"Tech": [1, 4, {"Deep Tech": [1, 6, 7]}]}, 2, 3, {"Blogs": [8, 9]}])
+        usf.save()
+
+        # Delete feed 1 from "Tech" - should NOT affect "Deep Tech"
+        response = self.client.post(reverse("delete-feed"), {"feed_id": 1, "in_folder": "Tech"})
+        self.assertEqual(json.decode(response.content)["code"], 1)
+
+        response = self.client.get(reverse("load-feeds"))
+        feeds = json.decode(response.content)
+        # Feed 1 should be removed from Tech but remain in Deep Tech
+        tech_folder = [f for f in feeds["folders"] if isinstance(f, dict) and "Tech" in f][0]
+        self.assertNotIn(1, tech_folder["Tech"])
+        deep_tech = [f for f in tech_folder["Tech"] if isinstance(f, dict) and "Deep Tech" in f][0]
+        self.assertIn(1, deep_tech["Deep Tech"])
+
+    def test_delete_feed__stale_in_folder(self):
+        """A stale/mismatched in_folder must still delete the feed, not silently no-op."""
+        self.client.login(username="conesus", password="test")
+        user = User.objects.get(username="conesus")
+
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        usf.folders = json.encode([{"Tech": [4, 5]}, 2, 3])
+        usf.save()
+
+        # Feed 5 lives in "Tech", but the client sends a folder it is not in.
+        self.assertTrue(UserSubscription.objects.filter(user=user, feed=5).exists())
+        response = self.client.post(reverse("delete-feed"), {"feed_id": 5, "in_folder": "Nonexistent Folder"})
+        self.assertEqual(json.decode(response.content)["code"], 1)
+
+        # The feed is removed from the tree entirely...
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        self.assertEqual(json.decode(usf.folders), [2, 3, {"Tech": [4]}])
+        # ...and the subscription is gone, so the delete actually "stuck".
+        self.assertFalse(UserSubscription.objects.filter(user=user, feed=5).exists())
+
+    def test_delete_feed__stale_in_folder_keeps_multiples(self):
+        """A stale in_folder removes one placement but keeps the sub if others remain."""
+        self.client.login(username="conesus", password="test")
+        user = User.objects.get(username="conesus")
+
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        usf.folders = json.encode([{"Tech": [5]}, {"Blogs": [5]}, 2, 3])
+        usf.save()
+
+        response = self.client.post(reverse("delete-feed"), {"feed_id": 5, "in_folder": "Nonexistent Folder"})
+        self.assertEqual(json.decode(response.content)["code"], 1)
+
+        # One placement removed, one remains, subscription preserved.
+        usf = UserSubscriptionFolders.objects.get(user=user)
+
+        def _count(items, target):
+            n = 0
+            for item in items:
+                if isinstance(item, int):
+                    n += 1 if item == target else 0
+                elif isinstance(item, dict):
+                    for _, kids in item.items():
+                        n += _count(kids, target)
+            return n
+
+        self.assertEqual(_count(json.decode(usf.folders), 5), 1)
+        self.assertTrue(UserSubscription.objects.filter(user=user, feed=5).exists())
+
+    def test_save_feed_order__rejects_stale_shrink(self):
+        """A reorder tree missing most subscribed feeds is rejected, not saved."""
+        self.client.login(username="conesus", password="test")
+        user = User.objects.get(username="conesus")
+
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        original = usf.folders
+
+        response = self.client.post(reverse("save-feed-order"), {"folders": json.encode([1, 2, 3])})
+        result = json.decode(response.content)
+        self.assertEqual(result["code"], -1)
+
+        # The stored organization is left untouched.
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        self.assertEqual(usf.folders, original)
+
+    def test_save_feed_order__accepts_full_reorder(self):
+        """A reorder that preserves all subscribed feeds is saved normally."""
+        self.client.login(username="conesus", password="test")
+        user = User.objects.get(username="conesus")
+
+        subscribed = sorted(UserSubscription.objects.filter(user=user).values_list("feed_id", flat=True))
+        new_tree = [{"All": subscribed}]
+
+        response = self.client.post(reverse("save-feed-order"), {"folders": json.encode(new_tree)})
+        result = json.decode(response.content)
+        self.assertNotEqual(result.get("code"), -1)
+
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        self.assertEqual(json.decode(usf.folders), new_tree)
+
+    def test_add_url__missing_url_param(self):
+        """POST to add_url without 'url' should return error, not crash."""
+        self.client.login(username="conesus", password="test")
+
+        response = self.client.post("/reader/add_url", {})
+        content = json.decode(response.content)
+        self.assertEqual(content["code"], -1)
+
+    @patch("apps.reader.views.UserSubscription.add_subscription")
+    def test_add_url__rejects_metadata_ip(self, mock_add_subscription):
+        """POST to add_url should reject private/link-local addresses before fetching."""
+        self.client.login(username="conesus", password="test")
+
+        response = self.client.post(
+            "/reader/add_url",
+            {"url": "http://169.254.169.254/latest/meta-data/", "folder": ""},
+        )
+        content = json.decode(response.content)
+
+        self.assertEqual(content["code"], -1)
+        mock_add_subscription.assert_not_called()
+
+    def test_rename_folder_no_substring_match(self):
+        """Renaming 'Tech' should not affect 'Deep Tech'."""
+        self.client.login(username="conesus", password="test")
+
+        # Set up folders with "Tech" containing "Deep Tech"
+        usf = UserSubscriptionFolders.objects.get(user__username="conesus")
+        usf.folders = json.encode([{"Tech": [1, {"Deep Tech": [6, 7]}]}, 2, 3])
+        usf.save()
+
+        # Rename "Tech" to "Technology" at top level
+        response = self.client.post(
+            reverse("rename-folder"),
+            {"folder_name": "Tech", "new_folder_name": "Technology", "in_folder": ""},
+        )
+        self.assertEqual(json.decode(response.content)["code"], 1)
+
+        response = self.client.get(reverse("load-feeds"))
+        feeds = json.decode(response.content)
+        folder_names = [list(f.keys())[0] for f in feeds["folders"] if isinstance(f, dict)]
+        self.assertIn("Technology", folder_names)
+        self.assertNotIn("Tech", folder_names)
+        # Deep Tech should be unchanged
+        tech_folder = [f for f in feeds["folders"] if isinstance(f, dict) and "Technology" in f][0]
+        nested_names = [list(f.keys())[0] for f in tech_folder["Technology"] if isinstance(f, dict)]
+        self.assertIn("Deep Tech", nested_names)
+
+    def test_move_folder_updates_classifiers(self):
+        """Moving a folder to a new parent should update folder-scoped classifier paths."""
+        from apps.analyzer.models import MClassifierTag
+
+        self.client.login(username="conesus", password="test")
+        user = User.objects.get(username="conesus")
+
+        # Set up folders: "YouTube (no shorts)" at top level with feeds
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        usf.folders = json.encode([{"YouTube (no shorts)": [1, 6]}, {"YouTube": [7]}, 2, 3])
+        usf.save()
+
+        # Create a folder-scoped classifier for "YouTube (no shorts)" (top-level path)
+        MClassifierTag.objects(user_id=user.pk, scope="folder").delete()
+        MClassifierTag.objects.create(
+            user_id=user.pk,
+            tag="short videos",
+            feed_id=0,
+            score=-1,
+            social_user_id=0,
+            scope="folder",
+            folder_name="YouTube (no shorts)",
+        )
+
+        # Move "YouTube (no shorts)" into "YouTube"
+        response = self.client.post(
+            reverse("move-folder-to-folder"),
+            {"folder_name": "YouTube (no shorts)", "in_folder": "", "to_folder": "YouTube"},
+        )
+        self.assertEqual(json.decode(response.content)["code"], 1)
+
+        # Classifier should now have the updated full path
+        classifier = MClassifierTag.objects.get(user_id=user.pk, tag="short videos", scope="folder")
+        self.assertEqual(classifier.folder_name, "YouTube - YouTube (no shorts)")
+
+        # Clean up
+        MClassifierTag.objects(user_id=user.pk, scope="folder").delete()
+
+    def test_move_folder_updates_subfolder_classifiers(self):
+        """Moving a folder should also update classifiers on its subfolders."""
+        from apps.analyzer.models import MClassifierTag
+
+        self.client.login(username="conesus", password="test")
+        user = User.objects.get(username="conesus")
+
+        # Set up folders: "Videos" with subfolder "Shorts" at top level
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        usf.folders = json.encode([{"Videos": [1, {"Shorts": [6]}]}, {"Archive": [7]}, 2])
+        usf.save()
+
+        # Create classifiers on both "Videos" and "Videos - Shorts"
+        MClassifierTag.objects(user_id=user.pk, scope="folder").delete()
+        MClassifierTag.objects.create(
+            user_id=user.pk,
+            tag="tag1",
+            feed_id=0,
+            score=-1,
+            social_user_id=0,
+            scope="folder",
+            folder_name="Videos",
+        )
+        MClassifierTag.objects.create(
+            user_id=user.pk,
+            tag="tag2",
+            feed_id=0,
+            score=-1,
+            social_user_id=0,
+            scope="folder",
+            folder_name="Videos - Shorts",
+        )
+
+        # Move "Videos" into "Archive"
+        response = self.client.post(
+            reverse("move-folder-to-folder"),
+            {"folder_name": "Videos", "in_folder": "", "to_folder": "Archive"},
+        )
+        self.assertEqual(json.decode(response.content)["code"], 1)
+
+        # Both classifiers should have updated paths
+        c1 = MClassifierTag.objects.get(user_id=user.pk, tag="tag1", scope="folder")
+        self.assertEqual(c1.folder_name, "Archive - Videos")
+        c2 = MClassifierTag.objects.get(user_id=user.pk, tag="tag2", scope="folder")
+        self.assertEqual(c2.folder_name, "Archive - Videos - Shorts")
+
+        # Clean up
+        MClassifierTag.objects(user_id=user.pk, scope="folder").delete()
+
+    def test_rename_nested_folder_updates_classifiers(self):
+        """Renaming a nested folder should update classifier paths using full paths."""
+        from apps.analyzer.models import MClassifierTag
+
+        self.client.login(username="conesus", password="test")
+        user = User.objects.get(username="conesus")
+
+        # Set up nested folders: "Parent" > "Child"
+        usf = UserSubscriptionFolders.objects.get(user=user)
+        usf.folders = json.encode([{"Parent": [1, {"Child": [6, 7]}]}, 2, 3])
+        usf.save()
+
+        # Create a folder-scoped classifier with the full nested path
+        MClassifierTag.objects(user_id=user.pk, scope="folder").delete()
+        MClassifierTag.objects.create(
+            user_id=user.pk,
+            tag="boring",
+            feed_id=0,
+            score=-1,
+            social_user_id=0,
+            scope="folder",
+            folder_name="Parent - Child",
+        )
+
+        # Rename "Child" to "NewChild" inside "Parent"
+        response = self.client.post(
+            reverse("rename-folder"),
+            {"folder_name": "Child", "new_folder_name": "NewChild", "in_folder": "Parent"},
+        )
+        self.assertEqual(json.decode(response.content)["code"], 1)
+
+        # Classifier should have the updated path
+        classifier = MClassifierTag.objects.get(user_id=user.pk, tag="boring", scope="folder")
+        self.assertEqual(classifier.folder_name, "Parent - NewChild")
+
+        # Clean up
+        MClassifierTag.objects(user_id=user.pk, scope="folder").delete()
+
+
+class Test_TrimUserReadStories(TestCase):
+    @patch("apps.reader.models.User.objects.get")
+    @patch("apps.reader.models.UserSubscription.objects.filter")
+    @patch("apps.reader.models.redis.Redis")
+    def test_concurrent_cleanups_use_distinct_temp_keys(self, mock_redis_class, mock_filter, mock_get_user):
+        user_id = 123
+        mock_get_user.return_value = MagicMock(username="reader")
+        mock_filter.return_value.only.return_value = [MagicMock(feed_id=i) for i in range(101)]
+
+        mock_redis = mock_redis_class.return_value
+        mock_redis.smembers.return_value = {"999:abcdef"}
+        mock_redis.exists.return_value = True
+        mock_redis.scard.return_value = 0
+
+        UserSubscription.trim_user_read_stories(user_id)
+        UserSubscription.trim_user_read_stories(user_id)
+
+        first_temp_key = mock_redis.sunionstore.call_args_list[0].args[0]
+        second_temp_key = mock_redis.sunionstore.call_args_list[2].args[0]
+        self.assertNotEqual(first_temp_key, second_temp_key)
+
+    @patch("apps.reader.models.User.objects.get")
+    @patch("apps.reader.models.UserSubscription.objects.filter")
+    @patch("apps.reader.models.redis.Redis")
+    def test_missing_union_temp_key_clears_stale_aggregate(
+        self, mock_redis_class, mock_filter, mock_get_user
+    ):
+        user_id = 123
+        aggregate_key = "RS:%s" % user_id
+        mock_get_user.return_value = MagicMock(username="reader")
+        mock_filter.return_value.only.return_value = [MagicMock(feed_id=i) for i in range(101)]
+
+        mock_redis = mock_redis_class.return_value
+        mock_redis.smembers.return_value = {"999:abcdef"}
+        mock_redis.exists.return_value = False
+        mock_redis.rename.side_effect = redis.ResponseError("no such key")
+        mock_redis.scard.return_value = 0
+
+        UserSubscription.trim_user_read_stories(user_id)
+
+        mock_redis.delete.assert_called_once_with(aggregate_key)
+        mock_redis.rename.assert_not_called()

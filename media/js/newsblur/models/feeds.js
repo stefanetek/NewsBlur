@@ -115,6 +115,20 @@ NEWSBLUR.Models.Feed = Backbone.Model.extend({
         return in_folders;
     },
 
+    flat_folder_paths: function () {
+        // Returns full folder paths like "Blogs - Tumblrs" matching the backend's
+        // flatten_folders() format, used for folder-scoped classifier matching.
+        return _.uniq(_.compact(_.map(this.folders, function (folder_collection) {
+            var parts = [];
+            var current = folder_collection;
+            while (current && current.options && current.options.title) {
+                parts.unshift(current.options.title);
+                current = current.parent_folder;
+            }
+            return parts.join(' - ');
+        })));
+    },
+
     rename: function (new_title) {
         this.set('feed_title', new_title);
         NEWSBLUR.assets.rename_feed(this.id, new_title);
@@ -207,13 +221,16 @@ NEWSBLUR.Models.Feed = Backbone.Model.extend({
         var lastday = 24 * 60 * 60;
 
         if (diff > 1000 * 60 * 60 * 24 * 365 * 20 || diff <= 0) {
-            return "Never";
+            return gettext("Never");
         } else if (diff < lasthour) {
-            return Inflector.pluralize("minute", Math.floor(diff / 60), true) + " ago";
+            var minutes = Math.floor(diff / 60);
+            return interpolate(ngettext("%(count)s minute ago", "%(count)s minutes ago", minutes), { count: Inflector.commas(minutes) }, true);
         } else if (diff < lastday) {
-            return Inflector.pluralize("hour", Math.floor(diff / 60 / 60), true) + " ago";
+            var hours = Math.floor(diff / 60 / 60);
+            return interpolate(ngettext("%(count)s hour ago", "%(count)s hours ago", hours), { count: Inflector.commas(hours) }, true);
         } else {
-            return Inflector.pluralize("day", Math.floor(diff / 60 / 60 / 24), true) + " ago";
+            var days = Math.floor(diff / 60 / 60 / 24);
+            return interpolate(ngettext("%(count)s day ago", "%(count)s days ago", days), { count: Inflector.commas(days) }, true);
         }
     },
 

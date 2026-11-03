@@ -7,6 +7,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 void drawLinearGradient(CGContextRef context, CGRect rect, CGColorRef startColor, 
                         CGColorRef  endColor);
@@ -15,6 +16,9 @@ void drawLinearGradient(CGContextRef context, CGRect rect, CGColorRef startColor
     NSCache *imageCache;
 }
 
++ (BOOL)usesSystemVerticalBar:(UITraitCollection *)traits NS_SWIFT_NAME(usesSystemVerticalBar(_:));
++ (void)keepBarButtonInHorizontalBar:(UIBarButtonItem *)item NS_SWIFT_NAME(keepBarButtonInHorizontalBar(_:));
++ (dispatch_block_t)beginNavigationBarMinimization:(UINavigationItem *)item NS_SWIFT_NAME(beginNavigationBarMinimization(_:));
 + (void)drawLinearGradientWithRect:(CGRect)rect startColor:(CGColorRef)startColor endColor:(CGColorRef)endColor;
 + (UIImage *)roundCorneredImage:(UIImage *)orig radius:(CGFloat)r;
 + (UIImage *)roundCorneredImage: (UIImage*)orig radius:(CGFloat)r convertToSize:(CGSize)size;
@@ -25,6 +29,7 @@ void drawLinearGradient(CGContextRef context, CGRect rect, CGColorRef startColor
 + (NSString *)md5:(NSString *)string;
 + (NSString *)formatLongDateFromTimestamp:(NSInteger)timestamp;
 + (NSString *)formatShortDateFromTimestamp:(NSInteger)timestamp;
++ (NSString *)formatClusterDateFromTimestamp:(NSInteger)timestamp;
 
 @end
 

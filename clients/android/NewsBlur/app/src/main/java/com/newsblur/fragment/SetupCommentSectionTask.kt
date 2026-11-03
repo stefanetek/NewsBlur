@@ -18,13 +18,22 @@ import com.newsblur.activity.Profile
 import com.newsblur.domain.Comment
 import com.newsblur.domain.Story
 import com.newsblur.domain.UserDetails
-import com.newsblur.util.*
+import com.newsblur.service.NbSyncManager.UPDATE_SOCIAL
+import com.newsblur.util.FeedUtils.Companion.triggerSync
+import com.newsblur.util.ImageLoader
+import com.newsblur.util.UIUtils
+import com.newsblur.util.ViewUtils
+import com.newsblur.util.executeAsyncTask
 import com.newsblur.view.FlowLayout
 import java.lang.ref.WeakReference
-import java.util.*
 
-class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: View, inflater: LayoutInflater, story: Story?, iconLoader: ImageLoader) {
-
+class SetupCommentSectionTask(
+    private val fragment: ReadingItemFragment,
+    view: View,
+    inflater: LayoutInflater,
+    story: Story?,
+    iconLoader: ImageLoader,
+) {
     private val topCommentViews: MutableList<View> = mutableListOf()
     private val topShareViews: MutableList<View> = mutableListOf()
     private val publicCommentViews: MutableList<View> = mutableListOf()
@@ -45,12 +54,12 @@ class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: V
      */
     fun execute() {
         fragment.lifecycleScope.executeAsyncTask(
-                doInBackground = {
-                    doInBackground()
-                },
-                onPostExecute = {
-                    onPostExecute()
-                }
+            doInBackground = {
+                doInBackground()
+            },
+            onPostExecute = {
+                onPostExecute()
+            },
         )
     }
 
@@ -64,7 +73,7 @@ class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: V
         val sharingUserIds: MutableSet<String> = HashSet()
         for (comment in comments) {
             // skip public comments if they are disabled
-            if (!comment.byFriend && !PrefsUtils.showPublicComments(context)) {
+            if (!comment.byFriend && !fragment.prefsRepo.showPublicComments()) {
                 continue
             }
             val commentUser = fragment.dbHelper.getUserProfile(comment.userId)
@@ -78,9 +87,9 @@ class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: V
             commentText.text = UIUtils.fromHtml(comment.commentText)
             val commentImage = commentView.findViewById<View>(R.id.comment_user_image) as ShapeableImageView
             val commentSharedDate = commentView.findViewById<View>(R.id.comment_shareddate) as TextView
-            // TODO: this uses hard-coded "ago" values, which will be wrong when reading prefetched stories
+            // SetupCommentSectionTask.kt shows the server's relative age, which goes stale on prefetched stories.
             if (comment.sharedDate != null) {
-                commentSharedDate.text = comment.sharedDate + " ago"
+                commentSharedDate.text = context.getString(R.string.profile_time_ago, comment.sharedDate)
             }
             val favouriteContainer = commentView.findViewById<View>(R.id.comment_favourite_avatars) as FlowLayout
             val favouriteIcon = commentView.findViewById<View>(R.id.comment_favourite_icon) as ImageView
@@ -104,10 +113,12 @@ class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: V
                 } else {
                     favouriteIcon.setOnClickListener {
                         if (!mutableListOf<String>(*comment.likingUsers).contains(user.id)) {
-                            fragment.feedUtils.likeComment(story, comment.userId, context)
+                            fragment.storyRepository.likeComment(story, comment.userId)
                         } else {
-                            fragment.feedUtils.unlikeComment(story, comment.userId, context)
+                            fragment.storyRepository.unlikeComment(story, comment.userId)
                         }
+                        fragment.feedUtils.syncUpdateStatus(UPDATE_SOCIAL)
+                        triggerSync(context)
                     }
                 }
             }
@@ -144,7 +155,7 @@ class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: V
                 }
                 if (reply.shortDate != null) {
                     val replySharedDate = replyView.findViewById<View>(R.id.reply_shareddate) as TextView
-                    replySharedDate.text = reply.shortDate + " ago"
+                    replySharedDate.text = context.getString(R.string.profile_time_ago, reply.shortDate)
                 }
                 val editIcon = replyView.findViewById<View>(R.id.reply_edit_icon) as ImageView
                 if (TextUtils.equals(reply.userId, user.id)) {
@@ -258,51 +269,31 @@ class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: V
             commentGrid.addView(image)
         }
         if (allCommentCount > 0) {
-            var countText = context.getString(R.string.friends_comments_count)
-            if (allCommentCount == 1) {
-                countText = countText.substring(0, countText.length - 1)
-            }
-            headerCommentTotal.text = String.format(countText, allCommentCount)
+            headerCommentTotal.text = context.resources.getQuantityString(R.plurals.friends_comments_count, allCommentCount, allCommentCount)
             headerCommentTotal.visibility = View.VISIBLE
         } else {
             headerCommentTotal.visibility = View.GONE
         }
         if (allShareCount > 0) {
-            var countText = context.getString(R.string.friends_shares_count)
-            if (allShareCount == 1) {
-                countText = countText.substring(0, countText.length - 1)
-            }
-            headerShareTotal.text = String.format(countText, allShareCount)
+            headerShareTotal.text = context.resources.getQuantityString(R.plurals.friends_shares_count, allShareCount, allShareCount)
             headerShareTotal.visibility = View.VISIBLE
         } else {
             headerShareTotal.visibility = View.GONE
         }
         if (publicCommentCount > 0) {
-            var commentCount = context.getString(R.string.public_comment_count)
-            if (publicCommentCount == 1) {
-                commentCount = commentCount.substring(0, commentCount.length - 1)
-            }
-            publicCommentTotal.text = String.format(commentCount, publicCommentCount)
+            publicCommentTotal.text = context.resources.getQuantityString(R.plurals.public_comment_count, publicCommentCount, publicCommentCount)
             view.findViewById<View>(R.id.reading_public_comment_header).visibility = View.VISIBLE
         } else {
             view.findViewById<View>(R.id.reading_public_comment_header).visibility = View.GONE
         }
         if (friendCommentCount > 0) {
-            var commentCount = context.getString(R.string.friends_comments_count)
-            if (friendCommentCount == 1) {
-                commentCount = commentCount.substring(0, commentCount.length - 1)
-            }
-            friendCommentTotal.text = String.format(commentCount, friendCommentCount)
+            friendCommentTotal.text = context.resources.getQuantityString(R.plurals.friends_comments_count, friendCommentCount, friendCommentCount)
             view.findViewById<View>(R.id.reading_friend_comment_header).visibility = View.VISIBLE
         } else {
             view.findViewById<View>(R.id.reading_friend_comment_header).visibility = View.GONE
         }
         if (friendShareCount > 0) {
-            var commentCount = context.getString(R.string.friends_shares_count)
-            if (friendShareCount == 1) {
-                commentCount = commentCount.substring(0, commentCount.length - 1)
-            }
-            friendShareTotal.text = String.format(commentCount, friendShareCount)
+            friendShareTotal.text = context.resources.getQuantityString(R.plurals.friends_shares_count, friendShareCount, friendShareCount)
             view.findViewById<View>(R.id.reading_friend_emptyshare_header).visibility = View.VISIBLE
         } else {
             view.findViewById<View>(R.id.reading_friend_emptyshare_header).visibility = View.GONE
@@ -340,7 +331,7 @@ class SetupCommentSectionTask(private val fragment: ReadingItemFragment, view: V
         this.inflater = inflater
         this.story = story
         viewHolder = WeakReference(view)
-        user = PrefsUtils.getUserDetails(context)
+        user = fragment.prefsRepo.getUserDetails()
         this.iconLoader = iconLoader
     }
 }

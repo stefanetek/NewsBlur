@@ -3,14 +3,15 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
     className: "NB-add-popover",
 
     options: {
-        'width': 380,
+        'width': 608,
+        'popover_class': 'NB-add-popover-container',
         'anchor': function () {
             return NEWSBLUR.reader.$s.$add_button;
         },
         'placement': 'top -left',
         offset: {
             top: 6,
-            left: 1
+            left: 3
         },
         'onOpen': _.bind(function () {
             this.focus_add_feed();
@@ -23,8 +24,14 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         "click .NB-add-folder-icon": "open_add_folder",
         "click .NB-add-folder-submit": "save_add_folder",
         "click .NB-add-import-button": "close_and_open_import",
+        "click .NB-add-discover-trending": "close_and_open_trending",
+        "mouseenter .NB-add-discover-popular": "show_popular_flyout",
+        "mouseleave .NB-add-discover-popular": "hide_popular_flyout",
+        "click .NB-add-discover-popular-category": "close_and_open_popular_category",
+        "click .NB-add-discover-source": "close_and_open_discover_tab",
         "focus .NB-add-url": "handle_focus_add_site",
-        "blur .NB-add-url": "handle_blur_add_site"
+        "blur .NB-add-url": "handle_blur_add_site",
+        "change .NB-folders": "update_folder_placeholder"
     },
 
     initialize: function (options) {
@@ -55,39 +62,84 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         this.$el.html($.make('div', { className: 'NB-add' }, [
             $.make('div', { className: 'NB-add-form' }, [
                 $.make('div', { className: 'NB-fieldset NB-modal-submit' }, [
-                    $.make('h3', { className: 'NB-module-content-header' }, [
-                        'Add a new site'
+                    $.make('div', { className: 'NB-add-header' }, [
+                        $.make('span', { className: 'NB-add-header-icon' }, '+'),
+                        $.make('span', gettext('Add any site or feed')),
+                        $.make('div', { className: 'NB-add-folder-row' }, [
+                            $.make('span', { className: 'NB-add-folder-label' }, gettext('in')),
+                            NEWSBLUR.utils.make_folders(this.options.folder_title),
+                            $.make('div', { className: 'NB-add-folder-icon', title: gettext("New folder"), role: "button" })
+                        ])
                     ]),
-                    $.make('div', [
-                        $.make('input', { type: 'text', id: 'NB-add-url', className: 'NB-input NB-add-url', name: 'url', value: self.options.url })
-                    ]),
-                    $.make('div', { className: 'NB-group NB-add-site' }, [
-                        NEWSBLUR.utils.make_folders(this.options.folder_title),
-                        $.make('div', { className: 'NB-add-folder-icon', title: "Add folder", role: "button" }),
-                        $.make('div', { className: 'NB-modal-submit-button NB-modal-submit-green NB-add-url-submit' }, 'Add site'),
-                        $.make('div', { className: 'NB-loading' })
+                    $.make('div', { className: 'NB-add-input-row' }, [
+                        $.make('input', { type: 'text', id: 'NB-add-url', className: 'NB-add-url', name: 'url', value: self.options.url, placeholder: gettext('Site URL or search by name...') }),
+                        $.make('div', { className: 'NB-loading' }),
+                        $.make('div', { className: 'NB-add-url-submit' }, gettext('Add site'))
                     ]),
                     $.make('div', { className: "NB-add-folder NB-hidden" }, [
-                        $.make('div', { className: 'NB-modal-submit-button NB-modal-submit-green NB-add-folder-submit' }, 'Add folder'),
-                        $.make('div', { className: 'NB-loading' }),
-                        $.make('input', { type: 'text', id: 'NB-add-folder', className: 'NB-input NB-add-folder-input', name: 'new_folder_name', placeholder: "New folder name..." })
+                        $.make('div', { className: 'NB-add-folder-input-row' }, [
+                            $.make('input', { type: 'text', id: 'NB-add-folder', className: 'NB-add-folder-input', name: 'new_folder_name', placeholder: gettext("New folder name...") }),
+                            $.make('div', { className: 'NB-loading' }),
+                            $.make('div', { className: 'NB-add-folder-submit' }, gettext('Create'))
+                        ])
                     ]),
                     $.make('div', { className: 'NB-group NB-error' }, [
                         $.make('div', { className: 'NB-error-message' })
                     ])
                 ]),
+                $.make('div', { className: 'NB-fieldset NB-add-discover-section' }, [
+                    $.make('div', { className: 'NB-add-discover-divider' }, [
+                        $.make('span', gettext('Discover more to read'))
+                    ]),
+                    $.make('div', { className: 'NB-add-discover-sources' }, [
+                        $.make('div', { className: 'NB-add-discover-source', 'data-tab': 'youtube' }, [
+                            $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/lucide/youtube.svg' }),
+                            $.make('span', 'YouTube')
+                        ]),
+                        $.make('div', { className: 'NB-add-discover-source', 'data-tab': 'reddit' }, [
+                            $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/phosphor-fill/reddit-logo-fill.svg', className: 'NB-mono' }),
+                            $.make('span', 'Reddit')
+                        ]),
+                        $.make('div', { className: 'NB-add-discover-source', 'data-tab': 'newsletters' }, [
+                            $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/lucide/mail.svg' }),
+                            $.make('span', gettext('Newsletters'))
+                        ]),
+                        $.make('div', { className: 'NB-add-discover-source', 'data-tab': 'podcasts' }, [
+                            $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/lucide/podcast.svg' }),
+                            $.make('span', gettext('Podcasts'))
+                        ]),
+                        $.make('div', { className: 'NB-add-discover-source', 'data-tab': 'google-news' }, [
+                            $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/lucide/newspaper.svg', className: 'NB-mono' }),
+                            $.make('span', gettext('Google News'))
+                        ])
+                    ]),
+                    $.make('div', { className: 'NB-add-discover-buttons' }, [
+                        $.make('div', { className: 'NB-add-discover-btn NB-add-discover-trending' }, [
+                            $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/nouns/pulse.svg' }),
+                            $.make('span', gettext('Trending'))
+                        ]),
+                        $.make('div', { className: 'NB-add-discover-btn NB-add-discover-popular' }, [
+                            $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/heroicons-solid/fire.svg' }),
+                            $.make('span', gettext('Popular')),
+                            $.make('span', { className: 'NB-add-discover-popular-arrow' }, '\u25BE'),
+                            $.make('div', { className: 'NB-add-discover-popular-flyout NB-hidden' }, [
+                                $.make('div', { className: 'NB-add-discover-popular-flyout-inner' })
+                            ])
+                        ])
+                    ])
+                ]),
                 $.make('div', { className: 'NB-fieldset NB-anonymous-ok NB-modal-submit NB-hidden' }, [
                     $.make('h5', [
-                        'Import feeds'
+                        gettext('Import feeds')
                     ]),
                     $.make('div', { className: 'NB-fieldset-fields' }, [
                         $.make('div', { className: 'NB-add-import-button NB-modal-submit-green NB-modal-submit-button' }, [
-                            'Import from Google Reader or upload OPML',
+                            gettext('Import from Google Reader or upload OPML'),
                             $.make('img', { className: 'NB-add-google-reader-arrow', src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/silk/arrow_right.png' })
                         ]),
                         $.make('div', { className: 'NB-add-danger' }, (NEWSBLUR.Globals.is_authenticated && _.size(this.model.feeds) > 0 && [
                             $.make('img', { src: NEWSBLUR.Globals['MEDIA_URL'] + 'img/icons/silk/server_go.png' }),
-                            'This will erase all existing feeds and folders.'
+                            gettext('This will erase all existing feeds and folders.')
                         ]))
                     ])
                 ])
@@ -122,7 +174,19 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         $add.autocomplete({
             minLength: 1,
             appendTo: ".NB-add-form",
-            source: '/rss_feeds/feed_autocomplete',
+            source: function (request, response) {
+                $add.addClass('NB-autocomplete-loading');
+                $.getJSON('/discover/autocomplete', { term: request.term })
+                    .done(function (data) {
+                        response(data.slice(0, 10));
+                    })
+                    .fail(function () {
+                        response([]);
+                    })
+                    .always(function () {
+                        $add.removeClass('NB-autocomplete-loading');
+                    });
+            },
             position: {
                 my: "left bottom",
                 at: "left top",
@@ -130,7 +194,6 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
             },
             select: function (e, ui) {
                 $add.val(ui.item.value);
-                // self.save_add_url();
                 return false;
             },
             search: function (e, ui) {
@@ -148,18 +211,32 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
             }
         }).data("ui-autocomplete")._renderItem = function (ul, item) {
             var feed = new NEWSBLUR.Models.Feed(item);
+            var freshness = self.make_freshness_indicator(item.last_story_date);
+            var num_subscribers = Math.max(0, item.num_subscribers);
+            var subscriber_text = interpolate(ngettext("%(count)s subscriber", "%(count)s subscribers", num_subscribers), {count: Inflector.commas(num_subscribers)}, true);
             return $.make('li', [
-                $.make('a', [
-                    $.make('div', { className: 'NB-add-autocomplete-subscribers' }, Inflector.pluralize(' subscriber', item.num_subscribers, true)),
-                    $.make('img', { className: 'NB-add-autocomplete-favicon', src: $.favicon(feed) }),
-                    $.make('div', { className: 'NB-add-autocomplete-title' }, item.label),
-                    $.make('div', { className: 'NB-add-autocomplete-address' }, item.value)
+                $.make('a', { className: 'NB-autocomplete-item' }, [
+                    $.favicon_el(feed, {
+                        image_class: 'NB-add-autocomplete-favicon',
+                        emoji_class: 'NB-add-autocomplete-favicon NB-feed-emoji',
+                        colored_class: 'NB-add-autocomplete-favicon NB-feed-icon-colored'
+                    }),
+                    $.make('div', { className: 'NB-autocomplete-content' }, [
+                        $.make('div', { className: 'NB-autocomplete-top-row' }, [
+                            $.make('div', { className: 'NB-add-autocomplete-title' }, item.label),
+                            $.make('div', { className: 'NB-add-autocomplete-subscribers' }, subscriber_text)
+                        ]),
+                        $.make('div', { className: 'NB-autocomplete-bottom-row' }, [
+                            $.make('div', { className: 'NB-add-autocomplete-address' }, item.value),
+                            freshness
+                        ])
+                    ])
                 ])
             ]).data("ui-autocomplete-item", item).prependTo(ul);
         };
         $add.data("ui-autocomplete")._resizeMenu = function () {
             var ul = this.menu.element;
-            ul.outerWidth(this.element.outerWidth());
+            ul.outerWidth(self.$('.NB-add-url').outerWidth());
         };
     },
 
@@ -175,6 +252,8 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
 
     setup_chosen: function () {
         var $select = this.$('select');
+        // reader_add_feed.js: chosen reads its RTL layout (media/css/controls/chosen.css) from chzn-rtl.
+        $select.toggleClass('chzn-rtl', NEWSBLUR.utils.is_rtl());
         $select.chosen();
     },
 
@@ -201,6 +280,133 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         });
     },
 
+    close_and_open_trending: function () {
+        this.close(function () {
+            NEWSBLUR.reader.open_add_site({ tab: 'trending' });
+        });
+    },
+
+    show_popular_flyout: function () {
+        var $flyout = this.$('.NB-add-discover-popular-flyout');
+        var $inner = this.$('.NB-add-discover-popular-flyout-inner');
+        this.render_popular_categories($inner);
+        $flyout.removeClass('NB-hidden');
+    },
+
+    hide_popular_flyout: function () {
+        var $flyout = this.$('.NB-add-discover-popular-flyout');
+        $flyout.addClass('NB-hidden');
+    },
+
+    render_popular_categories: function ($container) {
+        if (this._popular_categories) {
+            if ($container.children().length > 0) return;
+            _.each(this._popular_categories, function (cat, index) {
+                var is_all = cat.id === 'all';
+                var class_name = 'NB-add-discover-popular-category';
+                if (is_all) class_name += ' NB-category-all';
+                $container.append($.make('div', {
+                    className: class_name,
+                    'data-category': cat.id
+                }, [
+                    $.make('span', { className: 'NB-add-discover-popular-category-name' }, cat.name),
+                    $.make('span', { className: 'NB-add-discover-popular-category-count' }, cat.count ? interpolate(ngettext("%(count)s site", "%(count)s sites", cat.count), {count: Inflector.commas(cat.count)}, true) : '')
+                ]));
+                if (is_all) {
+                    $container.append($.make('div', { className: 'NB-add-discover-popular-separator' }));
+                }
+            });
+            return;
+        }
+
+        $container.html($.make('div', { className: 'NB-add-discover-popular-loading' }, gettext('Loading...')));
+
+        var self = this;
+        $.ajax({
+            url: '/discover/popular_feeds',
+            data: { type: 'all', limit: 1 },
+            success: function (data) {
+                var categories = [];
+                if (data && data.grouped_categories) {
+                    categories = _.map(data.grouped_categories, function (cat) {
+                        return { id: cat.name, name: cat.name, count: cat.feed_count || 0 };
+                    });
+                }
+                categories.unshift({ id: 'all', name: gettext('All Categories'), count: 0 });
+                self._popular_categories = categories;
+                $container.empty();
+                self.render_popular_categories($container);
+            },
+            error: function () {
+                self._popular_categories = [
+                    { id: 'all', name: gettext('All Categories'), count: 0 },
+                    { id: 'science', name: gettext('Science'), count: 0 },
+                    { id: 'technology', name: gettext('Technology'), count: 0 },
+                    { id: 'gaming', name: gettext('Gaming'), count: 0 },
+                    { id: 'education', name: gettext('Education'), count: 0 }
+                ];
+                $container.empty();
+                self.render_popular_categories($container);
+            }
+        });
+    },
+
+    close_and_open_popular_category: function (e) {
+        e.stopPropagation();
+        var category = $(e.currentTarget).data('category');
+        this.close(function () {
+            NEWSBLUR.reader.open_add_site({ tab: 'popular', category: category });
+        });
+    },
+
+    close_and_open_discover_tab: function (e) {
+        var tab = $(e.currentTarget).data('tab');
+        this.close(function () {
+            NEWSBLUR.reader.open_add_site({ tab: tab });
+        });
+    },
+
+    make_freshness_indicator: function (last_story_date) {
+        if (!last_story_date) {
+            return $.make('div', { className: 'NB-autocomplete-freshness NB-freshness-none' }, [
+                $.make('span', { className: 'NB-freshness-dot' }),
+                $.make('span', { className: 'NB-freshness-label' }, gettext('No stories'))
+            ]);
+        }
+
+        var last_date = new Date(last_story_date);
+        if (isNaN(last_date.getTime())) return null;
+
+        var now = new Date();
+        var days_ago = Math.floor((now - last_date) / (1000 * 60 * 60 * 24));
+        var freshness_class = 'NB-autocomplete-freshness';
+        var label;
+
+        if (days_ago < 365) {
+            freshness_class += ' NB-freshness-active';
+            // reader_add_feed.js: Abbreviated ages keep plural forms for languages that inflect them.
+            if (days_ago < 1) {
+                label = gettext('Updated today');
+            } else if (days_ago < 7) {
+                label = interpolate(ngettext("%(count)sd ago", "%(count)sd ago", days_ago), {count: days_ago}, true);
+            } else if (days_ago < 30) {
+                var weeks_ago = Math.floor(days_ago / 7);
+                label = interpolate(ngettext("%(count)sw ago", "%(count)sw ago", weeks_ago), {count: weeks_ago}, true);
+            } else {
+                var months_ago = Math.floor(days_ago / 30);
+                label = interpolate(ngettext("%(count)smo ago", "%(count)smo ago", months_ago), {count: months_ago}, true);
+            }
+        } else {
+            freshness_class += ' NB-freshness-stale';
+            label = interpolate(gettext("Stale %(date)s"), {date: last_date.toLocaleDateString(document.documentElement.lang || undefined, { month: 'short', year: 'numeric' })}, true);
+        }
+
+        return $.make('div', { className: freshness_class }, [
+            $.make('span', { className: 'NB-freshness-dot' }),
+            $.make('span', { className: 'NB-freshness-label' }, label)
+        ]);
+    },
+
     // ===========
     // = Actions =
     // ===========
@@ -213,9 +419,19 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         var url = this.$('.NB-add-url').val();
         var folder = this.$('.NB-folders').val();
 
+        // Check feed limit before adding
+        var add_limit = NEWSBLUR.Globals.add_feed_limit;
+        var active_feeds = NEWSBLUR.assets.feeds.active().length;
+        if (add_limit && active_feeds >= add_limit) {
+            this.error({
+                message: interpolate(gettext("You've reached your limit of %(value_1)s sites. Mute some sites or upgrade your account to add more."), {value_1: Inflector.commas(add_limit)}, true)
+            });
+            return;
+        }
+
         $error.slideUp(300);
         $loading.addClass('NB-active');
-        $submit.addClass('NB-disabled').text('Adding...');
+        $submit.addClass('NB-disabled').text(gettext('Adding site...'));
 
         NEWSBLUR.reader.flags['reloading_feeds'] = true;
         this.model.save_add_url(url, folder, $.rescope(this.post_save_add_url, this), $.rescope(this.error, this));
@@ -233,16 +449,46 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
                 if (data.feed) {
                     NEWSBLUR.reader.open_feed(data.feed.id);
                 }
+                // Show growth prompt after feed is added (if eligible)
+                if (NEWSBLUR.growth_prompts) {
+                    NEWSBLUR.growth_prompts.on_feed_added();
+                }
             });
             NEWSBLUR.reader.load_recommended_feed();
             NEWSBLUR.reader.handle_mouse_indicator_hover();
-            $submit.text('Added!');
+            $submit.text(gettext('Added!'));
             this.close();
             this.model.preference('has_setup_feeds', true);
             NEWSBLUR.reader.check_hide_getting_started();
         } else {
-            this.error(data);
+            var url = this.$('.NB-add-url').val();
+            this.handle_add_failure(url, data);
             $submit.removeClass('NB-disabled');
+        }
+    },
+
+    handle_add_failure: function (input, data) {
+        // Feed limit errors should always show inline
+        var add_limit = NEWSBLUR.Globals.add_feed_limit;
+        var active_feeds = NEWSBLUR.assets.feeds.active().length;
+        if (add_limit && active_feeds >= add_limit) {
+            this.error(data);
+            return;
+        }
+
+        input = (input || '').trim();
+        if (input && input.indexOf('.') !== -1 && input.indexOf(' ') === -1) {
+            // Looks like a URL - redirect to Web Feed tab
+            this.close(function () {
+                NEWSBLUR.reader.open_add_site({ tab: 'web-feed', initial_url: input });
+            });
+        } else if (input) {
+            // Looks like a search term - redirect to Search tab
+            this.close(function () {
+                NEWSBLUR.reader.open_add_site({ tab: 'search', initial_query: input });
+            });
+        } else {
+            this.error(data);
         }
     },
 
@@ -250,10 +496,15 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         var $submit = this.$('.NB-add-url-submit');
         var $error = this.$('.NB-error');
 
-        $(".NB-error-message", $error).text(data.message || "Oh no, there was a problem grabbing that URL and there's no good explanation for what happened.");
+        $(".NB-error-message", $error).text(data.message || gettext("Oh no, there was a problem grabbing that URL and there's no good explanation for what happened."));
         $error.slideDown(300);
-        $submit.text('Add Site');
+        $submit.text(gettext('Add site'));
         NEWSBLUR.reader.flags['reloading_feeds'] = false;
+    },
+
+    update_folder_placeholder: function () {
+        var parent_folder = this.$('.NB-folders option:selected').text().trim() || gettext('Top Level');
+        this.$('.NB-add-folder-input').attr('placeholder', interpolate(gettext("New folder under %(folder)s..."), {folder: parent_folder}, true));
     },
 
     open_add_folder: function () {
@@ -267,6 +518,7 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         } else {
             this._open_folder = true;
             $icon.addClass('NB-active');
+            this.update_folder_placeholder();
             $folder.slideDown(300);
         }
     },
@@ -281,7 +533,7 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
 
         $error.slideUp(300);
         $loading.addClass('NB-active');
-        $submit.addClass('NB-disabled').text('Adding...');
+        $submit.addClass('NB-disabled').text(gettext('Adding site...'));
 
         this.model.save_add_folder(folder, parent_folder, $.rescope(this.post_save_add_folder, this));
     },
@@ -295,19 +547,19 @@ NEWSBLUR.ReaderAddFeed = NEWSBLUR.ReaderPopover.extend({
         $submit.removeClass('NB-disabled');
 
         if (data.code > 0) {
-            $submit.text('Added!');
+            $submit.text(gettext('Added!'));
             NEWSBLUR.assets.load_feeds(_.bind(function () {
                 var $folders = NEWSBLUR.utils.make_folders($folder.val());
                 this.$(".NB-folders").replaceWith($folders);
                 this.open_add_folder();
-                $submit.text('Add Folder');
+                $submit.text(gettext('Add Folder'));
                 $folder.val('');
                 this.$('.NB-add-url').focus();
             }, this));
         } else {
             $(".NB-error-message", $error).text(data.message);
             $error.slideDown(300);
-            $submit.text('Add Folder');
+            $submit.text(gettext('Add Folder'));
         }
     }
 

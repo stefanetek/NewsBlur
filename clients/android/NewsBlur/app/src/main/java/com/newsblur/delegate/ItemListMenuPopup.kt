@@ -1,0 +1,470 @@
+package com.newsblur.delegate
+
+import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.LayoutInflater
+import android.view.Menu
+import android.view.View
+import android.widget.LinearLayout
+import android.widget.PopupWindow
+import androidx.core.content.ContextCompat
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
+import com.newsblur.R
+import com.newsblur.activity.ItemsList
+import com.newsblur.databinding.PopupItemlistMenuBinding
+import com.newsblur.util.PrefConstants
+import com.newsblur.util.PopupMenuTextScaler
+import com.newsblur.util.UIUtils
+import kotlin.math.max
+import kotlin.math.min
+
+class ItemListMenuPopup(
+    private val activity: ItemsList,
+    private val controller: Controller,
+    private val content: Content = Content.VISUAL,
+) {
+    enum class Content {
+        VISUAL,
+        ACTIONS,
+    }
+
+    interface Controller {
+        fun buildMenuModel(): Menu
+
+        fun onMenuItemSelected(itemId: Int): Boolean
+    }
+
+    companion object {
+        @JvmStatic
+        fun hasVisibleActions(menu: Menu): Boolean = StoryTitleSettingsMenu.hasVisibleActions(menu)
+    }
+
+    fun show(anchor: View): PopupWindow {
+        if (content == Content.ACTIONS) {
+            return FeedMenuPopover.showWithActions(activity, anchor, controller.buildMenuModel(), activity.prefsRepo.getResolvedTheme(activity), StoryTitleSettingsMenu.actions) { item ->
+                controller.onMenuItemSelected(item.itemId)
+            }
+        }
+        val binding = PopupItemlistMenuBinding.inflate(LayoutInflater.from(activity))
+        val popupWindow =
+            PopupWindow(
+                binding.root,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                true,
+            )
+
+        val palette = popupPalette()
+        val popupBackground = ContextCompat.getColor(activity, palette.backgroundColor)
+        val popupStroke = ContextCompat.getColor(activity, palette.strokeColor)
+        val dividerColor = ContextCompat.getColor(activity, palette.dividerColor)
+        val textColor = ContextCompat.getColor(activity, palette.textColor)
+        val accessoryColor = ContextCompat.getColor(activity, palette.accessoryColor)
+
+        binding.cardMenu.setCardBackgroundColor(popupBackground)
+        binding.cardMenu.strokeColor = popupStroke
+        binding.dividerActions.setBackgroundColor(dividerColor)
+
+        tintSectionHeaders(binding, textColor, accessoryColor)
+        styleToggleGroups(binding, palette)
+        bindMenu(binding, controller.buildMenuModel(), popupWindow, dividerColor, textColor, accessoryColor, anchor)
+        PopupMenuTextScaler.apply(binding.root, activity.prefsRepo.getListTextSize())
+
+        popupWindow.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        popupWindow.isOutsideTouchable = true
+        popupWindow.isTouchable = true
+        popupWindow.inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
+        popupWindow.elevation = UIUtils.dp2px(activity, 16f)
+
+        updatePopupLayout(anchor, binding, popupWindow, activity.prefsRepo.getListTextSize(), isShowing = false)
+        return popupWindow
+    }
+
+    private fun bindMenu(
+        binding: PopupItemlistMenuBinding,
+        menu: Menu,
+        popupWindow: PopupWindow,
+        dividerColor: Int,
+        textColor: Int,
+        accessoryColor: Int,
+        anchor: View,
+    ) {
+        binding.dividerActions.visibility = View.GONE
+
+        binding.containerActions.visibility = View.GONE
+        hideSections(binding, isVisible = true)
+        configureSections(binding, menu, popupWindow, anchor)
+    }
+
+    private fun configureSections(
+        binding: PopupItemlistMenuBinding,
+        menu: Menu,
+        popupWindow: PopupWindow,
+        anchor: View,
+    ) {
+        binding.sectionOrder.visibility = visibleFor(menu, R.id.menu_story_order)
+        binding.sectionReadFilter.visibility = visibleFor(menu, R.id.menu_read_filter)
+        binding.sectionContentPreview.visibility = visibleFor(menu, R.id.menu_story_content_preview_style)
+        binding.sectionThumbnailPreview.visibility = visibleFor(menu, R.id.menu_story_thumbnail_style)
+        binding.sectionListStyle.visibility = visibleFor(menu, R.id.menu_story_list_style)
+        binding.sectionTextSize.visibility = visibleFor(menu, R.id.menu_text_size)
+        binding.sectionSpacing.visibility = visibleFor(menu, R.id.menu_spacing)
+        binding.sectionTheme.visibility = visibleFor(menu, R.id.menu_theme)
+
+        applySelections(binding, menu)
+
+        binding.groupOrder.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            when (checkedId) {
+                binding.btnOrderNewest.id -> handleSelection(binding, popupWindow, R.id.menu_story_order_newest, dismissAfter = true)
+                binding.btnOrderOldest.id -> handleSelection(binding, popupWindow, R.id.menu_story_order_oldest, dismissAfter = true)
+            }
+        }
+
+        binding.groupReadFilter.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            when (checkedId) {
+                binding.btnReadFilterAll.id -> handleSelection(binding, popupWindow, R.id.menu_read_filter_all_stories, dismissAfter = true)
+                binding.btnReadFilterUnread.id -> handleSelection(binding, popupWindow, R.id.menu_read_filter_unread_only, dismissAfter = true)
+            }
+        }
+
+        binding.groupContentPreview.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            when (checkedId) {
+                binding.btnContentPreviewNone.id -> handleSelection(binding, popupWindow, R.id.menu_story_content_preview_none)
+                binding.btnContentPreviewSmall.id -> handleSelection(binding, popupWindow, R.id.menu_story_content_preview_small)
+                binding.btnContentPreviewMedium.id -> handleSelection(binding, popupWindow, R.id.menu_story_content_preview_medium)
+                binding.btnContentPreviewLarge.id -> handleSelection(binding, popupWindow, R.id.menu_story_content_preview_large)
+            }
+        }
+
+        binding.groupThumbnailPreview.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            when (checkedId) {
+                binding.btnThumbnailPreviewNone.id -> handleSelection(binding, popupWindow, R.id.menu_story_thumbnail_no_preview)
+                binding.btnThumbnailPreviewLeftSmall.id -> handleSelection(binding, popupWindow, R.id.menu_story_thumbnail_left_small)
+                binding.btnThumbnailPreviewLeftLarge.id -> handleSelection(binding, popupWindow, R.id.menu_story_thumbnail_left_large)
+                binding.btnThumbnailPreviewRightSmall.id -> handleSelection(binding, popupWindow, R.id.menu_story_thumbnail_right_small)
+                binding.btnThumbnailPreviewRightLarge.id -> handleSelection(binding, popupWindow, R.id.menu_story_thumbnail_right_large)
+            }
+        }
+
+        binding.groupListStyle.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            when (checkedId) {
+                binding.btnListStyleList.id -> handleSelection(binding, popupWindow, R.id.menu_list_style_list)
+                binding.btnListStyleGridC.id -> handleSelection(binding, popupWindow, R.id.menu_list_style_grid_c)
+                binding.btnListStyleGridM.id -> handleSelection(binding, popupWindow, R.id.menu_list_style_grid_m)
+                binding.btnListStyleGridF.id -> handleSelection(binding, popupWindow, R.id.menu_list_style_grid_f)
+            }
+        }
+
+        binding.groupTextSize.addView(ListMenuSegments.fontSize(activity) { id ->
+            handleTextSizeSelection(binding, popupWindow, anchor, id)
+        })
+        binding.groupTheme.addView(ListMenuSegments.theme(activity) { id ->
+            if (ListMenuSegments.themes.getValue(id) != activity.prefsRepo.getSelectedTheme()) {
+                handleSelection(binding, popupWindow, id, dismissAfter = true)
+            }
+        })
+
+        binding.groupSpacing.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            when (checkedId) {
+                binding.btnSpacingCompact.id -> handleSelection(binding, popupWindow, R.id.menu_spacing_compact)
+                binding.btnSpacingComfortable.id -> handleSelection(binding, popupWindow, R.id.menu_spacing_comfortable)
+            }
+        }
+
+    }
+
+    private fun handleSelection(
+        binding: PopupItemlistMenuBinding,
+        popupWindow: PopupWindow,
+        itemId: Int,
+        dismissAfter: Boolean = false,
+    ) {
+        controller.onMenuItemSelected(itemId)
+        if (dismissAfter) {
+            popupWindow.dismiss()
+        } else {
+            applySelections(binding, controller.buildMenuModel())
+            PopupMenuTextScaler.apply(binding.root, activity.prefsRepo.getListTextSize())
+        }
+    }
+
+    private fun handleTextSizeSelection(
+        binding: PopupItemlistMenuBinding,
+        popupWindow: PopupWindow,
+        anchor: View,
+        itemId: Int,
+    ) {
+        controller.onMenuItemSelected(itemId)
+        applySelections(binding, controller.buildMenuModel())
+        val textSize = activity.prefsRepo.getListTextSize()
+        PopupMenuTextScaler.apply(binding.root, textSize)
+        updatePopupLayout(anchor, binding, popupWindow, textSize, isShowing = true)
+    }
+
+    private fun applySelections(
+        binding: PopupItemlistMenuBinding,
+        menu: Menu,
+    ) {
+        if (menu.findItem(R.id.menu_story_order_newest)?.isChecked == true) binding.groupOrder.check(binding.btnOrderNewest.id)
+        if (menu.findItem(R.id.menu_story_order_oldest)?.isChecked == true) binding.groupOrder.check(binding.btnOrderOldest.id)
+
+        if (menu.findItem(R.id.menu_read_filter_all_stories)?.isChecked == true) binding.groupReadFilter.check(binding.btnReadFilterAll.id)
+        if (menu.findItem(R.id.menu_read_filter_unread_only)?.isChecked == true) binding.groupReadFilter.check(binding.btnReadFilterUnread.id)
+
+
+        if (menu.findItem(R.id.menu_story_content_preview_none)?.isChecked == true) binding.groupContentPreview.check(binding.btnContentPreviewNone.id)
+        if (menu.findItem(R.id.menu_story_content_preview_small)?.isChecked == true) binding.groupContentPreview.check(binding.btnContentPreviewSmall.id)
+        if (menu.findItem(R.id.menu_story_content_preview_medium)?.isChecked == true) binding.groupContentPreview.check(binding.btnContentPreviewMedium.id)
+        if (menu.findItem(R.id.menu_story_content_preview_large)?.isChecked == true) binding.groupContentPreview.check(binding.btnContentPreviewLarge.id)
+
+        if (menu.findItem(R.id.menu_story_thumbnail_no_preview)?.isChecked == true) binding.groupThumbnailPreview.check(binding.btnThumbnailPreviewNone.id)
+        if (menu.findItem(R.id.menu_story_thumbnail_left_small)?.isChecked == true) binding.groupThumbnailPreview.check(binding.btnThumbnailPreviewLeftSmall.id)
+        if (menu.findItem(R.id.menu_story_thumbnail_left_large)?.isChecked == true) binding.groupThumbnailPreview.check(binding.btnThumbnailPreviewLeftLarge.id)
+        if (menu.findItem(R.id.menu_story_thumbnail_right_small)?.isChecked == true) binding.groupThumbnailPreview.check(binding.btnThumbnailPreviewRightSmall.id)
+        if (menu.findItem(R.id.menu_story_thumbnail_right_large)?.isChecked == true) binding.groupThumbnailPreview.check(binding.btnThumbnailPreviewRightLarge.id)
+
+        if (menu.findItem(R.id.menu_list_style_list)?.isChecked == true) binding.groupListStyle.check(binding.btnListStyleList.id)
+        if (menu.findItem(R.id.menu_list_style_grid_c)?.isChecked == true) binding.groupListStyle.check(binding.btnListStyleGridC.id)
+        if (menu.findItem(R.id.menu_list_style_grid_m)?.isChecked == true) binding.groupListStyle.check(binding.btnListStyleGridM.id)
+        if (menu.findItem(R.id.menu_list_style_grid_f)?.isChecked == true) binding.groupListStyle.check(binding.btnListStyleGridF.id)
+
+
+        if (menu.findItem(R.id.menu_spacing_compact)?.isChecked == true) binding.groupSpacing.check(binding.btnSpacingCompact.id)
+        if (menu.findItem(R.id.menu_spacing_comfortable)?.isChecked == true) binding.groupSpacing.check(binding.btnSpacingComfortable.id)
+
+    }
+
+    private fun styleToggleGroups(
+        binding: PopupItemlistMenuBinding,
+        palette: ItemListPopupPalette,
+    ) {
+        listOf(
+            binding.groupOrder to listOf(binding.btnOrderNewest, binding.btnOrderOldest),
+            binding.groupReadFilter to listOf(binding.btnReadFilterAll, binding.btnReadFilterUnread),
+            binding.groupContentPreview to listOf(binding.btnContentPreviewNone, binding.btnContentPreviewSmall, binding.btnContentPreviewMedium, binding.btnContentPreviewLarge),
+            binding.groupThumbnailPreview to listOf(binding.btnThumbnailPreviewNone, binding.btnThumbnailPreviewLeftSmall, binding.btnThumbnailPreviewLeftLarge, binding.btnThumbnailPreviewRightSmall, binding.btnThumbnailPreviewRightLarge),
+            binding.groupListStyle to listOf(binding.btnListStyleList, binding.btnListStyleGridC, binding.btnListStyleGridM, binding.btnListStyleGridF),
+            binding.groupSpacing to listOf(binding.btnSpacingCompact, binding.btnSpacingComfortable),
+        ).forEach { (group, buttons) ->
+            styleToggleGroup(group, buttons, palette)
+        }
+    }
+
+    private fun styleToggleGroup(
+        group: MaterialButtonToggleGroup,
+        buttons: List<MaterialButton>,
+        palette: ItemListPopupPalette,
+    ) {
+        val buttonInset = UIUtils.dp2px(activity, 4)
+        val buttonRadius = UIUtils.dp2px(activity, 7)
+
+        group.setPadding(buttonInset, buttonInset, buttonInset, buttonInset)
+        group.background =
+            GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = UIUtils.dp2px(activity, 12f)
+                setColor(ContextCompat.getColor(activity, palette.themeGroupBackgroundColor))
+                setStroke(UIUtils.dp2px(activity, 1), ContextCompat.getColor(activity, palette.themeGroupBorderColor))
+            }
+
+        val buttonTint =
+            ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(
+                    ContextCompat.getColor(activity, palette.themeGroupSelectedColor),
+                    Color.TRANSPARENT,
+                ),
+            )
+        val textColor =
+            ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(
+                    ContextCompat.getColor(activity, palette.themeGroupSelectedTextColor),
+                    ContextCompat.getColor(activity, palette.themeGroupTextColor),
+                ),
+            )
+
+        buttons.forEach { button ->
+            button.backgroundTintList = buttonTint
+            button.setTextColor(textColor)
+            button.iconTint = textColor
+            button.strokeWidth = 0
+            button.cornerRadius = buttonRadius
+            button.insetTop = 0
+            button.insetBottom = 0
+            button.minimumHeight = 0
+            button.gravity = Gravity.CENTER
+            button.textAlignment = View.TEXT_ALIGNMENT_CENTER
+            button.setPadding(0, 0, 0, 0)
+        }
+    }
+
+    private fun tintSectionHeaders(
+        binding: PopupItemlistMenuBinding,
+        textColor: Int,
+        accessoryColor: Int,
+    ) {
+        listOf(
+            binding.textSectionOrder,
+            binding.textSectionReadFilter,
+            binding.textSectionContentPreview,
+            binding.textSectionThumbnailPreview,
+            binding.textSectionListStyle,
+            binding.textSectionTextSize,
+            binding.textSectionSpacing,
+            binding.textSectionTheme,
+        ).forEach { it.setTextColor(textColor) }
+
+        listOf(
+            binding.iconSectionOrder,
+            binding.iconSectionReadFilter,
+            binding.iconSectionContentPreview,
+            binding.iconSectionThumbnailPreview,
+            binding.iconSectionListStyle,
+            binding.iconSectionTextSize,
+            binding.iconSectionSpacing,
+            binding.iconSectionTheme,
+        ).forEach { it.setColorFilter(accessoryColor) }
+    }
+
+    private fun applyCardWidth(
+        binding: PopupItemlistMenuBinding,
+        availableWidthPx: Int,
+        preferenceScale: Float,
+    ) {
+        val popupMargin = UIUtils.dp2px(activity, 8)
+        val cardHorizontalMargin = UIUtils.dp2px(activity, 16)
+        val baseWidth = UIUtils.dp2px(activity, 320)
+        val maxCardWidth = availableWidthPx - (popupMargin * 2) - cardHorizontalMargin
+        binding.cardMenu.layoutParams =
+            binding.cardMenu.layoutParams.apply {
+                width = min(PopupMenuTextScaler.scaledWidthPx(baseWidth, preferenceScale), maxCardWidth).coerceAtLeast(baseWidth)
+            }
+    }
+
+    private fun updatePopupLayout(
+        anchor: View,
+        binding: PopupItemlistMenuBinding,
+        popupWindow: PopupWindow,
+        preferenceScale: Float,
+        isShowing: Boolean,
+    ) {
+        val displayFrame = Rect()
+        anchor.getWindowVisibleDisplayFrame(displayFrame)
+        applyCardWidth(binding, displayFrame.width(), preferenceScale)
+        binding.root.measure(
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+        )
+        com.newsblur.util.AnchoredPopover.show(anchor, popupWindow, binding.root.measuredWidth, binding.root.measuredHeight, isShowing)
+    }
+
+    private fun visibleFor(
+        menu: Menu,
+        itemId: Int,
+    ): Int = if (menu.findItem(itemId)?.isVisible == true) View.VISIBLE else View.GONE
+
+    private fun hideSections(
+        binding: PopupItemlistMenuBinding,
+        isVisible: Boolean,
+    ) {
+        val visibility = if (isVisible) View.VISIBLE else View.GONE
+        listOf(
+            binding.sectionOrder,
+            binding.sectionReadFilter,
+            binding.sectionContentPreview,
+            binding.sectionThumbnailPreview,
+            binding.sectionListStyle,
+            binding.sectionTextSize,
+            binding.sectionSpacing,
+            binding.sectionTheme,
+        ).forEach { it.visibility = visibility }
+    }
+
+    private fun popupPalette(): ItemListPopupPalette =
+        when (resolvedTheme()) {
+            PrefConstants.ThemeValue.SEPIA ->
+                ItemListPopupPalette(
+                    backgroundColor = R.color.item_background_sepia,
+                    strokeColor = R.color.row_border_sepia,
+                    dividerColor = R.color.row_border_sepia,
+                    textColor = R.color.text_sepia,
+                    accessoryColor = R.color.button_text_sepia,
+                    themeGroupBackgroundColor = R.color.segmented_control_background_sepia,
+                    themeGroupSelectedColor = R.color.segmented_control_selected_sepia,
+                    themeGroupTextColor = R.color.segmented_control_text_sepia,
+                    themeGroupSelectedTextColor = R.color.segmented_control_selected_text_sepia,
+                    themeGroupBorderColor = R.color.segmented_control_border_sepia,
+                )
+
+            PrefConstants.ThemeValue.DARK ->
+                ItemListPopupPalette(
+                    backgroundColor = R.color.gray13,
+                    strokeColor = R.color.gray30,
+                    dividerColor = R.color.gray30,
+                    textColor = R.color.white,
+                    accessoryColor = R.color.gray75,
+                    themeGroupBackgroundColor = R.color.segmented_control_background_dark,
+                    themeGroupSelectedColor = R.color.segmented_control_selected_dark,
+                    themeGroupTextColor = R.color.segmented_control_text_dark,
+                    themeGroupSelectedTextColor = R.color.segmented_control_selected_text_dark,
+                    themeGroupBorderColor = R.color.segmented_control_border_dark,
+                )
+
+            PrefConstants.ThemeValue.BLACK ->
+                ItemListPopupPalette(
+                    backgroundColor = R.color.gray13,
+                    strokeColor = R.color.gray30,
+                    dividerColor = R.color.gray30,
+                    textColor = R.color.white,
+                    accessoryColor = R.color.gray75,
+                    themeGroupBackgroundColor = R.color.segmented_control_background_black,
+                    themeGroupSelectedColor = R.color.segmented_control_selected_black,
+                    themeGroupTextColor = R.color.segmented_control_text_black,
+                    themeGroupSelectedTextColor = R.color.segmented_control_selected_text_black,
+                    themeGroupBorderColor = R.color.segmented_control_border_black,
+                )
+
+            else ->
+                ItemListPopupPalette(
+                    backgroundColor = R.color.white,
+                    strokeColor = R.color.gray90,
+                    dividerColor = R.color.gray85,
+                    textColor = R.color.gray20,
+                    accessoryColor = R.color.gray55,
+                    themeGroupBackgroundColor = R.color.gray90,
+                    themeGroupSelectedColor = R.color.white,
+                    themeGroupTextColor = R.color.segmented_control_text_light,
+                    themeGroupSelectedTextColor = R.color.segmented_control_selected_text_light,
+                    themeGroupBorderColor = R.color.gray80,
+                )
+        }
+
+    private fun resolvedTheme(): PrefConstants.ThemeValue =
+        activity.prefsRepo.getResolvedTheme(activity)
+}
+
+private data class ItemListPopupPalette(
+    val backgroundColor: Int,
+    val strokeColor: Int,
+    val dividerColor: Int,
+    val textColor: Int,
+    val accessoryColor: Int,
+    val themeGroupBackgroundColor: Int,
+    val themeGroupSelectedColor: Int,
+    val themeGroupTextColor: Int,
+    val themeGroupSelectedTextColor: Int,
+    val themeGroupBorderColor: Int,
+)

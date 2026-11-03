@@ -39,57 +39,70 @@ class DumpRequestMiddleware:
 
     def process_response(self, request, response):
         if hasattr(request, "sql_times_elapsed"):
-            redis_log = (
-                "~FCuser:%s%.6f~SNs ~FCstory:%s%.6f~SNs ~FCsession:%s%.6f~SNs ~FCpubsub:%s%.6f~SNs"
-                % (
-                    self.color_db(request.sql_times_elapsed["redis_user"], "~FC"),
-                    request.sql_times_elapsed["redis_user"],
-                    self.color_db(request.sql_times_elapsed["redis_story"], "~FC"),
-                    request.sql_times_elapsed["redis_story"],
-                    self.color_db(request.sql_times_elapsed["redis_session"], "~FC"),
-                    request.sql_times_elapsed["redis_session"],
-                    self.color_db(request.sql_times_elapsed["redis_pubsub"], "~FC"),
-                    request.sql_times_elapsed["redis_pubsub"],
-                )
-            )
+            counts = getattr(request, "sql_call_counts", {})
+            times = request.sql_times_elapsed
+            redis_parts = []
+            for key, label in [
+                ("redis_user", "user"),
+                ("redis_story", "story"),
+                ("redis_session", "session"),
+                ("redis_pubsub", "pubsub"),
+            ]:
+                c = counts.get(key, 0)
+                t = times[key]
+                color = self.color_db(t, "~FC")
+                redis_parts.append("%s%s:%s/%s~SN" % (color, label, c, self.format_db_time(t)))
+            redis_log = " ".join(redis_parts)
+            sql_color = self.color_db(times["sql"], "~FY")
+            mongo_color = self.color_db(times["mongo"], "~FM")
             logging.user(
                 request,
-                "~SN~FCDB times ~SB~FK%s~SN~FC: ~FYsql: %s%.4f~SNs ~SN~FMmongo: %s%.5f~SNs ~SN~FCredis: %s"
+                "~SN~FCDB times ~SD~FW%s~SN~FC: %ssql: %s/%s~SN %smongo: %s/%s~SN ~FCredis: %s"
                 % (
                     request.path,
-                    self.color_db(request.sql_times_elapsed["sql"], "~FY"),
-                    request.sql_times_elapsed["sql"],
-                    self.color_db(request.sql_times_elapsed["mongo"], "~FM"),
-                    request.sql_times_elapsed["mongo"],
+                    sql_color,
+                    counts.get("sql", 0),
+                    self.format_db_time(times["sql"]),
+                    mongo_color,
+                    counts.get("mongo", 0),
+                    self.format_db_time(times["mongo"]),
                     redis_log,
                 ),
             )
 
-        if hasattr(request, "start_time"):
+        if hasattr(request, "_server_timing_start"):
+            seconds = time.time() - request._server_timing_start
+        elif hasattr(request, "start_time"):
             seconds = time.time() - request.start_time
-            if seconds > RECORD_SLOW_REQUESTS_ABOVE_SECONDS:
-                r = redis.Redis(connection_pool=settings.REDIS_STATISTICS_POOL)
-                pipe = r.pipeline()
-                minute = round_time(round_to=60)
-                name = f"SLOW:{minute.strftime('%s')}"
-                user_id = request.user.pk if request.user.is_authenticated else "0"
-                data_string = None
-                if request.method == "GET":
-                    data_string = " ".join([f"{key}={value}" for key, value in request.GET.items()])
-                elif request.method == "GET":
-                    data_string = " ".join([f"{key}={value}" for key, value in request.POST.items()])
-                data = {
-                    "user_id": user_id,
-                    "time": round(seconds, 2),
-                    "path": request.path,
-                    "method": request.method,
-                    "data": data_string,
-                }
-                pipe.lpush(name, base64.b64encode(pickle.dumps(data)).decode("utf-8"))
-                pipe.expire(name, 60 * 60 * 12)  # 12 hours
-                pipe.execute()
+        else:
+            seconds = 0
+
+        if seconds > RECORD_SLOW_REQUESTS_ABOVE_SECONDS:
+            r = redis.Redis(connection_pool=settings.REDIS_STATISTICS_POOL)
+            pipe = r.pipeline()
+            minute = round_time(round_to=60)
+            name = f"SLOW:{minute.strftime('%s')}"
+            user_id = request.user.pk if request.user.is_authenticated else "0"
+            data_string = None
+            if request.method == "GET":
+                data_string = " ".join([f"{key}={value}" for key, value in request.GET.items()])
+            elif request.method == "POST":
+                data_string = " ".join([f"{key}={value}" for key, value in request.POST.items()])
+            data = {
+                "user_id": user_id,
+                "time": round(seconds, 2),
+                "path": request.path,
+                "method": request.method,
+                "data": data_string,
+            }
+            pipe.lpush(name, base64.b64encode(pickle.dumps(data)).decode("utf-8"))
+            pipe.expire(name, 60 * 60 * 12)  # 12 hours
+            pipe.execute()
 
         return response
+
+    def format_db_time(self, seconds):
+        return "%.3fs" % seconds
 
     def color_db(self, seconds, default):
         color = default
@@ -97,8 +110,8 @@ class DumpRequestMiddleware:
             color = "~SB~FR"
         elif seconds > 0.1:
             color = "~FW"
-        # elif seconds == 0:
-        #     color = '~FK~SB'
+        elif seconds == 0:
+            color = "~SD~FW"
         return color
 
     def __init__(self, get_response=None):

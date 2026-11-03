@@ -150,13 +150,18 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
             this.$('.folder_title').eq(0).bind('contextmenu', _.bind(this.show_manage_menu_rightclick, this));
         }
 
+        // Store view reference on DOM element (also done in initialize, but ensure it's set after render)
+        this.$el.data('folder_view', this);
+
         return this;
     },
 
     render_folder: function ($feeds) {
+        // folder_view.js: dir="auto" on .folder_title_text isolates the folder name, so a name in
+        // another script keeps its punctuation and truncates at its own end (see reader_rtl.css).
         var $folder = _.template('<<%= list_type %> class="folder NB-folder">\
         <% if (!root) { %>\
-            <div class="folder_title <% if (depth <= 1) { %>NB-toplevel<% } %>">\
+            <div class="folder_title <% if (depth <= 1) { %>NB-toplevel NB-sticky-sidebar-folder<% } %>">\
                 <% if (feedbar) { %>\
                     <div class="NB-feedbar-mark-feed-read-container">\
                         <div class="NB-feedbar-mark-feed-read"><div class="NB-icon"></div></div>\
@@ -176,42 +181,47 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
                               var end_date = NEWSBLUR.reader.flags.date_filter_end;\
                               if (start_date && end_date) { %>\
                                 <% if (start_date === end_date) { %>\
-                                Stories on <%= start_date %>\
+                                <%- interpolate(gettext("Stories on %(date)s"), {date: start_date}, true) %>\
                                 <% } else { %>\
-                                Stories from <%= start_date %> to <%= end_date %>\
+                                <%- interpolate(gettext("Stories from %(start_date)s to %(end_date)s"), {start_date: start_date, end_date: end_date}, true) %>\
                                 <% } %>\
                                 &middot;\
                             <% } else if (start_date) { %>\
-                              Stories newer than <%= start_date %>\
+                              <%- interpolate(gettext("Stories newer than %(date)s"), {date: start_date}, true) %>\
                               &middot;\
                             <% } else if (end_date) { %>\
-                              Stories older than <%= end_date %>\
+                              <%- interpolate(gettext("Stories older than %(date)s"), {date: end_date}, true) %>\
                               &middot;\
                             <% } %>\
-                            <%= NEWSBLUR.assets.view_setting("river:"+folder_title, "read_filter") %>\
+                            <%- setting_label(NEWSBLUR.assets.view_setting("river:"+folder_title, "read_filter")) %>\
                             &middot;\
-                            <%= NEWSBLUR.assets.view_setting("river:"+folder_title, "order") %>\
+                            <%- setting_label(NEWSBLUR.assets.view_setting("river:"+folder_title, "order")) %>\
+                            <% if (has_auto_mark_read) { %>\
+                                &middot;\
+                                <div class="NB-feedbar-auto-mark-read-icon"></div>\
+                            <% } %>\
                         </span>\
                     </div>\
                     <div class="NB-story-title-indicator">\
                         <div class="NB-story-title-indicator-count"></div>\
-                        <span class="NB-story-title-indicator-text">show hidden stories</span>\
+                        <span class="NB-story-title-indicator-text"><%- gettext("show hidden stories") %></span>\
                     </div>\
                     <% if (show_discover) { %>\
                         <div class="NB-feedbar-discover-container">\
                             <div class="NB-feedbar-discover-icon"></div>\
+                            <span class="NB-feedbar-discover-text"><%- gettext("Related Sites") %></span>\
                             <div class="NB-icon"></div>\
                         </div>\
                     <% } %>\
                 <% } %>\
-                <div class="NB-folder-icon">\
-                <% if (feedbar) { %>\
-                    <img class="feed_favicon" src="<%= $.favicon("river:"+folder_title) %>">\
-                <% } %>\
+                <% var icon_url = $.favicon("river:"+folder_title); %>\
+                <% var is_custom = $.icon_url_is_custom(icon_url); %>\
+                <div class="NB-folder-icon<% if (is_custom) { %> NB-has-custom-icon<% } %>">\
+                    <%= $.favicon_html("river:"+folder_title) %>\
                 </div>\
-                <div class="NB-feedlist-collapse-icon" title="<% if (is_collapsed) { %>Expand Folder<% } else {%>Collapse Folder<% } %>"></div>\
+                <div class="NB-feedlist-collapse-icon" title="<% if (is_collapsed) { %><%- gettext("Expand Folder") %><% } else {%><%- gettext("Collapse Folder") %><% } %>"></div>\
                 <div class="NB-feedlist-manage-icon" role="button"></div>\
-                <span class="folder_title_text">\
+                <span class="folder_title_text" dir="auto">\
                     <span><%= folder_title %></span>\
                 </span>\
             </div>\
@@ -228,7 +238,12 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
             root: this.options.root,
             feedbar: this.options.feedbar,
             show_discover: NEWSBLUR.assets.preference("show_discover"),
-            list_type: this.options.feedbar ? 'div' : 'li'
+            setting_label: this.setting_label,
+            list_type: this.options.feedbar ? 'div' : 'li',
+            has_auto_mark_read: (function () {
+                var setting = NEWSBLUR.assets.get_folder_auto_mark_read(this.options.folder_title);
+                return setting !== null && setting !== undefined;
+            }).call(this)
         });
 
         this.$el.replaceWith($folder);
@@ -247,6 +262,18 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
             }
         }
         return $folder;
+    },
+
+    // folder_view.js: Display label for read_filter/order view setting identifiers,
+    // which stay untranslated because they are stored preferences and sent to the server.
+    setting_label: function (value) {
+        var labels = {
+            all: gettext("All"),
+            unread: gettext("Unread"),
+            newest: gettext("Newest"),
+            oldest: gettext("Oldest")
+        };
+        return labels[value] || value;
     },
 
     update_title: function () {
@@ -408,7 +435,10 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
                 $children.eq(0).is(':visible') &&
                 !this.collection.collapsed)) {
             NEWSBLUR.log(["hiding folder", $children, this.collection, this.options.folder_title]);
-            NEWSBLUR.assets.collapsed_folders(this.options.folder_title, true);
+            // Don't save preference in feed_chooser mode (temporary collapse)
+            if (!this.options.feed_chooser) {
+                NEWSBLUR.assets.collapsed_folders(this.options.folder_title, true);
+            }
             this.collection.collapsed = true;
             this.$el.addClass('NB-folder-collapsed');
             $children.animate({ 'opacity': 0 }, {
@@ -416,6 +446,7 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
                 'duration': options.force_collapse ? 0 : 200,
                 'complete': function () {
                     self.show_collapsed_folder_count();
+                    self.show_folder_highlight_status();
                     $children.slideUp({
                         'duration': 270,
                         'easing': 'easeOutQuart'
@@ -427,9 +458,14 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
         else if ($children.length &&
             (this.collection.collapsed || !$children.eq(0).is(':visible'))) {
             NEWSBLUR.log(["showing folder", this.collection, this.options.folder_title]);
-            NEWSBLUR.assets.collapsed_folders(this.options.folder_title, false);
+            // Don't save preference in feed_chooser mode (temporary collapse)
+            if (!this.options.feed_chooser) {
+                NEWSBLUR.assets.collapsed_folders(this.options.folder_title, false);
+            }
             this.collection.collapsed = false;
             this.$el.removeClass('NB-folder-collapsed');
+            // Remove folder highlight status when expanding
+            this.$('.folder_title').eq(0).find('.NB-folder-highlight-status').remove();
             if (!NEWSBLUR.assets.preference('folder_counts')) {
                 this.hide_collapsed_folder_count();
             }
@@ -465,6 +501,53 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
         });
 
         return all_children_highlighted;
+    },
+
+    no_children_highlighted: function () {
+        var folder_title = this.options.folder_title;
+        var no_children_highlighted = this.collection.all(function (item) {
+            if (item.is_feed()) {
+                var view = _.any(item.feed.views, function (view) {
+                    return view.options.feed_chooser &&
+                        view.options.folder_title == folder_title;
+                });
+
+                if (!view) return true;
+
+                return !item.feed.highlighted_in_folder(folder_title);
+            } else if (item.is_folder()) {
+                return _.all(item.folder_views, function (view) {
+                    if (!view.options.feed_chooser) return true;
+                    return view.no_children_highlighted();
+                });
+            }
+            return true;
+        });
+
+        return no_children_highlighted;
+    },
+
+    show_folder_highlight_status: function () {
+        if (!this.options.feed_chooser) return;
+
+        var $folder_title = this.$('.folder_title').eq(0);
+        var $status = $folder_title.find('.NB-folder-highlight-status');
+
+        // Remove existing status
+        $status.remove();
+
+        // Only show status if folder is collapsed
+        if (!this.$el.hasClass('NB-folder-collapsed')) return;
+
+        var all_highlighted = this.all_children_highlighted();
+        var none_highlighted = this.no_children_highlighted();
+
+        if (all_highlighted) {
+            $folder_title.append($.make('span', { className: 'NB-folder-highlight-status NB-folder-on' }, gettext('ON')));
+        } else if (none_highlighted) {
+            $folder_title.append($.make('span', { className: 'NB-folder-highlight-status NB-folder-off' }, gettext('OFF')));
+        }
+        // If mixed, don't show any status
     },
 
     highlighted_count_unique_folders: function () {
@@ -508,6 +591,8 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
     highlight_feeds: function (options) {
         options = options || {};
         if (!this.options.feed_chooser) return;
+        // Don't toggle selection when clicking the collapse icon
+        if (options.target && $(options.target).hasClass('NB-feedlist-collapse-icon')) return;
         var $folder = options.currentTarget && $(options.currentTarget).closest('li.folder');
         if ($folder && $folder[0] != this.el) return;
         var all_children_highlighted = this.all_children_highlighted();
@@ -570,8 +655,17 @@ NEWSBLUR.Views.Folder = Backbone.View.extend({
     },
 
     mark_folder_as_read: function (e, days_back) {
+        var self = this;
+        var $container = this.$('.NB-feedbar-mark-feed-read-container');
+        if ($container.length && NEWSBLUR.reader.should_confirm_mark_read('folder')) {
+            NEWSBLUR.reader.show_mark_read_confirm($container, function () {
+                NEWSBLUR.reader.mark_folder_as_read(self.model, days_back);
+                $container.fadeOut(400);
+            }, { days: days_back });
+            return;
+        }
         NEWSBLUR.reader.mark_folder_as_read(this.model, days_back);
-        this.$('.NB-feedbar-mark-feed-read-container').fadeOut(400);
+        $container.fadeOut(400);
     },
 
     mark_folder_as_read_days: function (e) {

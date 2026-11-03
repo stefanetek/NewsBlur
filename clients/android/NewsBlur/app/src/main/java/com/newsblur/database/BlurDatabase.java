@@ -7,10 +7,14 @@ import android.database.sqlite.SQLiteOpenHelper;
 public class BlurDatabase extends SQLiteOpenHelper {
 
 	public final static String DB_NAME = "blur.db";
-	private final static int VERSION = 2;
+	static final int VERSION = 11;
 
 	public BlurDatabase(Context context) {
-		super(context, DB_NAME, null, VERSION);
+		this(context, DB_NAME);
+	}
+
+	BlurDatabase(Context context, String dbName) {
+		super(context, dbName, null, VERSION);
 	}
 
 	@Override
@@ -20,6 +24,7 @@ public class BlurDatabase extends SQLiteOpenHelper {
 		db.execSQL(DatabaseConstants.FOLDER_SQL);
 		db.execSQL(DatabaseConstants.USER_SQL);
 		db.execSQL(DatabaseConstants.STORY_SQL);
+        ClusterReadStore.createTables(db);
         db.execSQL(DatabaseConstants.READING_SESSION_SQL);
         db.execSQL(DatabaseConstants.STORY_TEXT_SQL);
 		db.execSQL(DatabaseConstants.COMMENT_SQL);
@@ -33,10 +38,22 @@ public class BlurDatabase extends SQLiteOpenHelper {
         db.execSQL(DatabaseConstants.FEED_TAGS_SQL);
         db.execSQL(DatabaseConstants.FEED_AUTHORS_SQL);
         db.execSQL(DatabaseConstants.SYNC_METADATA_SQL);
+        db.execSQL(DatabaseConstants.CUSTOM_ICON_SQL);
 	}
-	
+
+	@Override
+	public void onOpen(SQLiteDatabase db) {
+		super.onOpen(db);
+		db.enableWriteAheadLogging();
+	}
+
 	void dropAndRecreateTables() {
 		SQLiteDatabase db = getWritableDatabase();
+		dropAndRecreateTables(db);
+	}
+
+	private void dropAndRecreateTables(SQLiteDatabase db) {
+		ClusterReadStore.dropTables(db);
 		String drop = "DROP TABLE IF EXISTS ";
 		db.execSQL(drop + DatabaseConstants.FEED_TABLE);
 		db.execSQL(drop + DatabaseConstants.SOCIALFEED_TABLE);
@@ -56,13 +73,47 @@ public class BlurDatabase extends SQLiteOpenHelper {
         db.execSQL(drop + DatabaseConstants.FEED_TAGS_TABLE);
         db.execSQL(drop + DatabaseConstants.FEED_AUTHORS_TABLE);
         db.execSQL(drop + DatabaseConstants.SYNC_METADATA_TABLE);
-		
+        db.execSQL(drop + DatabaseConstants.CUSTOM_ICON_TABLE);
+
 		onCreate(db);
 	}
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int previousVersion, int nextVersion) {
-        // note: we drop all tables and recreate any time the schema changes on app upgrade
+        if (previousVersion >= 6 && previousVersion < 9) {
+            // Folder.java reconstructs segment keys from the cached parent list. Display
+            // paths can collide when a folder title contains the hierarchy separator.
+            db.execSQL("ALTER TABLE " + DatabaseConstants.FOLDER_TABLE + " RENAME TO folders_legacy");
+            db.execSQL(DatabaseConstants.FOLDER_SQL);
+            try (android.database.Cursor cursor = db.query("folders_legacy", null, null, null, null, null, null)) {
+                while (cursor.moveToNext()) {
+                    db.insertOrThrow(DatabaseConstants.FOLDER_TABLE, null,
+                            com.newsblur.domain.Folder.fromCursor(cursor).getValues());
+                }
+            }
+            db.execSQL("DROP TABLE folders_legacy");
+        }
+        if (previousVersion >= 6 && previousVersion < 10) {
+            // ClusterReadStore.kt upgrades membership without replacing cached stories, actions, or receipts.
+            if (previousVersion < 8) {
+                ClusterReadStore.createTables(db);
+            } else {
+                ClusterReadStore.addMemberMetadata(db);
+            }
+            ClusterReadStore.backfill(db);
+        }
+        if (previousVersion >= 6 && previousVersion < 11) {
+            // BlurDatabaseHelper.java reads custom_icons during startup. Repair missing tables
+            // without discarding cached stories, existing icons, or queued offline actions.
+            db.execSQL(DatabaseConstants.CUSTOM_ICON_SQL);
+            return;
+        }
+        dropAndRecreateTables(db);
+    }
+
+    @Override
+    public void onDowngrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        dropAndRecreateTables(db);
     }
 
     public SQLiteDatabase getRO() {

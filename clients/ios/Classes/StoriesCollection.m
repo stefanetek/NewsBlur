@@ -12,10 +12,16 @@
 #import "NSObject+SBJSON.h"
 #import "FMDatabase.h"
 #import "Utilities.h"
+#import "NewsBlur-Swift.h"
 
 @interface StoriesCollection ()
 
 @property (nonatomic, strong) NSMutableDictionary *recentlyReadHashes;
+
+- (BOOL)isClusterMarkReadEnabledForStory:(NSDictionary *)story;
+- (NSDictionary *)activeFeedStoryWithHash:(NSString *)storyHash;
+- (void)markStoryRead:(NSString *)storyId feedId:(id)feedId fallbackStory:(NSDictionary *)fallbackStory;
+- (void)markStoryUnread:(NSString *)storyId feedId:(id)feedId fallbackStory:(NSDictionary *)fallbackStory;
 
 @end
 
@@ -41,9 +47,9 @@
 @synthesize isRiverView;
 @synthesize isSocialView;
 @synthesize isSocialRiverView;
+@synthesize isDailyBriefing;
 @synthesize isSavedView;
 @synthesize isReadView;
-@synthesize transferredFromDashboard;
 @synthesize inSearch;
 @synthesize searchQuery;
 
@@ -58,29 +64,24 @@
     return self;
 }
 
-- (id)initForDashboard {
-    if (self = [self init]) {
-        
-    }
-    
-    return self;
-}
-
 - (void)reset {
+    self.notificationStoryHash = nil;
+    self.notificationStory = nil;
     [self setStories:nil];
     [self setFeedUserProfiles:nil];
 
     self.feedPage = 1;
+    self.readFilterOverride = nil;
     self.activeFeed = nil;
     self.activeSavedStoryTag = nil;
     self.activeFolder = nil;
     self.activeFolderFeeds = nil;
     self.activeClassifiers = [NSMutableDictionary dictionary];
     
-    self.transferredFromDashboard = NO;
     self.isRiverView = NO;
     self.isSocialView = NO;
     self.isSocialRiverView = NO;
+    self.isDailyBriefing = NO;
     self.isSavedView = NO;
     self.isReadView = NO;
     self.isWidgetView = NO;
@@ -97,6 +98,14 @@
     self.savedSearchQuery = fromCollection.savedSearchQuery;
 }
 
+- (BOOL)isDashboard {
+    return appDelegate.isDashboard;
+}
+
+- (BOOL)isDashboardOrFromDashboardStory {
+    return self.isDashboard || appDelegate.fromDashboardStory;
+}
+
 - (BOOL)isEverything {
     return [activeFolder isEqualToString:@"everything"];
 }
@@ -105,12 +114,24 @@
     return [activeFolder isEqualToString:@"infrequent"];
 }
 
+- (BOOL)isTrending {
+    return [activeFolder hasPrefix:@"trending:"];
+}
+
 - (BOOL)isRiverOrSocial {
     return self.isRiverView || self.isSavedView || self.isReadView || self.isWidgetView || self.isSocialView || self.isSocialRiverView;
 }
 
 - (BOOL)isCustomFolder {
-    return self.isRiverView && !self.isEverything && !self.isInfrequent && !self.isSavedView && !self.isReadView && !self.isSocialView && !self.isWidgetView;
+    return self.isRiverView &&
+    !self.isEverything &&
+    !self.isInfrequent &&
+    !self.isTrending &&
+    !self.isDailyBriefing &&
+    !self.isSavedView &&
+    !self.isReadView &&
+    !self.isSocialView &&
+    !self.isWidgetView;
 }
 
 - (BOOL)isCustomFolderOrFeed {
@@ -120,6 +141,7 @@
 #pragma mark - Story Traversal
 
 - (BOOL)isStoryUnread:(NSDictionary *)story {
+    if ([story[@"_nb_provisional_read_state"] boolValue]) return [story[@"read_status"] intValue] == 0;
     BOOL readStatusUnread = [[story objectForKey:@"read_status"] intValue] == 0;
     BOOL storyHashUnread = [[appDelegate.unreadStoryHashes
                              objectForKey:[story objectForKey:@"story_hash"]] boolValue];
@@ -259,7 +281,7 @@
     
     if (orderPref) {
         return orderPref;
-    } else if (orderPrefDefault) {
+    } else if (!self.isDashboardOrFromDashboardStory && orderPrefDefault) {
         return orderPrefDefault;
     } else {
         return @"newest";
@@ -267,6 +289,11 @@
 }
 
 - (NSString *)activeReadFilter {
+    // StoriesCollection.m keeps notification visits inclusive without changing the saved feed preference.
+    if (self.readFilterOverride) {
+        return self.readFilterOverride;
+    }
+
     if (self.appDelegate.isSavedStoriesIntelligenceMode) {
         return @"starred";
     }
@@ -279,14 +306,16 @@
     if (readFilterPref) {
         return readFilterPref;
     } else if (self.activeFolder && (self.isRiverView || self.isSocialRiverView)) {
-        if (readFilterFolderPrefDefault) {
+        if (!self.isDashboardOrFromDashboardStory && readFilterFolderPrefDefault) {
             return readFilterFolderPrefDefault;
         } else {
             return @"unread";
         }
     } else {
-        if (readFilterFeedPrefDefault) {
+        if (!self.isDashboardOrFromDashboardStory && readFilterFeedPrefDefault) {
             return readFilterFeedPrefDefault;
+        } else if (self.isDashboardOrFromDashboardStory) {
+            return @"unread";
         } else {
             return @"all";
         }
@@ -320,35 +349,24 @@
 
 - (NSString *)orderKey {
     if (self.isRiverView) {
-        return [NSString stringWithFormat:@"folder:%@:order", self.activeFolder];
+        return [NSString stringWithFormat:@"%@folder:%@:order", self.isDashboardOrFromDashboardStory ? @"dashboard:" : @"", self.activeFolder];
     } else {
-        return [NSString stringWithFormat:@"%@:order", [self.activeFeed objectForKey:@"id"]];
+        return [NSString stringWithFormat:@"%@%@:order", self.isDashboardOrFromDashboardStory ? @"dashboard:" : @"", [self.activeFeed objectForKey:@"id"]];
     }
 }
 
 - (NSString *)readFilterKey {
     if (self.isRiverView) {
-        return [NSString stringWithFormat:@"folder:%@:read_filter", self.activeFolder];
+        return [NSString stringWithFormat:@"%@folder:%@:read_filter", self.isDashboardOrFromDashboardStory ? @"dashboard:" : @"", self.activeFolder];
     } else {
-        return [NSString stringWithFormat:@"%@:read_filter", [self.activeFeed objectForKey:@"id"]];
-    }
-}
-
-- (NSString *)scrollReadFilterKey {
-    NSUserDefaults *userPreferences = [NSUserDefaults standardUserDefaults];
-    BOOL shouldOverride = [userPreferences boolForKey:@"override_scroll_read_filter"];
-    
-    if (!shouldOverride) {
-        return @"default_scroll_read_filter";
-    } else if (self.isRiverView) {
-        return [NSString stringWithFormat:@"folder:%@:scroll_read_filter", self.activeFolder];
-    } else {
-        return [NSString stringWithFormat:@"%@:scroll_read_filter", [self.activeFeed objectForKey:@"id"]];
+        return [NSString stringWithFormat:@"%@%@:read_filter", self.isDashboardOrFromDashboardStory ? @"dashboard:" : @"", [self.activeFeed objectForKey:@"id"]];
     }
 }
 
 - (NSString *)storyTitlesPositionKey {
-    if (self.isRiverView) {
+    if (self.isDashboard) {
+        return [NSString stringWithFormat:@"dashboard:story_titles_position"];
+    } else if (self.isRiverView) {
         return [NSString stringWithFormat:@"folder:%@:story_titles_position", self.activeFolder];
     } else {
         return [NSString stringWithFormat:@"%@:story_titles_position", [self.activeFeed objectForKey:@"id"]];
@@ -371,8 +389,18 @@
             return @"Global Shared Stories";
         } else if ([activeFolder isEqualToString:@"everything"]) {
             return @"All Site Stories";
+        } else if ([activeFolder isEqualToString:@"dashboard"]) {
+            return @"NewsBlur Dashboard";
         } else if ([activeFolder isEqualToString:@"infrequent"]) {
             return @"Infrequent Site Stories";
+        } else if ([activeFolder isEqualToString:@"trending:well_read"]) {
+            return @"Widely Read Stories";
+        } else if ([activeFolder isEqualToString:@"trending:long_reads"]) {
+            return @"Long Reads";
+        } else if ([activeFolder isEqualToString:@"trending:good_reads"]) {
+            return @"Good Reads";
+        } else if ([activeFolder isEqualToString:@"daily_briefing"]) {
+            return @"Daily Briefing";
         } else if (isSavedView && activeSavedStoryTag) {
             return activeSavedStoryTag;
         } else if ([activeFolder isEqualToString:@"widget_stories"]) {
@@ -393,19 +421,55 @@
 
 #pragma mark - Story Management
 
+- (NSArray *)storiesByIncludingNotificationStory:(NSArray *)stories {
+    NSDictionary *target = self.notificationStory;
+    if (!stories || !target || !self.readFilterOverride ||
+        ![[NSString stringWithFormat:@"%@", target[@"story_feed_id"]] isEqualToString:self.activeFeedIdStr]) return stories;
+
+    // StoriesCollection.m retains one exact lookup beyond the loaded pages, without changing their page numbers.
+    BOOL hasCurrentTarget = NO;
+    for (NSDictionary *story in self.activeFeedStories) {
+        if ([story[@"story_hash"] isEqualToString:target[@"story_hash"]]) {
+            target = story;
+            hasCurrentTarget = YES;
+            break;
+        }
+    }
+    NSMutableArray *merged = [NSMutableArray arrayWithCapacity:stories.count + 1];
+    for (NSDictionary *story in stories) {
+        if ([story[@"story_hash"] isEqualToString:target[@"story_hash"]]) {
+            if (!hasCurrentTarget) target = story;
+        } else {
+            [merged addObject:story];
+        }
+    }
+    BOOL oldestFirst = [self.activeOrder isEqualToString:@"oldest"];
+    double timestamp = [target[@"story_timestamp"] doubleValue];
+    NSUInteger insertion = merged.count;
+    for (NSUInteger index = 0; index < merged.count; index++) {
+        double otherTimestamp = [merged[index][@"story_timestamp"] doubleValue];
+        if (oldestFirst ? timestamp < otherTimestamp : timestamp > otherTimestamp) {
+            insertion = index;
+            break;
+        }
+    }
+    [merged insertObject:target atIndex:insertion];
+    return merged;
+}
+
 - (void)addStories:(NSArray *)stories {
     if (self.activeFeedStories == nil) {
         NSLog(@"addStories: activeFeedStories was nil!");
         self.activeFeedStories = [NSMutableArray array];
     }
-    self.activeFeedStories = [self.activeFeedStories arrayByAddingObjectsFromArray:stories];
+    self.activeFeedStories = [self storiesByIncludingNotificationStory:[self.activeFeedStories arrayByAddingObjectsFromArray:stories]];
     self.storyCount = (int)[self.activeFeedStories count];
     [self calculateStoryLocations];
     self.storyLocationsCount = (int)[self.activeFeedStoryLocations count];
 }
 
 - (void)setStories:(NSArray *)activeFeedStoriesValue {
-    self.activeFeedStories = activeFeedStoriesValue;
+    self.activeFeedStories = [self storiesByIncludingNotificationStory:activeFeedStoriesValue];
     self.storyCount = (int)[self.activeFeedStories count];
     appDelegate.recentlyReadFeeds = [NSMutableSet set];
     [self calculateStoryLocations];
@@ -421,7 +485,7 @@
 }
 
 - (void)pushReadStory:(id)storyId {
-    if ([appDelegate.readStories lastObject] != storyId) {
+    if (![[appDelegate.readStories lastObject] isEqual:storyId]) {
         [appDelegate.readStories addObject:storyId];
     }
 }
@@ -465,11 +529,20 @@
                forKey:@"story_hash"];
     [params setObject:[story objectForKey:@"story_feed_id"]
                forKey:@"story_feed_id"];
-    
+
+    NSString *readTimesJSON = [[ReadTimeTracker shared] consumeQueuedReadTimesJSON];
+    if (readTimesJSON) {
+        [params setObject:readTimesJSON forKey:@"read_times"];
+    }
+
     [appDelegate POST:urlString parameters:params success:^(NSURLSessionDataTask * _Nonnull task, id  _Nullable responseObject) {
         self.recentlyReadHashes[hash] = [NSString stringWithFormat:@"SYNCED - %@", title];
         [self finishMarkAsRead:responseObject];
     } failure:^(NSURLSessionDataTask * _Nullable task, NSError * _Nonnull error) {
+        NSString *failedReadTimes = [params objectForKey:@"read_times"];
+        if (failedReadTimes) {
+            [[ReadTimeTracker shared] restoreQueuedReadTimesWithJson:failedReadTimes];
+        }
         self.recentlyReadHashes[hash] = nil;
         [self failedMarkAsRead:params];
     }];
@@ -549,19 +622,29 @@
 }
 
 - (void)markStoryRead:(NSDictionary *)story {
-    [self markStoryRead:[story objectForKey:@"story_hash"] feedId:[story objectForKey:@"story_feed_id"]];
+    [self markStoryRead:[story objectForKey:@"story_hash"]
+                 feedId:[story objectForKey:@"story_feed_id"]
+          fallbackStory:story];
 }
 
 - (void)markStoryRead:(NSString *)storyId feedId:(id)feedId {
+    NSDictionary *retainedStory = [[appDelegate.activeStory objectForKey:@"story_hash"] isEqualToString:storyId] ?
+        appDelegate.activeStory : nil;
+    [self markStoryRead:storyId feedId:feedId fallbackStory:retainedStory];
+}
+
+- (NSDictionary *)activeFeedStoryWithHash:(NSString *)storyHash {
+    for (NSDictionary *story in self.activeFeedStories) {
+        if ([[story objectForKey:@"story_hash"] isEqualToString:storyHash]) return story;
+    }
+    return nil;
+}
+
+- (void)markStoryRead:(NSString *)storyId feedId:(id)feedId fallbackStory:(NSDictionary *)fallbackStory {
     NSString *feedIdStr = [NSString stringWithFormat:@"%@",feedId];
     NSDictionary *feed = [appDelegate getFeed:feedIdStr];
-    NSDictionary *story = nil;
-    for (NSDictionary *s in self.activeFeedStories) {
-        if ([[s objectForKey:@"story_hash"] isEqualToString:storyId]) {
-            story = s;
-            break;
-        }
-    }
+    // StoriesCollection.m keeps the retained reader's story available while Duo browses another source.
+    NSDictionary *story = [self activeFeedStoryWithHash:storyId] ?: fallbackStory;
     [self markStoryRead:story feed:feed];
     
     NSArray *otherFriendShares = [story objectForKey:@"shared_by_friends"];
@@ -581,31 +664,53 @@
 }
 
 - (void)markStoryRead:(NSDictionary *)story feed:(NSDictionary *)feed {
+    NSString *storyHash = [story objectForKey:@"story_hash"];
+    if (!storyHash.length) return;
+    BOOL storyIsInActiveFeed = [self activeFeedStoryWithHash:storyHash] != nil;
     NSString *feedIdStr;
     if (feed) {
         feedIdStr = [NSString stringWithFormat:@"%@", [feed objectForKey:@"id"]];
     } else {
         feedIdStr = @"0";
     }
-    
+
     NSMutableDictionary *newStory = [story mutableCopy];
     [newStory setValue:[NSNumber numberWithInt:1] forKey:@"read_status"];
-    
+    if ([self isClusterMarkReadEnabledForStory:story]) {
+        NSArray *updatedClusterStories = [StoryClusterDisplayDecision
+                                          updatedClusterStories:[story objectForKey:@"cluster_stories"]
+                                          parentRead:YES
+                                          clusterMarkReadEnabled:YES
+                                          isPremiumArchive:self.appDelegate.isPremiumArchive];
+        if (updatedClusterStories) {
+            [newStory setObject:updatedClusterStories forKey:@"cluster_stories"];
+        }
+    }
+
     if ([[appDelegate.activeStory objectForKey:@"story_hash"]
          isEqualToString:[newStory objectForKey:@"story_hash"]]) {
         appDelegate.activeStory = newStory;
     }
-    
+
     // make the story as read in self.activeFeedStories
     NSString *newStoryIdStr = [NSString stringWithFormat:@"%@", [newStory valueForKey:@"story_hash"]];
-    [self replaceStory:newStory withId:newStoryIdStr];
-    
+    if (storyIsInActiveFeed) [self replaceStory:newStory withId:newStoryIdStr];
+    if (appDelegate.activeUsername.length) {
+        [StoryFirstPageCache.shared recordStory:newStory fields:@[@"read_status"] account:appDelegate.activeUsername host:appDelegate.url];
+        if ([self isClusterMarkReadEnabledForStory:story]) {
+            for (NSDictionary *child in newStory[@"cluster_stories"]) {
+                [StoryFirstPageCache.shared recordStory:child fields:@[@"read_status"] account:appDelegate.activeUsername host:appDelegate.url];
+            }
+        }
+    }
+
+
     id storyFeedId = [newStory objectForKey:@"story_feed_id"];
-    
+
     // If not a feed, then don't bother updating local feed
     if (!feed || !storyFeedId) return;
     
-    self.visibleUnreadCount -= 1;
+    if (storyIsInActiveFeed) self.visibleUnreadCount -= 1;
     if (![appDelegate.recentlyReadFeeds containsObject:storyFeedId]) {
         [appDelegate.recentlyReadFeeds addObject:storyFeedId];
     }
@@ -631,7 +736,7 @@
             [self.appDelegate.database inTransaction:^(FMDatabase *db, BOOL *rollback) {
                 NSString *storyHash = [newStory objectForKey:@"story_hash"];
                 [db executeUpdate:@"UPDATE stories SET story_json = ? WHERE story_hash = ?",
-                 [newStory JSONRepresentation],
+                 [[StoryFirstPageCache publicStory:newStory] JSONRepresentation],
                  storyHash];
                 [db executeUpdate:@"DELETE FROM unread_hashes WHERE story_hash = ?",
                  storyHash];
@@ -650,11 +755,21 @@
     [appDelegate finishMarkAsRead:story];
 }
 
+- (BOOL)isClusterMarkReadEnabledForStory:(NSDictionary *)story {
+    NSArray *clusterStories = [story[@"cluster_stories"] isKindOfClass:[NSArray class]] ? story[@"cluster_stories"] : nil;
+
+    return self.appDelegate.isPremiumArchive &&
+        clusterStories.count > 0 &&
+        [StoryClusterDisplayDecision isClusterMarkReadEnabledWithUserProfile:self.appDelegate.dictUserProfile];
+}
+
 - (void)replaceStory:(NSDictionary *)newStory withId:(NSString *)newStoryIdStr {
     NSMutableArray *newActiveFeedStories = [self.activeFeedStories mutableCopy];
     for (int i = 0; i < [newActiveFeedStories count]; i++) {
-        NSMutableArray *thisStory = [[newActiveFeedStories objectAtIndex:i] mutableCopy];
-        NSString *thisStoryIdStr = [NSString stringWithFormat:@"%@", [thisStory valueForKey:@"story_hash"]];
+        NSDictionary *thisStory = [newActiveFeedStories objectAtIndex:i];
+        id storyHash = [thisStory objectForKey:@"story_hash"];
+        NSString *thisStoryIdStr = [storyHash isKindOfClass:[NSString class]] ?
+            storyHash : [NSString stringWithFormat:@"%@", storyHash];
         if ([newStoryIdStr isEqualToString:thisStoryIdStr]) {
             [newActiveFeedStories replaceObjectAtIndex:i withObject:newStory];
             break;
@@ -665,19 +780,20 @@
 
 - (void)markStoryUnread:(NSDictionary *)story {
     [self markStoryUnread:[story objectForKey:@"story_hash"]
-                   feedId:[story objectForKey:@"story_feed_id"]];
+                   feedId:[story objectForKey:@"story_feed_id"]
+            fallbackStory:story];
 }
 
 - (void)markStoryUnread:(NSString *)storyId feedId:(id)feedId {
+    NSDictionary *retainedStory = [[appDelegate.activeStory objectForKey:@"story_hash"] isEqualToString:storyId] ?
+        appDelegate.activeStory : nil;
+    [self markStoryUnread:storyId feedId:feedId fallbackStory:retainedStory];
+}
+
+- (void)markStoryUnread:(NSString *)storyId feedId:(id)feedId fallbackStory:(NSDictionary *)fallbackStory {
     NSString *feedIdStr = [NSString stringWithFormat:@"%@",feedId];
     NSDictionary *feed = [appDelegate getFeed:feedIdStr];
-    NSDictionary *story = nil;
-    for (NSDictionary *s in self.activeFeedStories) {
-        if ([[s objectForKey:@"story_hash"] isEqualToString:storyId]) {
-            story = s;
-            break;
-        }
-    }
+    NSDictionary *story = [self activeFeedStoryWithHash:storyId] ?: fallbackStory;
     [self markStoryUnread:story feed:feed];
     
     NSArray *otherFriendShares = [story objectForKey:@"shared_by_friends"];
@@ -697,6 +813,9 @@
 }
 
 - (void)markStoryUnread:(NSDictionary *)story feed:(NSDictionary *)feed {
+    NSString *storyHash = [story objectForKey:@"story_hash"];
+    if (!storyHash.length) return;
+    BOOL storyIsInActiveFeed = [self activeFeedStoryWithHash:storyHash] != nil;
     NSString *feedIdStr = [NSString stringWithFormat:@"%@", [feed objectForKey:@"id"]];
     if (!feed) {
         feedIdStr = @"0";
@@ -712,12 +831,14 @@
     
     // make the story as read in self.activeFeedStories
     NSString *newStoryIdStr = [NSString stringWithFormat:@"%@", [newStory valueForKey:@"story_hash"]];
-    [self replaceStory:newStory withId:newStoryIdStr];
+    if (storyIsInActiveFeed) [self replaceStory:newStory withId:newStoryIdStr];
+    if (appDelegate.activeUsername.length) [StoryFirstPageCache.shared recordStory:newStory fields:@[@"read_status"] account:appDelegate.activeUsername host:appDelegate.url];
+
 
     // If not a feed, then don't bother updating local feed.
     if (!feed) return;
     
-    self.visibleUnreadCount += 1;
+    if (storyIsInActiveFeed) self.visibleUnreadCount += 1;
     //    if ([self.recentlyReadFeeds containsObject:[newStory objectForKey:@"story_feed_id"]]) {
     [appDelegate.recentlyReadFeeds removeObject:[newStory objectForKey:@"story_feed_id"]];
     //    }
@@ -743,7 +864,7 @@
             [self.appDelegate.database inTransaction:^(FMDatabase *db, BOOL *rollback) {
                 NSString *storyHash = [newStory objectForKey:@"story_hash"];
                 [db executeUpdate:@"UPDATE stories SET story_json = ? WHERE story_hash = ?",
-                 [newStory JSONRepresentation],
+                 [[StoryFirstPageCache publicStory:newStory] JSONRepresentation],
                  storyHash];
                 [db executeUpdate:@"INSERT INTO unread_hashes "
                  "(story_hash, story_feed_id, story_timestamp) VALUES (?, ?, ?)",
@@ -825,6 +946,8 @@
     // make the story as read in self.activeFeedStories
     NSString *newStoryIdStr = [NSString stringWithFormat:@"%@", [newStory valueForKey:@"story_hash"]];
     [self replaceStory:newStory withId:newStoryIdStr];
+    if (appDelegate.activeUsername.length) [StoryFirstPageCache.shared recordStory:newStory fields:@[@"starred", @"starred_date", @"user_tags"] account:appDelegate.activeUsername host:appDelegate.url];
+
     
     return newStory;
 }

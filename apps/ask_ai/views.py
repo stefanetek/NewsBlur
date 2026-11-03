@@ -1,18 +1,22 @@
+"""Ask AI views: API endpoint for asking AI questions about stories."""
+
 import re
 import uuid
 
 import openai
 from django.conf import settings
+from django.utils.translation import gettext
 from django.views.decorators.http import require_http_methods
 
 from apps.rss_feeds.models import MStory
 from utils import json_functions as json
 from utils import log as logging
+from utils.llm_costs import LLMCostTracker
 from utils.user_functions import ajax_login_required
 from utils.view_functions import required_params
 
 from .prompts import get_prompt
-from .providers import VALID_MODELS
+from .providers import MODEL_ALIASES, VALID_MODELS
 from .tasks import AskAIQuestion
 from .usage import AskAIUsageTracker, TranscriptionUsageTracker
 
@@ -34,7 +38,8 @@ def ask_ai_question(request):
         question_id: ID of the question template (e.g., "sentence", "bullets", "custom")
         custom_question: Optional custom question text (required if question_id is "custom")
         conversation_history: Optional JSON string of conversation history for follow-ups
-        model: Optional model to use (opus, gpt-5.1, gemini-3, grok-4.1). Defaults to server setting.
+        model: Optional model to use (anthropic, openai, google, xai). Defaults to server setting.
+        thinking: Optional "true"/"false" to enable reasoning/thinking mode.
 
     Returns:
         JSON response with request_id and status
@@ -45,17 +50,21 @@ def ask_ai_question(request):
     conversation_history_json = request.POST.get("conversation_history", "")
     request_id = request.POST.get("request_id")
     model = request.POST.get("model", "")
+    thinking = request.POST.get("thinking", "").lower() in ("true", "1", "yes")
 
     # Validate request identifier (optional client-provided UUID)
     if request_id:
         if not REQUEST_ID_RE.match(request_id):
-            return {"code": -1, "message": "Invalid request identifier"}
+            return {"code": -1, "message": gettext("Invalid request identifier")}
     else:
         request_id = str(uuid.uuid4())
 
-    # Validate model (optional, defaults to server setting if not provided)
-    if model and model not in VALID_MODELS:
-        return {"code": -1, "message": f"Invalid model. Valid options: {', '.join(VALID_MODELS)}"}
+    # Validate model (optional, defaults to server setting if not provided).
+    # Older mobile clients still send legacy keys ("opus") — map them to vendor keys.
+    if model:
+        model = MODEL_ALIASES.get(model, model)
+        if model not in VALID_MODELS:
+            return {"code": -1, "message": f"Invalid model. Valid options: {', '.join(VALID_MODELS)}"}
 
     # Parse conversation history if provided
     conversation_history = None
@@ -65,7 +74,7 @@ def ask_ai_question(request):
             if not isinstance(conversation_history, list):
                 raise ValueError("Conversation history must be a list")
         except (json.JSONDecodeError, ValueError, TypeError):
-            return {"code": -1, "message": "Invalid conversation history format"}
+            return {"code": -1, "message": gettext("Invalid conversation history format")}
 
     # Normalize custom question input
     if custom_question:
@@ -82,19 +91,20 @@ def ask_ai_question(request):
     # Validate story exists
     story, _ = MStory.find_story(story_hash=story_hash)
     if not story:
-        return {"code": -1, "message": "Story not found"}
+        return {"code": -1, "message": gettext("Story not found")}
 
     # Validate question id and custom question payload
     if question_id == "custom":
         if not custom_question and not conversation_history:
-            return {"code": -1, "message": "Custom question is required"}
+            return {"code": -1, "message": gettext("Custom question is required")}
         if custom_question and len(custom_question) > MAX_CUSTOM_QUESTION_LENGTH:
             return {
                 "code": -1,
-                "message": f"Custom questions are limited to {MAX_CUSTOM_QUESTION_LENGTH} characters",
+                "message": gettext("Custom questions are limited to %(limit)d characters")
+                % {"limit": MAX_CUSTOM_QUESTION_LENGTH},
             }
     elif not get_prompt(question_id):
-        return {"code": -1, "message": "Unknown Ask AI question"}
+        return {"code": -1, "message": gettext("Unknown Ask AI question")}
 
     # Queue Celery task
     AskAIQuestion.apply_async(
@@ -106,13 +116,14 @@ def ask_ai_question(request):
             "conversation_history": conversation_history,
             "request_id": request_id,
             "model": model if model else None,
+            "thinking": thinking,
         },
         queue="work_queue",
     )
 
     return {
         "code": 1,
-        "message": "Processing question",
+        "message": gettext("Processing question"),
         "request_id": request_id,
         "story_hash": story_hash,
         "question_id": question_id,
@@ -133,7 +144,7 @@ def transcribe_audio(request):
         JSON response with transcribed text
     """
     if "audio" not in request.FILES:
-        return {"code": -1, "message": "No audio file provided"}
+        return {"code": -1, "message": gettext("No audio file provided")}
 
     audio_file = request.FILES["audio"]
 
@@ -152,8 +163,10 @@ def transcribe_audio(request):
         return {"code": -1, "message": limit_message}
 
     # Check OpenAI API key is configured
-    if not settings.OPENAI_API_KEY:
-        return {"code": -1, "message": "OpenAI API key not configured"}
+    from apps.ask_ai.providers import OpenAIProvider
+
+    if not OpenAIProvider().is_configured():
+        return {"code": -1, "message": gettext("OpenAI API key not configured")}
 
     try:
         client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
@@ -182,6 +195,14 @@ def transcribe_audio(request):
             duration_seconds=estimated_duration,
             story_hash=request.POST.get("story_hash", ""),
             request_id=request.POST.get("request_id", ""),
+        )
+
+        # Record LLM cost for transcription
+        LLMCostTracker.record_transcription(
+            duration_seconds=estimated_duration,
+            user_id=request.user.pk,
+            request_id=request.POST.get("request_id", ""),
+            metadata={"file_size": audio_file.size, "file_name": audio_file.name},
         )
 
         logging.user(

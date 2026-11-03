@@ -1,0 +1,2471 @@
+package com.newsblur.compose
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.ArrowForward
+import androidx.compose.material.icons.automirrored.rounded.Article
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.rounded.ListAlt
+import androidx.compose.material.icons.automirrored.rounded.MenuBook
+import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
+import androidx.compose.material.icons.automirrored.rounded.ShortText
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
+import androidx.compose.material.icons.rounded.Apps
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Contrast
+import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.FilterList
+import androidx.compose.material.icons.rounded.FormatColorFill
+import androidx.compose.material.icons.rounded.Forum
+import androidx.compose.material.icons.rounded.Gesture
+import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.Headphones
+import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.LightMode
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.OpenInBrowser
+import androidx.compose.material.icons.rounded.PanTool
+import androidx.compose.material.icons.rounded.Photo
+import androidx.compose.material.icons.rounded.Psychology
+import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.RecordVoiceOver
+import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.SmartButton
+import androidx.compose.material.icons.rounded.SortByAlpha
+import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.SwapVert
+import androidx.compose.material.icons.rounded.SwipeRightAlt
+import androidx.compose.material.icons.rounded.TextFields
+import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.TouchApp
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Wifi
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.newsblur.R
+import com.newsblur.listen.ListenSpeed
+import com.newsblur.listen.formatListenSpeed
+import com.newsblur.preference.ListenDelivery
+import com.newsblur.preference.ListenPrefKeys
+import com.newsblur.preference.ListenSettings
+import com.newsblur.preference.PrefsRepo
+import com.newsblur.util.AppIconAppearanceMode
+import com.newsblur.util.AppIconFlavor
+import com.newsblur.util.AppIconManager
+import com.newsblur.util.AppIconOption
+import com.newsblur.util.DefaultBrowser
+import com.newsblur.util.FeedListOrder
+import com.newsblur.util.GestureAction
+import com.newsblur.util.GestureChoices
+import com.newsblur.util.LanguageSettings
+import com.newsblur.util.MarkAllReadConfirmation
+import com.newsblur.util.MarkStoryReadBehavior
+import com.newsblur.util.PrefConstants
+import com.newsblur.util.PrefConstants.ThemeValue
+import com.newsblur.util.ReadFilter
+import com.newsblur.util.StoryButton
+import com.newsblur.util.StoryClusterDisplayDecision
+import com.newsblur.util.StoryContentPreviewStyle
+import com.newsblur.util.StoryOrder
+import com.newsblur.util.ThumbnailStyle
+import com.newsblur.util.VolumeKeyNavigation
+import kotlin.math.abs
+
+
+@Immutable
+data class SettingsUiState(
+    val theme: ThemeValue = ThemeValue.AUTO,
+    val enableOffline: Boolean = false,
+    val enableImagePrefetch: Boolean = false,
+    val networkSelect: String = PrefConstants.NETWORK_SELECT_NOMONONME,
+    val keepOldStories: Boolean = false,
+    val cacheAgeSelect: String = PrefConstants.CACHE_AGE_SELECT_30D,
+    val feedListOrder: String = FeedListOrder.ALPHABETICAL.name,
+    val enableRowGlobalShared: Boolean = true,
+    val enableRowInfrequentStories: Boolean = true,
+    val enableRowDailyBriefing: Boolean = true,
+    val enableRowWidelyReadStories: Boolean = true,
+    val enableRowLongReads: Boolean = true,
+    val enableRowGoodReads: Boolean = true,
+    val defaultStoryOrder: String = StoryOrder.NEWEST.name,
+    val defaultReadFilter: String = ReadFilter.ALL.name,
+    val markAllReadConfirmation: String = MarkAllReadConfirmation.FOLDER_ONLY.name,
+    val confirmMarkRangeRead: Boolean = false,
+    val loadNextOnMarkRead: Boolean = false,
+    val autoOpenFirstUnread: Boolean = false,
+    val storyClusteringEnabled: Boolean = true,
+    val clusterMode: String = StoryClusterDisplayDecision.CLUSTER_MODE_RELATED,
+    val isArchive: Boolean = false,
+    val clusterMarkReadEnabled: Boolean = false,
+    val clusterMarkReadSaving: Boolean = false,
+    val storyContentPreviewStyle: String = StoryContentPreviewStyle.MEDIUM.name,
+    val thumbnailStyle: String = ThumbnailStyle.RIGHT_LARGE.name,
+    val storyToolbarPosition: String = "bottom",
+    val markStoryReadBehavior: String = MarkStoryReadBehavior.IMMEDIATELY.name,
+    val defaultBrowser: String = DefaultBrowser.SYSTEM_DEFAULT.name,
+    val readingFont: String = "DEFAULT",
+    val readerControlsAlwaysVisible: Boolean = false,
+    val volumeKeyNavigation: String = VolumeKeyNavigation.OFF.name,
+    val showPublicComments: Boolean = true,
+    val ltrGestureAction: String = GestureAction.GEST_ACTION_BACK.name,
+    val rtlGestureAction: String = GestureAction.GEST_ACTION_TOGGLE_READ.name,
+    val feedSwipesEnabled: Boolean = true,
+    val storySwipesEnabled: Boolean = true,
+    val feedSwipeLeft: String = GestureAction.GEST_ACTION_MARKREAD.name,
+    val feedSwipeRight: String = GestureAction.GEST_ACTION_NOTIFICATIONS.name,
+    val feedLongPress: String = GestureAction.GEST_ACTION_MENU.name,
+    val storyLongPress: String = GestureAction.GEST_ACTION_MENU.name,
+    val doubleTapStory: String = "original",
+    val twoFingerDoubleTapStory: String = "text",
+    val readerEdgeAction: String = "back",
+    val enableNotifications: Boolean = false,
+    val showAskAi: Boolean = true,
+    val showTrainButton: Boolean = true,
+    val showSaveButton: Boolean = true,
+    val showShareButton: Boolean = true,
+    val showListenButton: Boolean = true,
+    val listenDelivery: String = ListenDelivery.NATURAL.value,
+    val listenSpeed: Double = ListenSettings.DEFAULT_SPEED,
+    val listenAutoContinue: Boolean = true,
+    val listenHighlight: Boolean = true,
+    val hasSubscription: Boolean = false,
+    val appIconFlavorId: String = AppIconManager.defaultFlavor.id,
+    val appIconAppearanceMode: AppIconAppearanceMode = AppIconAppearanceMode.AUTO,
+)
+
+fun buildSettingsUiState(
+    context: Context,
+    prefsRepo: PrefsRepo,
+    sharedPreferences: SharedPreferences,
+): SettingsUiState {
+    val appIconSelection = AppIconManager.currentSelection(context)
+    return SettingsUiState(
+        theme = prefsRepo.getSelectedTheme(),
+        enableOffline = prefsRepo.isOfflineEnabled(),
+        enableImagePrefetch = prefsRepo.isImagePrefetchEnabled(),
+        networkSelect =
+            sharedPreferences.getString(
+                PrefConstants.NETWORK_SELECT,
+                PrefConstants.NETWORK_SELECT_NOMONONME,
+            ) ?: PrefConstants.NETWORK_SELECT_NOMONONME,
+        keepOldStories = prefsRepo.isKeepOldStories(),
+        cacheAgeSelect =
+            sharedPreferences.getString(
+                PrefConstants.CACHE_AGE_SELECT,
+                PrefConstants.CACHE_AGE_SELECT_30D,
+            ) ?: PrefConstants.CACHE_AGE_SELECT_30D,
+        feedListOrder = prefsRepo.getFeedListOrder().name,
+        enableRowGlobalShared = prefsRepo.isEnableRowGlobalShared(),
+        enableRowInfrequentStories = prefsRepo.isEnableRowInfrequent(),
+        enableRowDailyBriefing = prefsRepo.isEnableRowDailyBriefing(),
+        enableRowWidelyReadStories = prefsRepo.isEnableRowWidelyReadStories(),
+        enableRowLongReads = prefsRepo.isEnableRowLongReads(),
+        enableRowGoodReads = prefsRepo.isEnableRowGoodReads(),
+        defaultStoryOrder = prefsRepo.getDefaultStoryOrder().name,
+        defaultReadFilter =
+            sharedPreferences.getString(
+                PrefConstants.DEFAULT_READ_FILTER,
+                ReadFilter.ALL.name,
+            ) ?: ReadFilter.ALL.name,
+        markAllReadConfirmation = prefsRepo.getMarkAllReadConfirmation().name,
+        confirmMarkRangeRead = prefsRepo.isConfirmMarkRangeRead(),
+        loadNextOnMarkRead = prefsRepo.loadNextOnMarkRead(),
+        autoOpenFirstUnread = prefsRepo.isAutoOpenFirstUnread(),
+        storyClusteringEnabled = StoryClusterDisplayDecision.isStoryClusteringEnabled(prefsRepo),
+        clusterMode = StoryClusterDisplayDecision.clusterMode(prefsRepo),
+        isArchive = prefsRepo.getIsArchive(),
+        clusterMarkReadEnabled = prefsRepo.isClusterMarkReadEnabled(),
+        storyContentPreviewStyle = prefsRepo.getStoryContentPreviewStyle().name,
+        thumbnailStyle = prefsRepo.getThumbnailStyle().name,
+        storyToolbarPosition = if (prefsRepo.isStoryToolbarAtBottom()) "bottom" else "top",
+        markStoryReadBehavior = prefsRepo.getMarkStoryReadBehavior().name,
+        defaultBrowser = prefsRepo.getDefaultBrowser().name,
+        readingFont = prefsRepo.getFontString(),
+        readerControlsAlwaysVisible = prefsRepo.isReaderControlsAlwaysVisible(),
+        volumeKeyNavigation = prefsRepo.getVolumeKeyNavigation().name,
+        showPublicComments = prefsRepo.showPublicComments(),
+        ltrGestureAction = prefsRepo.getLeftToRightGestureAction().name,
+        rtlGestureAction = prefsRepo.getRightToLeftGestureAction().name,
+        feedSwipesEnabled = prefsRepo.isFeedSwipesEnabled(),
+        storySwipesEnabled = prefsRepo.isStorySwipesEnabled(),
+        feedSwipeLeft = prefsRepo.getFeedSwipeAction(false).name,
+        feedSwipeRight = prefsRepo.getFeedSwipeAction(true).name,
+        feedLongPress = prefsRepo.getFeedLongPressAction().name,
+        storyLongPress = prefsRepo.getStoryLongPressAction().name,
+        doubleTapStory = prefsRepo.getReaderGesture("reader_double_tap", "original"),
+        twoFingerDoubleTapStory = prefsRepo.getReaderGesture("reader_two_finger_double_tap", "text"),
+        readerEdgeAction = prefsRepo.getReaderGesture("reader_left_edge", "back"),
+        enableNotifications = prefsRepo.isEnableNotifications(),
+        showAskAi = prefsRepo.isShowAskAi(),
+        showTrainButton = prefsRepo.isShowStoryButton(StoryButton.TRAIN),
+        showSaveButton = prefsRepo.isShowStoryButton(StoryButton.SAVE),
+        showShareButton = prefsRepo.isShowStoryButton(StoryButton.SHARE),
+        showListenButton = prefsRepo.isShowStoryButton(StoryButton.LISTEN),
+        listenDelivery = ListenDelivery.fromValue(sharedPreferences.getString(ListenPrefKeys.DELIVERY, null)).value,
+        listenSpeed = sharedPreferences.getFloat(ListenPrefKeys.SPEED, ListenSettings.DEFAULT_SPEED.toFloat()).toDouble(),
+        listenAutoContinue = sharedPreferences.getBoolean(ListenPrefKeys.AUTO_CONTINUE, true),
+        listenHighlight = sharedPreferences.getBoolean(ListenPrefKeys.HIGHLIGHT, true),
+        hasSubscription = prefsRepo.hasSubscription(),
+        appIconFlavorId = appIconSelection.flavor.id,
+        appIconAppearanceMode = appIconSelection.mode,
+    )
+}
+
+@Composable
+fun SettingsScreen(
+    onLanguageSelected: (String) -> Unit = {},
+    state: SettingsUiState,
+    onBooleanChanged: (String, Boolean) -> Unit,
+    onStringChanged: (String, String) -> Unit,
+    onStoryClusteringEnabledChanged: (Boolean) -> Unit,
+    onClusterModeChanged: (String) -> Unit,
+    onAppIconSelected: (AppIconFlavor, AppIconAppearanceMode) -> Unit,
+    onAppIconUpgrade: () -> Unit,
+    onDeleteOfflineStories: () -> Unit,
+    onListenVoices: () -> Unit = {},
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val palette = settingsPalette(state.theme)
+    var dialogState by remember { mutableStateOf<ChoiceDialogState?>(null) }
+    var showAppIconChooser by remember { mutableStateOf(false) }
+    val selectedAppIconFlavor = AppIconManager.flavorById(state.appIconFlavorId)
+    // The launcher icon's "Use both" mode follows the device's system dark setting.
+    val appIconSystemDark = isSystemInDarkTheme()
+
+    val networkOptions =
+        listOf(
+            ChoiceOption(PrefConstants.NETWORK_SELECT_ANY, stringResource(R.string.menu_network_select_opt_any)),
+            ChoiceOption(PrefConstants.NETWORK_SELECT_NOMO, stringResource(R.string.menu_network_select_opt_nomo)),
+            ChoiceOption(PrefConstants.NETWORK_SELECT_NOMONONME, stringResource(R.string.menu_network_select_opt_nomononme)),
+        )
+    val cacheAgeOptions =
+        listOf(
+            ChoiceOption(PrefConstants.CACHE_AGE_SELECT_2D, stringResource(R.string.menu_cache_age_select_opt_2d)),
+            ChoiceOption(PrefConstants.CACHE_AGE_SELECT_7D, stringResource(R.string.menu_cache_age_select_opt_7d)),
+            ChoiceOption(PrefConstants.CACHE_AGE_SELECT_14D, stringResource(R.string.menu_cache_age_select_opt_14d)),
+            ChoiceOption(PrefConstants.CACHE_AGE_SELECT_30D, stringResource(R.string.menu_cache_age_select_opt_30d)),
+        )
+    val feedListOrderOptions =
+        listOf(
+            ChoiceOption(FeedListOrder.ALPHABETICAL.name, stringResource(R.string.alphabetical)),
+            ChoiceOption(FeedListOrder.MOST_USED_AT_TOP.name, stringResource(R.string.most_used_at_top)),
+        )
+    val storyOrderOptions =
+        listOf(
+            ChoiceOption(StoryOrder.NEWEST.name, stringResource(R.string.newest), stringResource(R.string.newest)),
+            ChoiceOption(StoryOrder.OLDEST.name, stringResource(R.string.oldest), stringResource(R.string.oldest)),
+        )
+    val readFilterOptions =
+        listOf(
+            ChoiceOption(ReadFilter.ALL.name, stringResource(R.string.all_stories), stringResource(R.string.all_stories)),
+            ChoiceOption(ReadFilter.UNREAD.name, stringResource(R.string.unread_only), stringResource(R.string.unread_only)),
+        )
+    val confirmMarkReadOptions =
+        listOf(
+            ChoiceOption(
+                MarkAllReadConfirmation.FEED_AND_FOLDER.name,
+                stringResource(R.string.feed_and_folder),
+                stringResource(R.string.settings_confirm_mark_all_read_segment_both),
+            ),
+            ChoiceOption(
+                MarkAllReadConfirmation.FOLDER_ONLY.name,
+                stringResource(R.string.folder_only),
+                stringResource(R.string.settings_confirm_mark_all_read_segment_folders),
+            ),
+            ChoiceOption(
+                MarkAllReadConfirmation.NONE.name,
+                stringResource(R.string.none),
+                stringResource(R.string.settings_confirm_mark_all_read_segment_never),
+            ),
+        )
+    val afterMarkReadOptions =
+        listOf(
+            ChoiceOption(
+                "next",
+                stringResource(R.string.settings_after_mark_read_next),
+                stringResource(R.string.settings_after_mark_read_next),
+            ),
+            ChoiceOption(
+                "stay",
+                stringResource(R.string.settings_after_mark_read_stay),
+                stringResource(R.string.settings_after_mark_read_stay),
+            ),
+        )
+    val siteOpeningOptions =
+        listOf(
+            ChoiceOption(
+                "stories",
+                stringResource(R.string.settings_when_opening_site_stories),
+                stringResource(R.string.settings_when_opening_site_stories),
+            ),
+            ChoiceOption(
+                "first_story",
+                stringResource(R.string.settings_when_opening_site_first_story),
+                stringResource(R.string.settings_when_opening_site_first_story),
+            ),
+        )
+    val markStoryReadOptions =
+        MarkStoryReadBehavior.options(MarkStoryReadBehavior.entries.firstOrNull { it.name == state.markStoryReadBehavior }).map {
+            ChoiceOption(it.name, stringResource(it.labelRes))
+        }
+    val contentPreviewOptions =
+        listOf(
+            ChoiceOption(
+                StoryContentPreviewStyle.NONE.name,
+                stringResource(R.string.story_content_preview_none),
+                stringResource(R.string.story_content_preview_none),
+            ),
+            ChoiceOption(
+                StoryContentPreviewStyle.SMALL.name,
+                stringResource(R.string.story_content_preview_small),
+                stringResource(R.string.story_content_preview_small),
+            ),
+            ChoiceOption(
+                StoryContentPreviewStyle.MEDIUM.name,
+                stringResource(R.string.story_content_preview_medium),
+                stringResource(R.string.story_content_preview_medium),
+            ),
+            ChoiceOption(
+                StoryContentPreviewStyle.LARGE.name,
+                stringResource(R.string.story_content_preview_large),
+                stringResource(R.string.story_content_preview_large),
+            ),
+        )
+    val thumbnailOptions =
+        listOf(
+            ChoiceOption(
+                ThumbnailStyle.OFF.name,
+                stringResource(R.string.story_thumbnail_no_image_preview),
+                stringResource(R.string.settings_preview_images_segment_off),
+            ),
+            ChoiceOption(
+                ThumbnailStyle.LEFT_SMALL.name,
+                stringResource(R.string.story_thumbnail_left_hand_small),
+                stringResource(R.string.settings_preview_images_segment_left_small),
+            ),
+            ChoiceOption(
+                ThumbnailStyle.LEFT_LARGE.name,
+                stringResource(R.string.story_thumbnail_left_hand_large),
+                stringResource(R.string.settings_preview_images_segment_left_large),
+            ),
+            ChoiceOption(
+                ThumbnailStyle.RIGHT_SMALL.name,
+                stringResource(R.string.story_thumbnail_right_hand_small),
+                stringResource(R.string.settings_preview_images_segment_right_small),
+            ),
+            ChoiceOption(
+                ThumbnailStyle.RIGHT_LARGE.name,
+                stringResource(R.string.story_thumbnail_right_hand_large),
+                stringResource(R.string.settings_preview_images_segment_right_large),
+            ),
+        )
+    val browserOptions =
+        listOf(
+            ChoiceOption(DefaultBrowser.SYSTEM_DEFAULT.name, "System default"),
+            ChoiceOption(DefaultBrowser.IN_APP_BROWSER.name, "In-app browser"),
+            ChoiceOption(DefaultBrowser.CHROME.name, "Chrome"),
+            ChoiceOption(DefaultBrowser.FIREFOX.name, "Firefox"),
+            ChoiceOption(DefaultBrowser.OPERA_MINI.name, "Opera Mini"),
+        )
+    val fontOptions =
+        listOf(
+            ChoiceOption("ANONYMOUS_PRO", stringResource(R.string.anonymous_pro_font)),
+            ChoiceOption("CHRONICLE", stringResource(R.string.chronicle_font)),
+            ChoiceOption("DEFAULT", stringResource(R.string.default_font)),
+            ChoiceOption("GOTHAM_NARROW", stringResource(R.string.gotham_narrow_font)),
+            ChoiceOption("NOTO_SANS", stringResource(R.string.noto_sans_font)),
+            ChoiceOption("NOTO_SERIF", stringResource(R.string.noto_serif_font)),
+            ChoiceOption("OPEN_SANS_CONDENSED", stringResource(R.string.open_sans_condensed_font)),
+            ChoiceOption("ROBOTO", stringResource(R.string.roboto_font)),
+        )
+    val volumeKeyOptions =
+        listOf(
+            ChoiceOption(VolumeKeyNavigation.OFF.name, stringResource(R.string.off), stringResource(R.string.off)),
+            ChoiceOption(VolumeKeyNavigation.UP_NEXT.name, stringResource(R.string.volume_up_next), "Up"),
+            ChoiceOption(VolumeKeyNavigation.DOWN_NEXT.name, stringResource(R.string.volume_down_next), "Down"),
+        )
+
+    fun gestureOptions(vararg actions: GestureAction) =
+        actions.map {
+            ChoiceOption(
+                it.name,
+                com.newsblur.util.GestureLabels
+                    .title(context, it),
+            )
+        }
+    val storySwipeOptions =
+        gestureOptions(
+            GestureAction.GEST_ACTION_BACK,
+            GestureAction.GEST_ACTION_TOGGLE_READ,
+            GestureAction.GEST_ACTION_TOGGLE_SAVE,
+            GestureAction.GEST_ACTION_SHARE,
+            GestureAction.GEST_ACTION_MENU,
+            GestureAction.GEST_ACTION_NONE,
+            GestureAction.GEST_ACTION_MARKREAD,
+            GestureAction.GEST_ACTION_MARKUNREAD,
+            GestureAction.GEST_ACTION_SAVE,
+            GestureAction.GEST_ACTION_UNSAVE,
+            GestureAction.GEST_ACTION_STATISTICS,
+            GestureAction.GEST_ACTION_LISTEN,
+        )
+    val storyLongPressOptions = gestureOptions(*GestureChoices.storyLongPress.toTypedArray())
+    val feedSwipeOptions =
+        gestureOptions(
+            GestureAction.GEST_ACTION_MARKREAD,
+            GestureAction.GEST_ACTION_TRAIN,
+            GestureAction.GEST_ACTION_NOTIFICATIONS,
+            GestureAction.GEST_ACTION_STATISTICS,
+            GestureAction.GEST_ACTION_NONE,
+        ).map {
+            if (it.value ==
+                GestureAction.GEST_ACTION_MARKREAD.name
+            ) {
+                ChoiceOption(it.value, stringResource(R.string.gesture_mark_all))
+            } else {
+                it
+            }
+        }
+    val feedLongPressOptions =
+        gestureOptions(
+            GestureAction.GEST_ACTION_READ_RANGE,
+            GestureAction.GEST_ACTION_MARKREAD,
+            GestureAction.GEST_ACTION_MENU,
+            GestureAction.GEST_ACTION_NONE,
+        )
+    val readerTapOptions =
+        listOf(
+            ChoiceOption("original", stringResource(R.string.gesture_original)),
+            ChoiceOption("text", stringResource(R.string.gesture_text)),
+            ChoiceOption("unread", stringResource(R.string.gesture_unread)),
+            ChoiceOption("save", stringResource(R.string.gesture_save)),
+            ChoiceOption("listen", stringResource(R.string.gesture_listen)),
+            ChoiceOption("none", stringResource(R.string.gesture_none)),
+        )
+    val confirmMarkReadTitle = stringResource(R.string.settings_confirm_mark_all_read).stripTrailingEllipsis()
+    val markStoryReadTitle = stringResource(R.string.settings_mark_story_read_title)
+    val previewImagesTitle = stringResource(R.string.settings_preview_images_title)
+    val defaultBrowserTitle = stringResource(R.string.default_browser).stripTrailingEllipsis()
+    val listenSpeedTitle = stringResource(R.string.settings_listen_speed)
+    // SettingsScreen.kt offers the presets, plus a custom rate set from the player so it still reads as chosen.
+    val listenSpeedOptions =
+        (ListenSpeed.PRESETS + ListenSpeed.clamp(state.listenSpeed))
+            .distinctBy(ListenSpeed::prefString)
+            .sorted()
+            .map { ChoiceOption(ListenSpeed.prefString(it), formatListenSpeed(it)) }
+    val listenDeliveryOptions =
+        (ListenDelivery.presets + if (state.listenDelivery == ListenDelivery.CUSTOM.value) listOf(ListenDelivery.CUSTOM) else emptyList())
+            .map { delivery ->
+                ChoiceOption(
+                    delivery.value,
+                    stringResource(
+                        when (delivery) {
+                            ListenDelivery.STEADY -> R.string.listen_delivery_steady
+                            ListenDelivery.NATURAL -> R.string.listen_delivery_natural
+                            ListenDelivery.EXPRESSIVE -> R.string.listen_delivery_expressive
+                            ListenDelivery.CUSTOM -> R.string.listen_delivery_custom
+                        },
+                    ),
+                )
+            }
+    val fontTitle = stringResource(R.string.font).stripTrailingEllipsis()
+    val networkTitle = stringResource(R.string.menu_network_select).stripTrailingEllipsis()
+    val cacheAgeTitle = stringResource(R.string.menu_cache_age_select).stripTrailingEllipsis()
+    val clusterMatchesTitle = stringResource(R.string.settings_cluster_matches)
+    val clusterMatchesSummary = stringResource(R.string.settings_cluster_matches_summary)
+    val clusterModeOptions =
+        listOf(
+            ChoiceOption(
+                StoryClusterDisplayDecision.CLUSTER_MODE_TITLE,
+                stringResource(R.string.settings_cluster_mode_title_match_only),
+            ),
+            ChoiceOption(
+                StoryClusterDisplayDecision.CLUSTER_MODE_RELATED,
+                stringResource(R.string.settings_cluster_mode_title_match_plus_related),
+            ),
+        )
+
+    Column(
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(palette.background)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 18.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        SettingsSection(
+            title = stringResource(R.string.settings_cat_general),
+            icon = Icons.Rounded.Tune,
+            iconColor = NewsblurBlue,
+            palette = palette,
+        ) {
+            val languageTitle = stringResource(R.string.language_title)
+            val automatic = remember(context) { LanguageSettings.automaticLabel(context) }
+            val selected = LanguageSettings.selected(context)
+            val options = LanguageSettings.options(automatic).map { (code, name) -> ChoiceOption(code, name) }
+            ValueSettingsRow(
+                title = languageTitle,
+                icon = Icons.Rounded.Public,
+                iconColor = NewsblurBlue,
+                currentValue = options.labelFor(selected),
+                palette = palette,
+                onClick = {
+                    dialogState = ChoiceDialogState(languageTitle, selected, options, onSelect = onLanguageSelected)
+                },
+            )
+        }
+        SettingsSection(
+            title = stringResource(R.string.settings_cat_story_list),
+            icon = Icons.AutoMirrored.Rounded.ListAlt,
+            iconColor = NewsblurBlue,
+            palette = palette,
+        ) {
+            SegmentedSettingsRow(
+                title = stringResource(R.string.menu_story_order),
+                icon = Icons.Rounded.SwapVert,
+                iconColor = NewsblurBlue,
+                selectedValue = state.defaultStoryOrder,
+                options = storyOrderOptions,
+                palette = palette,
+                onSelected = { onStringChanged(PrefConstants.DEFAULT_STORY_ORDER, it) },
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = stringResource(R.string.settings_read_filter_title),
+                icon = Icons.Rounded.FilterList,
+                iconColor = NewsblurOrange,
+                selectedValue = state.defaultReadFilter,
+                options = readFilterOptions,
+                palette = palette,
+                onSelected = { onStringChanged(PrefConstants.DEFAULT_READ_FILTER, it) },
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = confirmMarkReadTitle,
+                icon = Icons.Rounded.CheckCircle,
+                iconColor = NewsblurGreen,
+                selectedValue = state.markAllReadConfirmation,
+                options = confirmMarkReadOptions,
+                palette = palette,
+                footer = stringResource(R.string.settings_confirm_mark_all_read_note),
+                onSelected = { onStringChanged(PrefConstants.MARK_ALL_READ_CONFIRMATION, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_confirm_mark_range_read),
+                icon = Icons.Rounded.CheckCircle,
+                iconColor = NewsblurGreen,
+                checked = state.confirmMarkRangeRead,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.MARK_RANGE_READ_CONFIRMATION, it) },
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = stringResource(R.string.settings_after_mark_read_title),
+                icon = Icons.AutoMirrored.Rounded.ArrowForward,
+                iconColor = NewsblurTeal,
+                selectedValue = if (state.loadNextOnMarkRead) "next" else "stay",
+                options = afterMarkReadOptions,
+                palette = palette,
+                onSelected = { onBooleanChanged(PrefConstants.LOAD_NEXT_ON_MARK_READ, it == "next") },
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = stringResource(R.string.settings_when_opening_site_title),
+                icon = Icons.AutoMirrored.Rounded.Article,
+                iconColor = NewsblurIndigo,
+                selectedValue = if (state.autoOpenFirstUnread) "first_story" else "stories",
+                options = siteOpeningOptions,
+                palette = palette,
+                onSelected = { onBooleanChanged(PrefConstants.STORIES_AUTO_OPEN_FIRST, it == "first_story") },
+            )
+            RowDivider(palette)
+            ValueSettingsRow(
+                title = markStoryReadTitle,
+                icon = Icons.Rounded.Timer,
+                iconColor = NewsblurCyan,
+                currentValue = markStoryReadOptions.labelFor(state.markStoryReadBehavior),
+                palette = palette,
+                onClick = {
+                    dialogState =
+                        ChoiceDialogState(
+                            title = markStoryReadTitle,
+                            selectedValue = state.markStoryReadBehavior,
+                            options = markStoryReadOptions,
+                            onSelect = { onStringChanged(PrefConstants.STORY_MARK_READ_BEHAVIOR, it) },
+                        )
+                },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_story_clustering),
+                icon = Icons.AutoMirrored.Rounded.Article,
+                iconColor = NewsblurIndigo,
+                checked = state.storyClusteringEnabled,
+                subtitle = stringResource(R.string.settings_story_clustering_summary),
+                palette = palette,
+                supportingContent = {
+                    ClusterSettingStateSummary(
+                        isEnabled = state.storyClusteringEnabled,
+                        clusterMode = state.clusterMode,
+                        palette = palette,
+                    )
+                },
+                onCheckedChange = onStoryClusteringEnabledChanged,
+            )
+            if (state.storyClusteringEnabled) {
+                RowDivider(palette)
+                ClusterModeSettingsRow(
+                    title = clusterMatchesTitle,
+                    icon = Icons.Rounded.FilterList,
+                    iconColor = NewsblurGreen,
+                    clusterMode = state.clusterMode,
+                    subtitle = clusterMatchesSummary,
+                    palette = palette,
+                    onClick = {
+                        dialogState =
+                            ChoiceDialogState(
+                                title = clusterMatchesTitle,
+                                selectedValue = state.clusterMode,
+                                options = clusterModeOptions,
+                                showClusterModePreview = true,
+                                onSelect = onClusterModeChanged,
+                            )
+                    },
+                )
+                if (state.isArchive) {
+                    RowDivider(palette)
+                    val matchesOnly = state.clusterMode == StoryClusterDisplayDecision.CLUSTER_MODE_TITLE
+                    ToggleSettingsRow(
+                        title = stringResource(if (matchesOnly) R.string.settings_cluster_mark_read_matches else R.string.settings_cluster_mark_read_related),
+                        icon = Icons.Rounded.CheckCircle,
+                        iconColor = NewsblurGreen,
+                        checked = state.clusterMarkReadEnabled,
+                        enabled = !state.clusterMarkReadSaving,
+                        subtitle = stringResource(if (matchesOnly) R.string.settings_cluster_mark_read_matches_summary else R.string.settings_cluster_mark_read_related_summary),
+                        palette = palette,
+                        onCheckedChange = { onBooleanChanged(PrefConstants.CLUSTER_MARK_READ, it) },
+                    )
+                }
+            }
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_cat_story_layout),
+            icon = Icons.Rounded.Tune,
+            iconColor = NewsblurPurple,
+            palette = palette,
+        ) {
+            SegmentedSettingsRow(
+                title = stringResource(R.string.settings_story_toolbar_position),
+                icon = Icons.Rounded.Tune,
+                iconColor = NewsblurBlue,
+                selectedValue = state.storyToolbarPosition,
+                options = listOf(ChoiceOption("top", stringResource(R.string.settings_story_toolbar_top)), ChoiceOption("bottom", stringResource(R.string.settings_story_toolbar_bottom))),
+                palette = palette,
+                onSelected = { onStringChanged(PrefConstants.STORY_TOOLBAR_POSITION, it) },
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = stringResource(R.string.settings_content_preview).stripTrailingEllipsis(),
+                icon = Icons.AutoMirrored.Rounded.ShortText,
+                iconColor = NewsblurOrange,
+                selectedValue = state.storyContentPreviewStyle,
+                options = contentPreviewOptions,
+                palette = palette,
+                onSelected = { onStringChanged(PrefConstants.STORIES_SHOW_PREVIEWS_STYLE, it) },
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = previewImagesTitle,
+                icon = Icons.Rounded.Photo,
+                iconColor = NewsblurGreen,
+                selectedValue = state.thumbnailStyle,
+                options = thumbnailOptions,
+                palette = palette,
+                onSelected = { onStringChanged(PrefConstants.STORIES_THUMBNAIL_STYLE, it) },
+            )
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_app_icon),
+            icon = Icons.Rounded.Apps,
+            iconColor = NewsblurGreen,
+            palette = palette,
+        ) {
+            AppIconSettingsRow(
+                selectedFlavor = selectedAppIconFlavor,
+                appearanceMode = state.appIconAppearanceMode,
+                isSystemDark = appIconSystemDark,
+                hasSubscription = state.hasSubscription,
+                palette = palette,
+                onClick = {
+                    if (state.hasSubscription) {
+                        showAppIconChooser = true
+                    } else {
+                        onAppIconUpgrade()
+                    }
+                },
+            )
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_cat_feed_list),
+            icon = Icons.Rounded.SortByAlpha,
+            iconColor = NewsblurOrange,
+            palette = palette,
+        ) {
+            SegmentedSettingsRow(
+                title = stringResource(R.string.setting_feed_list_order).stripTrailingEllipsis(),
+                icon = Icons.Rounded.SortByAlpha,
+                iconColor = NewsblurOrange,
+                selectedValue = state.feedListOrder,
+                options = feedListOrderOptions,
+                palette = palette,
+                onSelected = { onStringChanged(PrefConstants.FEED_LIST_ORDER, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_row_global_shared),
+                icon = Icons.Rounded.Public,
+                iconColor = NewsblurPurple,
+                checked = state.enableRowGlobalShared,
+                subtitle = stringResource(R.string.settings_enable_row_global_shared_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_ROW_GLOBAL_SHARED, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_row_infrequent_stories),
+                icon = Icons.Rounded.Schedule,
+                iconColor = NewsblurTeal,
+                checked = state.enableRowInfrequentStories,
+                subtitle = stringResource(R.string.settings_enable_row_infrequent_stories_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_ROW_INFREQUENT_STORIES, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_row_daily_briefing),
+                icon = Icons.Rounded.AutoAwesome,
+                iconColor = NewsblurOrange,
+                checked = state.enableRowDailyBriefing,
+                subtitle = stringResource(R.string.settings_enable_row_daily_briefing_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_ROW_DAILY_BRIEFING, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_row_widely_read_stories),
+                icon = Icons.Rounded.AutoAwesome,
+                iconColor = NewsblurOrange,
+                checked = state.enableRowWidelyReadStories,
+                subtitle = stringResource(R.string.settings_enable_row_widely_read_stories_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_ROW_WIDELY_READ_STORIES, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_row_long_reads),
+                icon = Icons.Rounded.DarkMode,
+                iconColor = NewsblurPurple,
+                checked = state.enableRowLongReads,
+                subtitle = stringResource(R.string.settings_enable_row_long_reads_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_ROW_LONG_READS, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_row_good_reads),
+                icon = Icons.Rounded.Star,
+                iconColor = NewsblurGreen,
+                checked = state.enableRowGoodReads,
+                subtitle = stringResource(R.string.settings_enable_row_good_reads_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_ROW_GOOD_READS, it) },
+            )
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_reading),
+            icon = Icons.AutoMirrored.Rounded.MenuBook,
+            iconColor = NewsblurBlue,
+            palette = palette,
+        ) {
+            ValueSettingsRow(
+                title = defaultBrowserTitle,
+                icon = Icons.Rounded.OpenInBrowser,
+                iconColor = NewsblurBlue,
+                currentValue = browserOptions.labelFor(state.defaultBrowser),
+                palette = palette,
+                onClick = {
+                    dialogState =
+                        ChoiceDialogState(
+                            title = defaultBrowserTitle,
+                            selectedValue = state.defaultBrowser,
+                            options = browserOptions,
+                            onSelect = { onStringChanged(PrefConstants.DEFAULT_BROWSER, it) },
+                        )
+                },
+            )
+            RowDivider(palette)
+            ValueSettingsRow(
+                title = fontTitle,
+                icon = Icons.Rounded.TextFields,
+                iconColor = NewsblurPurple,
+                currentValue = fontOptions.labelFor(state.readingFont),
+                palette = palette,
+                onClick = {
+                    dialogState =
+                        ChoiceDialogState(
+                            title = fontTitle,
+                            selectedValue = state.readingFont,
+                            options = fontOptions,
+                            onSelect = { onStringChanged(PrefConstants.READING_FONT, it) },
+                        )
+                },
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = stringResource(R.string.volume_key_navigation).stripTrailingEllipsis(),
+                icon = Icons.AutoMirrored.Rounded.VolumeUp,
+                iconColor = NewsblurCyan,
+                selectedValue = state.volumeKeyNavigation,
+                options = volumeKeyOptions,
+                palette = palette,
+                onSelected = { onStringChanged(PrefConstants.VOLUME_KEY_NAVIGATION, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_always_show_reading_controls),
+                subtitle = stringResource(R.string.settings_always_show_reading_controls_sum),
+                icon = Icons.Rounded.TouchApp,
+                iconColor = NewsblurBlue,
+                checked = state.readerControlsAlwaysVisible,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.READER_CONTROLS_ALWAYS_VISIBLE, it) },
+            )
+        }
+
+        // SettingsScreen.kt: each story button's toggle syncs through the server's show_sideoption prefs.
+        SettingsSection(
+            title = stringResource(R.string.settings_story_buttons),
+            icon = Icons.Rounded.SmartButton,
+            iconColor = NewsblurBlue,
+            palette = palette,
+        ) {
+            Text(
+                text = stringResource(R.string.settings_story_buttons_summary),
+                color = palette.textSecondary,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 12.dp),
+            )
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_show_train),
+                icon = Icons.Rounded.Psychology,
+                iconColor = NewsblurPurple,
+                checked = state.showTrainButton,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(StoryButton.TRAIN.prefKey, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_show_save),
+                icon = Icons.Rounded.Star,
+                iconColor = NewsblurOrange,
+                checked = state.showSaveButton,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(StoryButton.SAVE.prefKey, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_show_share),
+                icon = Icons.Rounded.Share,
+                iconColor = NewsblurTeal,
+                checked = state.showShareButton,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(StoryButton.SHARE.prefKey, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_show_ask_ai),
+                icon = Icons.Rounded.AutoAwesome,
+                iconColor = NewsblurOrange,
+                checked = state.showAskAi,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(StoryButton.ASK_AI.prefKey, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_show_listen),
+                icon = Icons.Rounded.Headphones,
+                iconColor = NewsblurCyan,
+                checked = state.showListenButton,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(StoryButton.LISTEN.prefKey, it) },
+            )
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_listen),
+            icon = Icons.Rounded.Headphones,
+            iconColor = NewsblurCyan,
+            palette = palette,
+        ) {
+            ActionSettingsRow(
+                title = stringResource(R.string.settings_listen_voices),
+                icon = Icons.Rounded.RecordVoiceOver,
+                iconColor = NewsblurCyan,
+                subtitle = stringResource(R.string.settings_listen_voices_summary),
+                palette = palette,
+                onClick = onListenVoices,
+            )
+            RowDivider(palette)
+            SegmentedSettingsRow(
+                title = stringResource(R.string.settings_listen_delivery),
+                icon = Icons.Rounded.GraphicEq,
+                iconColor = NewsblurPurple,
+                selectedValue = state.listenDelivery,
+                options = listenDeliveryOptions,
+                palette = palette,
+                onSelected = { onStringChanged(ListenPrefKeys.DELIVERY, it) },
+            )
+            RowDivider(palette)
+            ValueSettingsRow(
+                title = listenSpeedTitle,
+                icon = Icons.Rounded.Speed,
+                iconColor = NewsblurBlue,
+                currentValue = formatListenSpeed(state.listenSpeed),
+                palette = palette,
+                onClick = {
+                    dialogState =
+                        ChoiceDialogState(
+                            title = listenSpeedTitle,
+                            selectedValue = ListenSpeed.prefString(state.listenSpeed),
+                            options = listenSpeedOptions,
+                            onSelect = { onStringChanged(ListenPrefKeys.SPEED, it) },
+                        )
+                },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.listen_auto_continue),
+                icon = Icons.AutoMirrored.Rounded.PlaylistPlay,
+                iconColor = NewsblurTeal,
+                checked = state.listenAutoContinue,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(ListenPrefKeys.AUTO_CONTINUE, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.listen_highlight),
+                icon = Icons.Rounded.FormatColorFill,
+                iconColor = NewsblurOrange,
+                checked = state.listenHighlight,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(ListenPrefKeys.HIGHLIGHT, it) },
+            )
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_social),
+            icon = Icons.Rounded.Forum,
+            iconColor = NewsblurBlue,
+            palette = palette,
+        ) {
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_show_public_comments),
+                icon = Icons.Rounded.Forum,
+                iconColor = NewsblurBlue,
+                checked = state.showPublicComments,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.SHOW_PUBLIC_COMMENTS, it) },
+            )
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Rounded.Gesture, null, tint = NewsblurPurple, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.settings_gestures).uppercase(), color = palette.textSecondary, fontWeight = FontWeight.Bold)
+            }
+
+            @Composable fun gestureRow(
+                title: String,
+                key: String,
+                selected: String,
+                options: List<ChoiceOption>,
+            ) {
+                val longPress = key.endsWith("long_press")
+                val tap = key.contains("double_tap")
+                val icon =
+                    when {
+                        longPress -> Icons.Rounded.PanTool
+                        tap -> Icons.Rounded.TouchApp
+                        key.endsWith("left") || key == PrefConstants.RTL_GESTURE_ACTION -> Icons.AutoMirrored.Rounded.ArrowBack
+                        else -> Icons.AutoMirrored.Rounded.ArrowForward
+                    }
+                ValueSettingsRow(
+                    title = title,
+                    icon = icon,
+                    iconColor =
+                        if (longPress) {
+                            NewsblurOrange
+                        } else if (tap) {
+                            NewsblurBlue
+                        } else {
+                            NewsblurPurple
+                        },
+                    valueWeight = 1.2f,
+                    fillValueWidth = true,
+                    currentValue = options.labelFor(selected),
+                    palette = palette,
+                    onClick = { dialogState = ChoiceDialogState(title, selected, options, onSelect = { onStringChanged(key, it) }) },
+                )
+            }
+
+            @Composable fun gestureGroup(
+                title: String,
+                content: @Composable () -> Unit,
+            ) {
+                Text(
+                    title,
+                    color = palette.textPrimary,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(start = 4.dp, top = 8.dp),
+                )
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = palette.cardBackground,
+                    shadowElevation = if (palette.showShadow) 3.dp else 0.dp,
+                ) { Column { content() } }
+            }
+            gestureGroup(stringResource(R.string.gesture_feed_list)) {
+                ToggleSettingsRow(
+                    stringResource(R.string.gesture_swipe_feeds),
+                    Icons.Rounded.SwipeRightAlt,
+                    NewsblurPurple,
+                    state.feedSwipesEnabled,
+                    palette,
+                    onCheckedChange = { onBooleanChanged("enable_feed_swipes", it) },
+                )
+                androidx.compose.animation.AnimatedVisibility(state.feedSwipesEnabled) {
+                    Column {
+                        RowDivider(palette)
+                        gestureRow(stringResource(R.string.gesture_left), "feed_swipe_left", state.feedSwipeLeft, feedSwipeOptions)
+                        RowDivider(palette)
+                        gestureRow(stringResource(R.string.gesture_right), "feed_swipe_right", state.feedSwipeRight, feedSwipeOptions)
+                    }
+                }
+                RowDivider(palette)
+                gestureRow(stringResource(R.string.gesture_long_press), "feed_long_press", state.feedLongPress, feedLongPressOptions)
+            }
+            gestureGroup(stringResource(R.string.gesture_story_titles)) {
+                ToggleSettingsRow(
+                    stringResource(R.string.gesture_swipe_stories),
+                    Icons.Rounded.SwipeRightAlt,
+                    NewsblurPurple,
+                    state.storySwipesEnabled,
+                    palette,
+                    onCheckedChange = { onBooleanChanged("enable_story_swipes", it) },
+                )
+                androidx.compose.animation.AnimatedVisibility(state.storySwipesEnabled) {
+                    Column {
+                        RowDivider(palette)
+                        gestureRow(
+                            stringResource(R.string.gesture_left),
+                            PrefConstants.RTL_GESTURE_ACTION,
+                            state.rtlGestureAction,
+                            storySwipeOptions,
+                        )
+                        RowDivider(palette)
+                        gestureRow(
+                            stringResource(R.string.gesture_right),
+                            PrefConstants.LTR_GESTURE_ACTION,
+                            state.ltrGestureAction,
+                            storySwipeOptions,
+                        )
+                    }
+                }
+                RowDivider(palette)
+                gestureRow(stringResource(R.string.gesture_long_press), "story_long_press", state.storyLongPress, storyLongPressOptions)
+                Text(
+                    stringResource(R.string.gesture_edge_footer),
+                    color = palette.textSecondary,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(14.dp),
+                )
+            }
+            gestureGroup(stringResource(R.string.gesture_reading_story)) {
+                gestureRow(stringResource(R.string.gesture_double_tap), "reader_double_tap", state.doubleTapStory, readerTapOptions)
+                RowDivider(palette)
+                gestureRow(
+                    stringResource(R.string.gesture_two_finger_double_tap),
+                    "reader_two_finger_double_tap",
+                    state.twoFingerDoubleTapStory,
+                    readerTapOptions,
+                )
+                RowDivider(palette)
+                gestureRow(
+                    stringResource(R.string.gesture_left_edge),
+                    "reader_left_edge",
+                    state.readerEdgeAction,
+                    listOf(
+                        ChoiceOption("back", stringResource(R.string.gesture_back_titles)),
+                        ChoiceOption("previous", stringResource(R.string.gesture_previous)),
+                    ),
+                )
+            }
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_cat_offline),
+            icon = Icons.Rounded.Download,
+            iconColor = NewsblurBlue,
+            palette = palette,
+        ) {
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_offline),
+                icon = Icons.Rounded.Download,
+                iconColor = NewsblurBlue,
+                checked = state.enableOffline,
+                subtitle = stringResource(R.string.settings_enable_offline_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_OFFLINE, it) },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_image_prefetch),
+                icon = Icons.Rounded.Image,
+                iconColor = NewsblurOrange,
+                checked = state.enableImagePrefetch,
+                subtitle = stringResource(R.string.settings_enable_image_prefetch_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_IMAGE_PREFETCH, it) },
+            )
+            RowDivider(palette)
+            ValueSettingsRow(
+                title = networkTitle,
+                icon = Icons.Rounded.Wifi,
+                iconColor = NewsblurTeal,
+                currentValue = networkOptions.labelFor(state.networkSelect),
+                subtitle = stringResource(R.string.menu_network_select_sum),
+                palette = palette,
+                onClick = {
+                    dialogState =
+                        ChoiceDialogState(
+                            title = networkTitle,
+                            selectedValue = state.networkSelect,
+                            options = networkOptions,
+                            onSelect = { onStringChanged(PrefConstants.NETWORK_SELECT, it) },
+                        )
+                },
+            )
+            RowDivider(palette)
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_keep_old_stories),
+                icon = Icons.Rounded.Schedule,
+                iconColor = NewsblurPurple,
+                checked = state.keepOldStories,
+                subtitle = stringResource(R.string.settings_keep_old_stories_sum),
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.KEEP_OLD_STORIES, it) },
+            )
+            RowDivider(palette)
+            ValueSettingsRow(
+                title = cacheAgeTitle,
+                icon = Icons.Rounded.Schedule,
+                iconColor = NewsblurIndigo,
+                currentValue = cacheAgeOptions.labelFor(state.cacheAgeSelect),
+                subtitle = stringResource(R.string.menu_cache_age_select_sum),
+                palette = palette,
+                onClick = {
+                    dialogState =
+                        ChoiceDialogState(
+                            title = cacheAgeTitle,
+                            selectedValue = state.cacheAgeSelect,
+                            options = cacheAgeOptions,
+                            onSelect = { onStringChanged(PrefConstants.CACHE_AGE_SELECT, it) },
+                        )
+                },
+            )
+            RowDivider(palette)
+            ActionSettingsRow(
+                title = stringResource(R.string.menu_delete_offline_stories).stripTrailingEllipsis(),
+                icon = Icons.Rounded.DeleteSweep,
+                iconColor = NewsblurRed,
+                subtitle = stringResource(R.string.menu_delete_offline_stories_sum),
+                palette = palette,
+                isDestructive = true,
+                onClick = onDeleteOfflineStories,
+            )
+        }
+
+        SettingsSection(
+            title = stringResource(R.string.settings_notifications),
+            icon = Icons.Rounded.Notifications,
+            iconColor = NewsblurRed,
+            palette = palette,
+        ) {
+            ToggleSettingsRow(
+                title = stringResource(R.string.settings_enable_notifications),
+                icon = Icons.Rounded.Notifications,
+                iconColor = NewsblurRed,
+                checked = state.enableNotifications,
+                palette = palette,
+                onCheckedChange = { onBooleanChanged(PrefConstants.ENABLE_NOTIFICATIONS, it) },
+            )
+        }
+    }
+
+    if (showAppIconChooser) {
+        AppIconChooserDialog(
+            selectedFlavor = selectedAppIconFlavor,
+            selectedMode = state.appIconAppearanceMode,
+            palette = palette,
+            onSelect = { flavor, mode ->
+                onAppIconSelected(flavor, mode)
+                showAppIconChooser = false
+            },
+            onDismiss = { showAppIconChooser = false },
+        )
+    }
+
+    dialogState?.let { dialog ->
+        ChoiceDialog(
+            state = dialog,
+            palette = palette,
+            onDismiss = { dialogState = null },
+        )
+    }
+}
+
+@Composable
+private fun SettingsSection(
+    title: String,
+    icon: ImageVector,
+    iconColor: Color,
+    palette: SettingsPalette,
+    content: @Composable () -> Unit,
+) {
+    Column {
+        Row(
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = iconColor,
+                modifier = Modifier.size(15.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = title.uppercase(),
+                color = palette.textSecondary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.8.sp,
+            )
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            color = palette.cardBackground,
+            shadowElevation = if (palette.showShadow) 3.dp else 0.dp,
+        ) {
+            Column(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .border(
+                            width = 1.dp,
+                            color = palette.border.copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(18.dp),
+                        ),
+            ) {
+                content()
+            }
+        }
+    }
+}
+
+@Composable
+private fun ValueSettingsRow(
+    title: String,
+    icon: ImageVector,
+    iconColor: Color,
+    currentValue: String,
+    palette: SettingsPalette,
+    subtitle: String? = null,
+    footer: String? = null,
+    valueWeight: Float = 0.6f,
+    fillValueWidth: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClick,
+                ).padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            PreferenceIcon(icon = icon, color = iconColor)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    color = palette.textPrimary,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                subtitle?.let {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = it,
+                        color = palette.textSecondary,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = currentValue,
+                color = palette.textSecondary,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.End,
+                modifier = Modifier.weight(valueWeight, fill = fillValueWidth),
+            )
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                contentDescription = null,
+                tint = palette.textSecondary.copy(alpha = 0.55f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        footer?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = it,
+                color = palette.textSecondary,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(start = 40.dp, end = 6.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun AppIconSettingsRow(
+    selectedFlavor: AppIconFlavor,
+    appearanceMode: AppIconAppearanceMode,
+    isSystemDark: Boolean,
+    hasSubscription: Boolean,
+    palette: SettingsPalette,
+    onClick: () -> Unit,
+) {
+    val previewOption = AppIconManager.displayOption(selectedFlavor, appearanceMode, isSystemDark)
+
+    Column(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClick,
+                ).padding(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            AppIconPreviewImage(option = previewOption, size = 42.dp, cornerRadius = 10.dp)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.settings_app_icon_choose),
+                    color = palette.textPrimary,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = stringResource(R.string.settings_app_icon_summary),
+                    color = palette.textSecondary,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            if (!hasSubscription) {
+                Icon(
+                    imageVector = Icons.Rounded.Lock,
+                    contentDescription = null,
+                    tint = palette.textSecondary.copy(alpha = 0.75f),
+                    modifier = Modifier.size(15.dp),
+                )
+                Spacer(Modifier.width(5.dp))
+            }
+            Text(
+                text =
+                    if (hasSubscription) {
+                        selectedFlavor.title
+                    } else {
+                        stringResource(R.string.settings_app_icon_premium)
+                    },
+                color = palette.textSecondary,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.End,
+                modifier = Modifier.weight(0.55f, fill = false),
+            )
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                contentDescription = null,
+                tint = palette.textSecondary.copy(alpha = 0.55f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = stringResource(R.string.settings_app_icon_footer),
+            color = palette.textSecondary,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(start = 54.dp, end = 6.dp),
+        )
+    }
+}
+
+@Composable
+private fun AppIconChooserDialog(
+    selectedFlavor: AppIconFlavor,
+    selectedMode: AppIconAppearanceMode,
+    palette: SettingsPalette,
+    onSelect: (AppIconFlavor, AppIconAppearanceMode) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var pendingFlavor by remember(selectedFlavor.id) { mutableStateOf(selectedFlavor) }
+    var pendingMode by remember(selectedMode) { mutableStateOf(selectedMode) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = palette.cardBackground,
+        titleContentColor = palette.textPrimary,
+        textContentColor = palette.textPrimary,
+        title = {
+            Text(
+                text = stringResource(R.string.settings_app_icon),
+                color = palette.textPrimary,
+                style = MaterialTheme.typography.titleMedium,
+            )
+        },
+        text = {
+            Column(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 520.dp)
+                        .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                AppIconAppearanceSelector(
+                    mode = pendingMode,
+                    palette = palette,
+                    onModeChange = { pendingMode = it },
+                )
+
+                if (pendingMode == AppIconAppearanceMode.AUTO) {
+                    AppIconManager.flavors.forEach { flavor ->
+                        AppIconFlavorSection(
+                            flavor = flavor,
+                            selected = flavor.id == pendingFlavor.id,
+                            palette = palette,
+                            onSelect = { pendingFlavor = flavor },
+                        )
+                    }
+                } else {
+                    AppIconPinnedGrid(
+                        mode = pendingMode,
+                        pendingFlavorId = pendingFlavor.id,
+                        palette = palette,
+                        onSelect = { pendingFlavor = it },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSelect(pendingFlavor, pendingMode) }) {
+                Text(stringResource(R.string.alert_dialog_done), color = palette.newsblurGreen)
+            }
+        },
+    )
+}
+
+/** Three-way segmented control: pin the light icon, follow the system, or pin dark. */
+@Composable
+private fun AppIconAppearanceSelector(
+    mode: AppIconAppearanceMode,
+    palette: SettingsPalette,
+    onModeChange: (AppIconAppearanceMode) -> Unit,
+) {
+    val modes = AppIconAppearanceMode.entries
+    val selectedIndex = modes.indexOf(mode).coerceAtLeast(0)
+    val thumbPosition by animateFloatAsState(
+        targetValue = selectedIndex.toFloat(),
+        animationSpec = spring(dampingRatio = 0.85f, stiffness = Spring.StiffnessMediumLow),
+        label = "appIconAppearanceThumb",
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        BoxWithConstraints(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .height(40.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(palette.secondaryBackground)
+                    .border(1.dp, palette.border.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                    .padding(3.dp),
+        ) {
+            val segmentWidth = maxWidth / modes.size
+            Box(
+                modifier =
+                    Modifier
+                        .offset(x = segmentWidth * thumbPosition)
+                        .width(segmentWidth)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(palette.newsblurGreen),
+            )
+            Row(modifier = Modifier.fillMaxSize()) {
+                modes.forEachIndexed { index, entry ->
+                    // Track the thumb so the label colour slides with it instead of snapping.
+                    val coverage = (1f - abs(thumbPosition - index)).coerceIn(0f, 1f)
+                    val contentColor = lerp(palette.textSecondary, Color.White, coverage)
+                    Box(
+                        modifier =
+                            Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(9.dp))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                    onClick = { onModeChange(entry) },
+                                ),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            Icon(
+                                imageVector = appearanceModeIcon(entry),
+                                contentDescription = null,
+                                tint = contentColor,
+                                modifier = Modifier.size(15.dp),
+                            )
+                            Text(
+                                text = stringResource(entry.titleRes),
+                                color = contentColor,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        Text(
+            text = stringResource(mode.captionRes),
+            color = palette.textSecondary,
+            fontSize = 12.sp,
+            lineHeight = 16.sp,
+            modifier = Modifier.heightIn(min = 32.dp).padding(horizontal = 4.dp),
+        )
+    }
+}
+
+private fun appearanceModeIcon(mode: AppIconAppearanceMode): ImageVector =
+    when (mode) {
+        AppIconAppearanceMode.LIGHT -> Icons.Rounded.LightMode
+        AppIconAppearanceMode.AUTO -> Icons.Rounded.Contrast
+        AppIconAppearanceMode.DARK -> Icons.Rounded.DarkMode
+    }
+
+/** One tile per flavor, shown in the pinned light or dark appearance. */
+@Composable
+private fun AppIconPinnedGrid(
+    mode: AppIconAppearanceMode,
+    pendingFlavorId: String,
+    palette: SettingsPalette,
+    onSelect: (AppIconFlavor) -> Unit,
+) {
+    val appearance =
+        if (mode == AppIconAppearanceMode.DARK) {
+            AppIconManager.DARK_APPEARANCE
+        } else {
+            AppIconManager.LIGHT_APPEARANCE
+        }
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        AppIconManager.flavors.chunked(2).forEach { rowFlavors ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                rowFlavors.forEach { flavor ->
+                    val option =
+                        flavor.options.firstOrNull { it.appearance == appearance }
+                            ?: flavor.options[0]
+                    AppIconOptionCard(
+                        option = option,
+                        displayTitle = flavor.title,
+                        appearanceTag = null,
+                        selected = flavor.id == pendingFlavorId,
+                        palette = palette,
+                        onSelect = { onSelect(flavor) },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (rowFlavors.size == 1) {
+                    Spacer(Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppIconFlavorSection(
+    flavor: AppIconFlavor,
+    selected: Boolean,
+    palette: SettingsPalette,
+    onSelect: () -> Unit,
+) {
+    Column(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(18.dp))
+                .background(if (selected) palette.newsblurGreen.copy(alpha = 0.08f) else Color.Transparent)
+                .border(
+                    width = if (selected) 2.dp else 1.dp,
+                    color = if (selected) palette.newsblurGreen else palette.border.copy(alpha = 0.35f),
+                    shape = RoundedCornerShape(18.dp),
+                ).padding(8.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+        ) {
+            Text(
+                text = flavor.title.uppercase(),
+                color = if (selected) palette.newsblurGreen else palette.textSecondary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.8.sp,
+            )
+            Spacer(Modifier.width(8.dp))
+            if (selected) {
+                Icon(
+                    imageVector = Icons.Rounded.CheckCircle,
+                    contentDescription = null,
+                    tint = palette.newsblurGreen,
+                    modifier = Modifier.size(15.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            flavor.options.forEach { option ->
+                AppIconOptionCard(
+                    option = option,
+                    displayTitle = option.title,
+                    appearanceTag = option.appearance,
+                    selected = false,
+                    palette = palette,
+                    onSelect = onSelect,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppIconOptionCard(
+    option: AppIconOption,
+    displayTitle: String,
+    appearanceTag: String?,
+    selected: Boolean,
+    palette: SettingsPalette,
+    onSelect: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier =
+            modifier
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onSelect,
+                ),
+        shape = RoundedCornerShape(12.dp),
+        color = palette.cardBackground,
+        border =
+            BorderStroke(
+                width = if (selected) 2.dp else 1.dp,
+                color = if (selected) palette.newsblurGreen else palette.border.copy(alpha = 0.45f),
+            ),
+        shadowElevation = if (palette.showShadow) 2.dp else 0.dp,
+    ) {
+        Column(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Box(contentAlignment = Alignment.TopEnd) {
+                AppIconPreviewImage(option = option, size = 68.dp, cornerRadius = 16.dp)
+                if (selected) {
+                    Icon(
+                        imageVector = Icons.Rounded.CheckCircle,
+                        contentDescription = null,
+                        tint = palette.newsblurGreen,
+                        modifier =
+                            Modifier
+                                .offset(x = 6.dp, y = (-6).dp)
+                                .size(20.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(palette.cardBackground)
+                                .padding(1.dp),
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = displayTitle,
+                color = palette.textPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                lineHeight = 15.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.heightIn(min = if (appearanceTag == null) 16.dp else 32.dp),
+            )
+            if (appearanceTag != null) {
+                Spacer(Modifier.height(5.dp))
+                Box(
+                    modifier =
+                        Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(Color(option.tintColor).copy(alpha = 0.14f))
+                            .padding(horizontal = 7.dp, vertical = 3.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = appearanceTag.uppercase(),
+                        color = Color(option.tintColor),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        lineHeight = 10.sp,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppIconPreviewImage(
+    option: AppIconOption,
+    size: Dp,
+    cornerRadius: Dp,
+) {
+    val shape = RoundedCornerShape(cornerRadius)
+    androidx.compose.foundation.Image(
+        painter = painterResource(option.previewRes),
+        contentDescription = null,
+        contentScale = ContentScale.Crop,
+        modifier =
+            Modifier
+                .size(size)
+                .shadow(4.dp, shape, clip = false)
+                .clip(shape)
+                .border(1.dp, Color.Black.copy(alpha = 0.08f), shape),
+    )
+}
+
+@Composable
+private fun ToggleSettingsRow(
+    title: String,
+    icon: ImageVector,
+    iconColor: Color,
+    checked: Boolean,
+    palette: SettingsPalette,
+    enabled: Boolean = true,
+    subtitle: String? = null,
+    supportingContent: (@Composable () -> Unit)? = null,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .toggleable(value = checked, enabled = enabled, role = Role.Switch, onValueChange = onCheckedChange)
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        PreferenceIcon(icon = icon, color = iconColor)
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                color = palette.textPrimary,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            subtitle?.let {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = it,
+                    color = palette.textSecondary,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            supportingContent?.let {
+                Spacer(Modifier.height(4.dp))
+                it()
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = null,
+            colors =
+                SwitchDefaults.colors(
+                    checkedBorderColor = palette.newsblurGreen,
+                    checkedThumbColor = Color.White,
+                    checkedTrackColor = palette.newsblurGreen,
+                    uncheckedBorderColor = palette.border,
+                    uncheckedThumbColor = Color.White,
+                    uncheckedTrackColor = palette.secondaryBackground,
+                ),
+        )
+    }
+}
+
+@Composable
+private fun ClusterSettingStateSummary(
+    isEnabled: Boolean,
+    clusterMode: String,
+    palette: SettingsPalette,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text =
+                if (!isEnabled) {
+                    stringResource(R.string.settings_story_clustering_title_only)
+                } else {
+                    clusterModeLabel(clusterMode)
+                },
+            color = palette.textSecondary,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (isEnabled) {
+            ClusterModePreview(mode = clusterMode, compact = true, palette = palette)
+        }
+    }
+}
+
+@Composable
+private fun ClusterModeSettingsRow(
+    title: String,
+    icon: ImageVector,
+    iconColor: Color,
+    clusterMode: String,
+    palette: SettingsPalette,
+    subtitle: String? = null,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClick,
+                ).padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            PreferenceIcon(icon = icon, color = iconColor)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    color = palette.textPrimary,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                subtitle?.let {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = it,
+                        color = palette.textSecondary,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = clusterModeLabel(clusterMode),
+                        color = palette.textSecondary,
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.End,
+                    )
+                    ClusterModePreview(mode = clusterMode, compact = true, palette = palette)
+                }
+            }
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                contentDescription = null,
+                tint = palette.textSecondary.copy(alpha = 0.55f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ClusterModePreview(
+    mode: String,
+    compact: Boolean,
+    palette: SettingsPalette,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ClusterTierPill(
+            text = stringResource(R.string.story_cluster_badge_match),
+            color = palette.clusterMatchColor,
+            compact = compact,
+        )
+        if (clusterModeShowsRelated(mode)) {
+            Text(
+                text = stringResource(R.string.settings_story_clustering_plus),
+                color = palette.textSecondary,
+                fontSize = if (compact) 10.sp else 11.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            ClusterTierPill(
+                text = stringResource(R.string.story_cluster_badge_related),
+                color = palette.clusterRelatedColor,
+                compact = compact,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ClusterTierPill(
+    text: String,
+    color: Color,
+    compact: Boolean,
+) {
+    Box(
+        modifier =
+            Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .border(1.dp, color, RoundedCornerShape(999.dp))
+                .padding(
+                    horizontal = if (compact) 6.dp else 8.dp,
+                    vertical = if (compact) 2.dp else 3.dp,
+                ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text.uppercase(),
+            color = color,
+            fontSize = if (compact) 9.sp else 10.sp,
+            fontWeight = FontWeight.SemiBold,
+            lineHeight = 10.sp,
+        )
+    }
+}
+
+@Composable
+private fun clusterModeLabel(mode: String): String =
+    if (mode == StoryClusterDisplayDecision.CLUSTER_MODE_TITLE) {
+        stringResource(R.string.settings_cluster_mode_title_match_only)
+    } else {
+        stringResource(R.string.settings_cluster_mode_title_match_plus_related)
+    }
+
+private fun clusterModeShowsRelated(mode: String): Boolean = mode != StoryClusterDisplayDecision.CLUSTER_MODE_TITLE
+
+private fun segmentTextColor(
+    selected: Boolean,
+    palette: SettingsPalette,
+): Color = if (selected) palette.segmentedSelectedText else palette.segmentedText
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SegmentedSettingsRow(
+    title: String,
+    icon: ImageVector,
+    iconColor: Color,
+    selectedValue: String,
+    options: List<ChoiceOption>,
+    palette: SettingsPalette,
+    subtitle: String? = null,
+    footer: String? = null,
+    onSelected: (String) -> Unit,
+) {
+    Column(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            PreferenceIcon(icon = icon, color = iconColor)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    color = palette.textPrimary,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                subtitle?.let {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = it,
+                        color = palette.textSecondary,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        FlowRow(
+            modifier =
+                Modifier
+                    .padding(start = 40.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(palette.segmentedBackground)
+                    .border(1.dp, palette.segmentedBorder, RoundedCornerShape(16.dp))
+                    .padding(3.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            options.forEach { option ->
+                val isSelected = option.value == selectedValue
+                Box(
+                    modifier =
+                        Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (isSelected) palette.segmentedSelected else Color.Transparent)
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                            ) {
+                                onSelected(option.value)
+                            }.padding(horizontal = 12.dp, vertical = 8.dp)
+                            .defaultMinSize(minWidth = 56.dp)
+                            .wrapContentHeight(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = option.segmentLabel,
+                        color = if (isSelected) palette.segmentedSelectedText else palette.segmentedText,
+                        fontSize = 12.sp,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                        textAlign = TextAlign.Center,
+                        lineHeight = 14.sp,
+                    )
+                }
+            }
+        }
+        footer?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = it,
+                color = palette.textSecondary,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(start = 40.dp, end = 6.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ActionSettingsRow(
+    title: String,
+    icon: ImageVector,
+    iconColor: Color,
+    palette: SettingsPalette,
+    subtitle: String? = null,
+    isDestructive: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClick,
+                ).padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        PreferenceIcon(icon = icon, color = iconColor)
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                color = if (isDestructive) palette.destructive else palette.textPrimary,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            subtitle?.let {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = it,
+                    color = palette.textSecondary,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreferenceIcon(
+    icon: ImageVector,
+    color: Color,
+) {
+    Box(
+        modifier =
+            Modifier
+                .size(28.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(color),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = Color.White,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+@Composable
+private fun RowDivider(palette: SettingsPalette) {
+    HorizontalDivider(
+        color = palette.border.copy(alpha = 0.55f),
+        modifier = Modifier.padding(start = 54.dp, end = 14.dp),
+    )
+}
+
+@Composable
+private fun ChoiceDialog(
+    state: ChoiceDialogState,
+    palette: SettingsPalette,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = palette.cardBackground,
+        titleContentColor = palette.textPrimary,
+        textContentColor = palette.textPrimary,
+        title = {
+            Text(
+                text = state.title,
+                color = palette.textPrimary,
+                style = MaterialTheme.typography.titleMedium,
+            )
+        },
+        text = {
+            Column(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState()),
+            ) {
+                state.options.forEach { option ->
+                    Row(
+                        modifier =
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    state.onSelect(option.value)
+                                    onDismiss()
+                                }.padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = option.value == state.selectedValue,
+                            onClick = {
+                                state.onSelect(option.value)
+                                onDismiss()
+                            },
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        if (state.showClusterModePreview) {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = option.label,
+                                    color = palette.textPrimary,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                )
+                                ClusterModePreview(mode = option.value, compact = true, palette = palette)
+                            }
+                        } else {
+                            Text(
+                                text = option.label,
+                                color = palette.textPrimary,
+                                style = MaterialTheme.typography.bodyLarge,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.alert_dialog_done), color = palette.newsblurGreen)
+            }
+        },
+    )
+}
+
+private data class ChoiceDialogState(
+    val title: String,
+    val selectedValue: String,
+    val options: List<ChoiceOption>,
+    val showClusterModePreview: Boolean = false,
+    val onSelect: (String) -> Unit,
+)
+
+private data class ChoiceOption(
+    val value: String,
+    val label: String,
+    val segmentLabel: String = label,
+)
+
+private fun List<ChoiceOption>.labelFor(value: String): String = firstOrNull { it.value == value }?.label ?: ""
+
+private fun String.stripTrailingEllipsis(): String = removeSuffix("…")
+
+@Immutable
+private data class SettingsPalette(
+    val background: Color,
+    val cardBackground: Color,
+    val secondaryBackground: Color,
+    val textPrimary: Color,
+    val textSecondary: Color,
+    val border: Color,
+    val segmentedBackground: Color,
+    val segmentedSelected: Color,
+    val segmentedText: Color,
+    val segmentedSelectedText: Color,
+    val segmentedBorder: Color,
+    val clusterMatchColor: Color,
+    val clusterRelatedColor: Color,
+    val newsblurGreen: Color,
+    val destructive: Color,
+    val showShadow: Boolean,
+)
+
+@Composable
+private fun settingsPalette(theme: ThemeValue): SettingsPalette {
+    val resolvedTheme =
+        when (theme) {
+            ThemeValue.AUTO -> if (isSystemInDarkTheme()) ThemeValue.DARK else ThemeValue.LIGHT
+            else -> theme
+        }
+
+    return when (resolvedTheme) {
+        ThemeValue.SEPIA ->
+            SettingsPalette(
+                background = Color(0xFFF3E2CB),
+                cardBackground = Color(0xFFFAF5ED),
+                secondaryBackground = Color(0xFFFAF5ED),
+                textPrimary = Color(0xFF3C3226),
+                textSecondary = Color(0xFF8B7B6B),
+                border = Color(0xFFD4C8B8),
+                segmentedBackground = Color(0xFFE8DED0),
+                segmentedSelected = Color(0xFFFAF5ED),
+                segmentedText = Color(0xFF8B7B6B),
+                segmentedSelectedText = Color(0xFF3C3226),
+                segmentedBorder = Color(0xFFC8B8A8),
+                clusterMatchColor = Color(0xFF5A8C6A),
+                clusterRelatedColor = Color(0xFFA88246),
+                newsblurGreen = Color(0xFF709E5D),
+                destructive = Color(0xFFE35A4F),
+                showShadow = true,
+            )
+
+        ThemeValue.DARK ->
+            SettingsPalette(
+                background = Color(0xFF2C2C2E),
+                cardBackground = Color(0xFF3A3A3C),
+                secondaryBackground = Color(0xFF48484A),
+                textPrimary = Color(0xFFF2F2F7),
+                textSecondary = Color(0xFFAEAEB2),
+                border = Color(0xFF545458),
+                segmentedBackground = Color(0xFF707070),
+                segmentedSelected = Color(0xFFBBBBBB),
+                segmentedText = Color(0xFFCCCCCC),
+                segmentedSelectedText = Color(0xFFFFFFFF),
+                segmentedBorder = Color(0xFF555555),
+                clusterMatchColor = Color(0xFF7DC99A),
+                clusterRelatedColor = Color(0xFFD2A76B),
+                newsblurGreen = Color(0xFF709E5D),
+                destructive = Color(0xFFFF867C),
+                showShadow = false,
+            )
+
+        ThemeValue.BLACK ->
+            SettingsPalette(
+                background = Color(0xFF000000),
+                cardBackground = Color(0xFF121214),
+                secondaryBackground = Color(0xFF1C1C1E),
+                textPrimary = Color(0xFFF2F2F7),
+                textSecondary = Color(0xFF98989D),
+                border = Color(0xFF303030),
+                segmentedBackground = Color(0xFF303030),
+                segmentedSelected = Color(0xFF888890),
+                segmentedText = Color(0xFFAAAAAA),
+                segmentedSelectedText = Color(0xFFFFFFFF),
+                segmentedBorder = Color(0xFF444444),
+                clusterMatchColor = Color(0xFF7DC99A),
+                clusterRelatedColor = Color(0xFFD2A76B),
+                newsblurGreen = Color(0xFF709E5D),
+                destructive = Color(0xFFFF867C),
+                showShadow = false,
+            )
+
+        else ->
+            SettingsPalette(
+                background = Color(0xFFF0F2ED),
+                cardBackground = Color(0xFFFFFFFF),
+                secondaryBackground = Color(0xFFF7F7F5),
+                textPrimary = Color(0xFF1C1C1E),
+                textSecondary = Color(0xFF6E6E73),
+                border = Color(0xFFD1D1D6),
+                segmentedBackground = Color(0xFFE7E6E7),
+                segmentedSelected = Color(0xFFDCE6F0),
+                segmentedText = Color(0xFF909090),
+                segmentedSelectedText = Color(0xFF000000),
+                segmentedBorder = Color(0xFFC0C0C0),
+                clusterMatchColor = Color(0xFF5A8C6A),
+                clusterRelatedColor = Color(0xFFA88246),
+                newsblurGreen = Color(0xFF709E5D),
+                destructive = Color(0xFFE35A4F),
+                showShadow = true,
+            )
+    }
+}
+
+private val NewsblurBlue = Color(0xFF0A84FF)
+private val NewsblurOrange = Color(0xFFFF9500)
+private val NewsblurPurple = Color(0xFFBF5AF2)
+private val NewsblurGreen = Color(0xFF34C759)
+private val NewsblurTeal = Color(0xFF30B0C7)
+private val NewsblurIndigo = Color(0xFF5E5CE6)
+private val NewsblurCyan = Color(0xFF32ADE6)
+private val NewsblurRed = Color(0xFFFF453A)
